@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    name: go (${{ matrix.module }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [omniackless, omnistripe]
+    defaults:
+      run:
+        working-directory: src/${{ matrix.module }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+          cache: false
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "gofmt needs to be run on:"
+            echo "$unformatted"
+            exit 1
+          fi
+      - name: go vet
+        run: go vet ./...
+      - name: go test -race
+        run: go test -race ./...
+
+  binaries:
+    name: committed binaries current (${{ matrix.module }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [omniackless, omnistripe]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.3'
+          cache: false
+      - name: rebuild from source and verify committed binaries are byte-identical
+        run: |
+          set -e
+          module="${{ matrix.module }}"
+          if [ "$module" = omnistripe ]; then
+            markers=("$(grep -oE 'omnistripe [0-9]+\.[0-9]+\.[0-9]+' src/omnistripe/main.go | head -1)")
+          else
+            markers=(".sendbase." "refusing to start to avoid sequence reuse")
+          fi
+          for arch in amd64 arm64; do
+            committed="bin/${module}-${arch}"
+            fresh="$(mktemp)"
+            ( cd "src/${module}" && CGO_ENABLED=0 GOOS=linux GOARCH="${arch}" go build -trimpath -buildvcs=false -o "${fresh}" . )
+            if [ ! -s "${committed}" ]; then
+              echo "committed binary ${committed} is missing or empty"
+              exit 1
+            fi
+            if ! cmp -s "${fresh}" "${committed}"; then
+              echo "committed ${committed} is NOT byte-identical to a reproducible -trimpath -buildvcs=false build from source on go 1.26.3; rebuild and recommit it"
+              exit 1
+            fi
+            for m in "${markers[@]}"; do
+              if ! grep -aqF -- "${m}" "${committed}"; then
+                echo "committed ${committed} lacks expected marker [${m}]"
+                exit 1
+              fi
+            done
+          done
+
+  shell:
+    name: shell tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: run shell tests
+        run: |
+          set -e
+          for t in tests/*.sh; do
+            echo "::group::$t"
+            bash "$t"
+            echo "::endgroup::"
+          done

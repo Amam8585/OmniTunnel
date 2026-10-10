@@ -27,6 +27,7 @@ SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 ROOT_DIR="/etc/omnitunnel"
 INST_DIR="$ROOT_DIR/inst"
 PEER_DIR="$ROOT_DIR/peers"
+VARLIB_DIR="/var/lib/omnitunnel"
 TSUITE_BIN="${OMNITUN_BIN:-/usr/local/bin/omnitun}"
 BINLINK="/usr/local/bin/omnitunnel"   # the 'omnitunnel' command (symlink to this script)
 # Hysteria2 is a separate Go engine (QUIC/UDP with the loss-agnostic "Brutal"
@@ -42,6 +43,8 @@ HY_MASQ_HOST="www.bing.com"
 # alongside the core; pulled via raw like the rest.
 CHISEL_BIN="${OMNITUN_CHISEL_BIN:-/usr/local/bin/chisel}"
 CHISEL_VER="1.10.1"
+OMNISTRIPE_BIN="${OMNITUN_STRIPE_BIN:-/usr/local/bin/omnistripe}"
+OMNIACKLESS_BIN="${OMNITUN_ACKLESS_BIN:-/usr/local/bin/omniackless}"
 # where the shipped per-arch binaries live (install.sh drops them here)
 ASSET_DIR="${OMNITUN_ASSETS:-/opt/omnitunnel}"
 RAW_BASE="https://raw.githubusercontent.com/Free-Guy-IR/OmniTunnel/main"
@@ -167,8 +170,46 @@ ensure_chisel() {
     install -m 0755 "$cand" "$CHISEL_BIN"
 }
 
+omnistripe_local_bin() {
+    local a="$1" d
+    for d in "$ASSET_DIR/bin" "$SCRIPT_DIR/bin"; do [[ -f "$d/omnistripe-$a" ]] && { echo "$d/omnistripe-$a"; return 0; }; done
+    return 1
+}
+ensure_omnistripe() {
+    [[ -x "$OMNISTRIPE_BIN" ]] && return 0
+    local a; a="$(arch_tag)"; [[ "$a" == unknown ]] && die "unsupported CPU: $(uname -m)"
+    local cand; cand="$(omnistripe_local_bin "$a" || true)"
+    if [[ -z "$cand" ]]; then
+        info "  fetching omnistripe core for $a ..."
+        mkdir -p "$ASSET_DIR/bin"
+        curl -fsSL -o "$ASSET_DIR/bin/omnistripe-$a" "$RAW_BASE/bin/omnistripe-$a" \
+            || die "could not obtain omnistripe-$a (no shipped copy and download failed)"
+        chmod +x "$ASSET_DIR/bin/omnistripe-$a"; cand="$ASSET_DIR/bin/omnistripe-$a"
+    fi
+    install -m 0755 "$cand" "$OMNISTRIPE_BIN"
+}
+
+omniackless_local_bin() {
+    local a="$1" d
+    for d in "$ASSET_DIR/bin" "$SCRIPT_DIR/bin"; do [[ -f "$d/omniackless-$a" ]] && { echo "$d/omniackless-$a"; return 0; }; done
+    return 1
+}
+ensure_omniackless() {
+    [[ -x "$OMNIACKLESS_BIN" ]] && return 0
+    local a; a="$(arch_tag)"; [[ "$a" == unknown ]] && die "unsupported CPU: $(uname -m)"
+    local cand; cand="$(omniackless_local_bin "$a" || true)"
+    if [[ -z "$cand" ]]; then
+        info "  fetching omniackless core for $a ..."
+        mkdir -p "$ASSET_DIR/bin"
+        curl -fsSL -o "$ASSET_DIR/bin/omniackless-$a" "$RAW_BASE/bin/omniackless-$a" \
+            || die "could not obtain omniackless-$a (no shipped copy and download failed)"
+        chmod +x "$ASSET_DIR/bin/omniackless-$a"; cand="$ASSET_DIR/bin/omniackless-$a"
+    fi
+    install -m 0755 "$cand" "$OMNIACKLESS_BIN"
+}
+
 # ------------------------------------------------------------ type registry ---
-ALL_TYPES="gre icmp udp mux ws hysteria tcp fou vxlan reverse-mux"
+ALL_TYPES="gre icmp udp mux ws hysteria tcp fou vxlan reverse-mux stripe ackless"
 type_desc() {
     case "$1" in
         gre)      echo "IP-over-GRE  (kernel; often unpoliced & full line-rate)";;
@@ -181,6 +222,8 @@ type_desc() {
         fou)      echo "GRE-in-UDP  (kernel; GRE hidden inside plain UDP on its port)";;
         vxlan)    echo "VXLAN L2-over-UDP  (kernel; Ethernet inside UDP)";;
         reverse-mux) echo "ICMP-reply + single-flow MUX  (Iran->foreign relay: beats policed multi-flow UPLOAD)";;
+        stripe)   echo "connection-striping TCP  (shards one flow across fresh short-lived conns; beats per-5-tuple byte caps)";;
+        ackless)  echo "ACK-less TCP carrier  (single flow of flags=0 raw TCP; dodges per-5-tuple packet caps)";;
         *) echo "";;
     esac
 }
@@ -196,10 +239,12 @@ type_is_kernel() { [[ "$1" == gre || "$1" == fou || "$1" == vxlan ]]; }
 # bit the plain `udp` transport too). gre's "port" is only a GRE key, and
 # tcp/mux/ws are TCP, so those are unaffected and stay at 51820. hysteria runs its
 # own QUIC/443 masquerade and manages its own port.
-port_base() { case "$1" in udp|fou|vxlan) echo 28820;; *) echo 51820;; esac; }
+port_base() { case "$1" in udp|fou|vxlan) echo 28820;; stripe) echo 40000;; ackless) echo 49000;; *) echo 51820;; esac; }
 # hysteria is a separate engine: its own binary + YAML, no tun device, forwards
 # ports natively (no iptables DNAT). It gets special-cased throughout.
 type_is_hysteria() { [[ "$1" == hysteria ]]; }
+type_is_stripe() { [[ "$1" == stripe ]]; }
+type_is_ackless() { [[ "$1" == ackless ]]; }
 
 # ------------------------------------------------------------ instance i/o ----
 inst_path() { echo "$INST_DIR/$1"; }
@@ -318,14 +363,14 @@ install_fwd_dropins() {
 
 load_inst() {
     local n="$1"; inst_exists "$n" || die "no such instance: $n"
-    TYPE=""; ROLE=""; LOCAL_IP=""; PEER_IP=""; TUN_ADDR=""; PEER_ADDR=""; PORT=""; KEY=""; DEV=""; MTU="1400"; NCONN="16"; SHAPE="none"; ICMP_MODE=""
+    TYPE=""; ROLE=""; LOCAL_IP=""; PEER_IP=""; TUN_ADDR=""; PEER_ADDR=""; PORT=""; KEY=""; DEV=""; MTU="1400"; NCONN="16"; SHAPE="none"; ICMP_MODE=""; PCOUNT="400"
     # shellcheck disable=SC1090
     source "$(inst_conf "$n")"; INAME="$n"
 }
 
 # create NAME TYPE ROLE LOCAL PEER PORT KEY TUN_ADDR PEER_ADDR [SHAPE] [NCONN]
 create_inst() {
-    local n="$1" t="$2" role="$3" lip="$4" pip="$5" port="$6" key="$7" ta="$8" pa="$9" shape="${10:-none}" nc="${11:-16}" imode="${12:-}"
+    local n="$1" t="$2" role="$3" lip="$4" pip="$5" port="$6" key="$7" ta="$8" pa="$9" shape="${10:-none}" nc="${11:-16}" imode="${12:-}" pcount="${13:-400}"
     # reverse-mux IS icmp with the reply-type forced (its whole point is the
     # reply-gated dodge), so default its ICMP_MODE to reply if unset.
     [[ "$t" == reverse-mux && -z "$imode" ]] && imode=reply
@@ -346,6 +391,7 @@ MTU=1400
 NCONN=$nc
 SHAPE=$shape
 ICMP_MODE=$imode
+PCOUNT=$pcount
 EOF
 }
 
@@ -377,6 +423,10 @@ kernel_down_cmd() { echo "ip link del $DEV 2>/dev/null"; }
 # ------------------------------------------------------- execstart builder ----
 build_execstart() {
     local sflag=""; [[ "$ROLE" == "server" ]] && sflag=" -s"
+    if type_uses_key "$TYPE" && [[ -z "$KEY" ]]; then
+        echo "build_execstart: $TYPE requires a non-empty PSK but KEY is empty; refusing" >&2
+        return 1
+    fi
     case "$TYPE" in
         udp)  echo "$TSUITE_BIN udp -L $LOCAL_IP -R $PEER_IP -A $TUN_ADDR -P $PEER_ADDR -p $PORT -k $KEY -T $DEV -M $MTU";;
         tcp)  echo "$TSUITE_BIN tcp -L $LOCAL_IP -R $PEER_IP -A $TUN_ADDR -P $PEER_ADDR -p $PORT -k $KEY$sflag -T $DEV -M $MTU";;
@@ -386,6 +436,8 @@ build_execstart() {
         # reverse-mux rides the icmp engine with the reply type forced; the chisel
         # MUX layer lives in separate units (mux-add / mux-token), not here.
         reverse-mux) echo "$TSUITE_BIN icmp -L $LOCAL_IP -R $PEER_IP -A $TUN_ADDR -P $PEER_ADDR -I 4d54 -T $DEV -M $MTU$sflag -r ${ICMP_MODE:-reply}";;
+        stripe) echo "$OMNISTRIPE_BIN -L $LOCAL_IP -R $PEER_IP -A $TUN_ADDR -P $PEER_ADDR -k $KEY -p $PORT -C ${PCOUNT:-400} -N $NCONN -T $DEV -M $MTU$sflag";;
+        ackless) echo "$OMNIACKLESS_BIN -L $LOCAL_IP -R $PEER_IP -A $TUN_ADDR -P $PEER_ADDR -k $KEY -p $PORT -T $DEV -M $MTU$sflag";;
     esac
 }
 
@@ -629,6 +681,8 @@ apply_tuning() {
 write_service() {
     load_inst "$1"
     if type_is_hysteria "$TYPE"; then ensure_hysteria
+    elif type_is_stripe "$TYPE"; then ensure_omnistripe
+    elif type_is_ackless "$TYPE"; then ensure_omniackless
     elif ! type_is_kernel "$TYPE"; then ensure_binary; fi
     local unit="/etc/systemd/system/$(svc_name "$1")"
     if type_is_hysteria "$TYPE"; then
@@ -688,6 +742,7 @@ ExecStartPost=$SCRIPT_PATH _postup $1
 Restart=always
 RestartSec=3
 TimeoutStopSec=5
+LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
@@ -1020,6 +1075,16 @@ cmd_mux_off() { need_root; mux_remove "$1"; rm -f "$(mux_conf "$1")" 2>/dev/null
 # --------------------------------------------------------------- remove -------
 # Removes ONLY the named instance this tool created. Never touches /etc/icmptun
 # or any interface / unit it did not create.
+inst_cleanup_residue() {
+    local dev="$1" sdev
+    [[ -n "$dev" ]] || return 0
+    sdev="${dev//[^A-Za-z0-9_]/_}"
+    while iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -o "$dev" -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; do :; done
+    while iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -i "$dev" -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; do :; done
+    rm -f "$VARLIB_DIR/stripe-$sdev.floor" 2>/dev/null || true
+    rm -f "$VARLIB_DIR/ackless_$sdev.floor" 2>/dev/null || true
+    rm -f "$VARLIB_DIR/ackless_$sdev".sendbase.* 2>/dev/null || true
+}
 inst_remove() {
     need_root; inst_exists "$1" || { warn "no such instance: $1"; return 0; }
     load_inst "$1"
@@ -1030,6 +1095,7 @@ inst_remove() {
     systemctl reset-failed "$(svc_name "$1")" 2>/dev/null || true   # no lingering 'not-found failed' ghost
     systemctl daemon-reload 2>/dev/null || true
     pf_flush_chain "$1"; ip link del "$DEV" 2>/dev/null || true
+    inst_cleanup_residue "$DEV"
     rm -rf "$(inst_path "$1")"; ok "removed instance '$1'"
 }
 
@@ -1094,10 +1160,47 @@ next_subnet_idx() {
         [[ -n "$used" && "$used" -ge "$i" ]] && i=$((used+1)); done
     echo "$i"
 }
+type_port_span() { case "$1" in stripe) echo "${2:-400}";; ackless) echo 100;; *) echo 1;; esac; }
+occupied_port_ranges() {
+    local n t p c span
+    for n in $(list_instances); do
+        inst_exists "$n" || continue
+        t=$(grep -m1 -oE '^TYPE=[a-z-]+' "$(inst_conf "$n")" 2>/dev/null | cut -d= -f2 || true)
+        p=$(grep -m1 -oE '^PORT=[0-9]+' "$(inst_conf "$n")" 2>/dev/null | cut -d= -f2 || true)
+        c=$(grep -m1 -oE '^PCOUNT=[0-9]+' "$(inst_conf "$n")" 2>/dev/null | cut -d= -f2 || true)
+        [[ -n "$p" ]] || continue
+        span=$(type_port_span "$t" "${c:-400}")
+        echo "$p $((p + span - 1))"
+    done
+}
+peer_port_triples() {
+    peer_ssh "$1" 'for f in /etc/omnitunnel/inst/*/instance.conf; do [ -f "$f" ] || continue; t=$(grep -m1 -oE "^TYPE=[a-z-]+" "$f" | cut -d= -f2); p=$(grep -m1 -oE "^PORT=[0-9]+" "$f" | cut -d= -f2); c=$(grep -m1 -oE "^PCOUNT=[0-9]+" "$f" | cut -d= -f2); [ -n "$p" ] && echo "$t $p ${c:-400}"; done' 2>/dev/null | tr -d '\r' || true
+}
+remote_port_ranges() {
+    local t p c span
+    while read -r t p c; do
+        [[ -n "${p:-}" ]] || continue
+        span=$(type_port_span "$t" "${c:-400}")
+        echo "$p $((p + span - 1))"
+    done
+}
+alloc_port_span() {
+    local cand="${1:-51820}" span="${2:-1}" extra="${3:-}" ranges hi lo rhi conflict
+    ranges="$(occupied_port_ranges)"
+    [[ -n "$extra" ]] && ranges="$ranges"$'\n'"$extra"
+    while :; do
+        conflict=0
+        hi=$((cand + span - 1))
+        while read -r lo rhi; do
+            [[ -n "${lo:-}" ]] || continue
+            if (( cand <= rhi && lo <= hi )); then cand=$((rhi + 1)); conflict=1; break; fi
+        done <<< "$ranges"
+        if (( conflict )); then continue; fi
+        echo "$cand"; return
+    done
+}
 next_port() {
-    local cand="${1:-51820}" used
-    used=$(grep -hoE 'PORT=[0-9]+' "$INST_DIR"/*/instance.conf 2>/dev/null | grep -oE '[0-9]+' || true)
-    while echo "$used" | grep -qx "$cand"; do cand=$((cand+1)); done; echo "$cand"
+    alloc_port_span "${1:-51820}" "$(type_port_span "${2:-}")" ""
 }
 # Collision-safe allocation across BOTH this box and the foreign: two different
 # Iran boxes tunnelling to the SAME foreign must never pick the same 10.201.<n>
@@ -1117,10 +1220,21 @@ alloc_subnet() {
     echo 0
 }
 alloc_port() {
-    local cand="${1:-51820}" avoid=" ${2:-} " localused
-    localused=" $(grep -hoE 'PORT=[0-9]+' "$INST_DIR"/*/instance.conf 2>/dev/null | grep -oE '[0-9]+' | tr '\n' ' ') "
-    while [[ "$localused" == *" $cand "* || "$avoid" == *" $cand "* ]]; do cand=$((cand+1)); done
-    echo "$cand"
+    alloc_port_span "${1:-51820}" "$(type_port_span "${3:-}")" "${2:-}"
+}
+alloc_and_create() {
+    local n="$1" t="$2" role="$3" lip="$4" pip="$5" shape="$6" nc="$7" imode="$8" want_port="${9:-}"
+    local afd
+    mkdir -p "$INST_DIR" 2>/dev/null || true
+    exec {afd}>"$INST_DIR/.alloc.lock" || die "cannot open allocation lock $INST_DIR/.alloc.lock"
+    flock "$afd" || die "cannot acquire allocation lock"
+    inst_exists "$n" && die "instance $n exists"
+    ALLOC_SUB=$(next_subnet_idx)
+    ALLOC_PORT=$(next_port "${want_port:-$(( $(port_base "$t") + ALLOC_SUB ))}" "$t")
+    ALLOC_KEY=$(gen_key); type_uses_key "$t" || ALLOC_KEY=""
+    create_inst "$n" "$t" "$role" "$lip" "$pip" "$ALLOC_PORT" "$ALLOC_KEY" "10.201.$ALLOC_SUB.1" "10.201.$ALLOC_SUB.2" "$shape" "$nc" "$imode"
+    flock -u "$afd"
+    exec {afd}>&-
 }
 
 # ------------------------------------------------------------ peer SSH --------
@@ -1218,6 +1332,16 @@ provision_peer() {
         [[ -n "$hbin" ]] || die "no hysteria-$parch binary to send to peer"
         peer_scp "$h" "$hbin" "/opt/omnitunnel/bin/hysteria-$parch"
         peer_ssh "$h" "chmod +x /opt/omnitunnel/bin/hysteria-$parch; install -m0755 /opt/omnitunnel/bin/hysteria-$parch /usr/local/bin/hysteria"
+    elif type_is_stripe "$t"; then
+        local sbin; sbin="$(omnistripe_local_bin "$parch" || true)"
+        [[ -n "$sbin" ]] || die "no omnistripe-$parch binary to send to peer"
+        peer_scp "$h" "$sbin" "/opt/omnitunnel/bin/omnistripe-$parch"
+        peer_ssh "$h" "chmod +x /opt/omnitunnel/bin/omnistripe-$parch; install -m0755 /opt/omnitunnel/bin/omnistripe-$parch /usr/local/bin/omnistripe"
+    elif type_is_ackless "$t"; then
+        local abin; abin="$(omniackless_local_bin "$parch" || true)"
+        [[ -n "$abin" ]] || die "no omniackless-$parch binary to send to peer"
+        peer_scp "$h" "$abin" "/opt/omnitunnel/bin/omniackless-$parch"
+        peer_ssh "$h" "chmod +x /opt/omnitunnel/bin/omniackless-$parch; install -m0755 /opt/omnitunnel/bin/omniackless-$parch /usr/local/bin/omniackless"
     else
         local pbin=""
         for d in "$ASSET_DIR/bin" "$SCRIPT_DIR/bin"; do [[ -f "$d/omnitun-$parch" ]] && pbin="$d/omnitun-$parch" && break; done
@@ -1230,8 +1354,10 @@ provision_peer() {
 cmd_peercreate() {
     need_root
     if type_is_hysteria "$2"; then ensure_hysteria
+    elif type_is_stripe "$2"; then ensure_omnistripe
+    elif type_is_ackless "$2"; then ensure_omniackless
     elif ! type_is_kernel "$2"; then ensure_binary; fi
-    create_inst "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" "${11}" "${12:-}"
+    create_inst "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" "${11}" "${12:-}" "${13:-400}"
     inst_enable "$1" >/dev/null 2>&1 || true; ok "peer instance '$1' up"
 }
 
@@ -1240,7 +1366,11 @@ cmd_peercreate() {
 # Far-side SSH password comes from a saved peer file or $OMNITUN_PEER_PASS
 # (+ optional $OMNITUN_PEER_USER, default root).
 cmd_add_auto() {
-    need_root; ensure_binary
+    need_root
+    if type_is_hysteria "$1"; then ensure_hysteria
+    elif type_is_stripe "$1"; then ensure_omnistripe
+    elif type_is_ackless "$1"; then ensure_omniackless
+    elif ! type_is_kernel "$1"; then ensure_binary; fi
     local t="$1" kn="$2" fhost="$3" nc="${4:-16}" shape="${5:-none}" mylip="${6:-$(default_local_ip)}"
     [[ -n "$t" && -n "$kn" && -n "$fhost" ]] || die "usage: add-auto <type> <name> <foreign_ip> [nconn] [shape] [my_ip]"
     inst_exists "$kn" && die "instance $kn exists"
@@ -1251,19 +1381,25 @@ cmd_add_auto() {
     # the first box's tunnel.
     local fsub fport fnames
     fsub=$(peer_ssh "$fhost" "grep -hoE 'TUN_ADDR=10\\.201\\.[0-9]+' /etc/omnitunnel/inst/*/instance.conf 2>/dev/null | grep -oE '[0-9]+\$'" 2>/dev/null | tr '\r\n' '  ' || true)
-    fport=$(peer_ssh "$fhost" "grep -hoE 'PORT=[0-9]+' /etc/omnitunnel/inst/*/instance.conf 2>/dev/null | grep -oE '[0-9]+'" 2>/dev/null | tr '\r\n' '  ' || true)
+    fport=$(peer_port_triples "$fhost")
     fnames=$(peer_ssh "$fhost" "ls /etc/omnitunnel/inst 2>/dev/null" 2>/dev/null | tr '\r\n' '  ' || true)
     case " $fnames " in *" $kn "*) die "the foreign $fhost already has an instance named '$kn' - choose a different name (each tunnel to a foreign needs a unique name)";; esac
-    local sub port key ta pa; sub=$(alloc_subnet "$fsub"); ta="10.201.$sub.1"; pa="10.201.$sub.2"
-    port=$(alloc_port "$(( $(port_base "$t") + sub ))" "$fport"); key=$(gen_key); type_uses_key "$t" || key=""
     local imode="${OMNITUN_ICMP_MODE:-}" pmode="${OMNITUN_ICMP_MODE_PEER:-}"
     local m; for m in "$imode" "$pmode"; do [[ -z "$m" || "$m" == reply || "$m" == request ]] || die "icmp mode must be reply|request (got '$m')"; done
     [[ "$t" == icmp ]] || type_is_revmux "$t" || { imode=""; pmode=""; }
     if type_is_revmux "$t" && [[ "$imode" == request || "$pmode" == request ]]; then
         warn "reverse-mux asked to emit echo-request; that gives up its reply-gated dodge"
     fi
+    local sub port key ta pa afd
+    mkdir -p "$INST_DIR" 2>/dev/null || true
+    exec {afd}>"$INST_DIR/.alloc.lock" || die "cannot open allocation lock $INST_DIR/.alloc.lock"
+    flock "$afd" || die "cannot acquire allocation lock"
+    inst_exists "$kn" && die "instance $kn exists"
+    sub=$(alloc_subnet "$fsub"); ta="10.201.$sub.1"; pa="10.201.$sub.2"
+    port=$(alloc_port "$(( $(port_base "$t") + sub ))" "$(printf '%s\n' "$fport" | remote_port_ranges)" "$t"); key=$(gen_key); type_uses_key "$t" || key=""
     provision_peer "$fhost" "$kn" "$t" "$fhost" "$mylip" "$port" "$key" "$pa" "$ta" "$shape" "$nc" "$pmode"
     create_inst "$kn" "$t" client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" "$shape" "$nc" "$imode"
+    flock -u "$afd"; exec {afd}>&-
     inst_enable "$kn"; ok "instance '$kn' ($t) up: $mylip -> $fhost  (subnet 10.201.$sub.0/24, port/key $port)"
 }
 
@@ -1276,12 +1412,12 @@ cmd_add_auto() {
 cmd_add_manual() {
     need_root
     if type_is_hysteria "$1"; then ensure_hysteria
+    elif type_is_stripe "$1"; then ensure_omnistripe
+    elif type_is_ackless "$1"; then ensure_omniackless
     elif ! type_is_kernel "$1"; then ensure_binary; fi
     local t="$1" kn="$2" fhost="$3" nc="${4:-16}" shape="${5:-none}" mylip="${6:-$(default_local_ip)}" want_port="${7:-}"
     [[ -n "$t" && -n "$kn" && -n "$fhost" ]] || die "usage: add-manual <type> <name> <foreign_ip> [nconn] [shape] [my_ip] [foreign_port]"
     inst_exists "$kn" && die "instance $kn exists"
-    local sub port key ta pa; sub=$(next_subnet_idx); ta="10.201.$sub.1"; pa="10.201.$sub.2"
-    port=$(next_port "${want_port:-$(( $(port_base "$t") + sub ))}"); key=$(gen_key); type_uses_key "$t" || key=""
     # icmp: this end's emitted ICMP type (OMNITUN_ICMP_MODE) and the foreign end's
     # (OMNITUN_ICMP_MODE_PEER), for paths that drop one echo type in one direction.
     local imode="${OMNITUN_ICMP_MODE:-}" pmode="${OMNITUN_ICMP_MODE_PEER:-}"
@@ -1290,7 +1426,9 @@ cmd_add_manual() {
     if type_is_revmux "$t" && [[ "$imode" == request || "$pmode" == request ]]; then
         warn "reverse-mux asked to emit echo-request; that gives up its reply-gated dodge"
     fi
-    create_inst "$kn" "$t" client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" "$shape" "$nc" "$imode"
+    local sub port key ta pa
+    alloc_and_create "$kn" "$t" client "$mylip" "$fhost" "$shape" "$nc" "$imode" "$want_port"
+    sub="$ALLOC_SUB"; port="$ALLOC_PORT"; key="$ALLOC_KEY"; ta="10.201.$sub.1"; pa="10.201.$sub.2"
     inst_enable "$kn"
     # Server-side params (tun IPs swapped). Encoded so it is a single paste.
     local token; token=$(printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' "$kn" "$t" "$fhost" "$mylip" "$port" "$key" "$pa" "$ta" "$shape" "$nc" "$pmode" | base64 | tr -d '\n')
@@ -1312,6 +1450,8 @@ cmd_server_token() {
     IFS='|' read -r name t fhost mylip port key pta ppa shape nc pmode <<< "$dec"
     [[ -n "$name" && -n "$t" ]] || die "invalid token"
     if type_is_hysteria "$t"; then ensure_hysteria
+    elif type_is_stripe "$t"; then ensure_omnistripe
+    elif type_is_ackless "$t"; then ensure_omniackless
     elif ! type_is_kernel "$t"; then ensure_binary; fi
     # Re-running the SAME token must be idempotent. A first attempt that half-
     # failed (or was Ctrl-C'd) leaves the instance dir behind and this used to
@@ -1352,15 +1492,17 @@ wizard_add() {
         read -erp "Download shaper rate to stabilise (e.g. 90mbit / none) [none]: " shape; shape="${shape:-none}"
     elif [[ "$t" == hysteria ]]; then
         read -erp "Brutal-CC target bandwidth in mbps (higher pushes harder through loss) [200]: " shape; shape="${shape:-200}"
+    elif [[ "$t" == stripe ]]; then
+        read -erp "Striping connection workers N [90]: " nc; nc="${nc:-90}"
     fi
     # collision-safe allocation vs whatever the foreign already runs (see cmd_add_auto)
     local fsub fport fnames
     fsub=$(peer_ssh "$fhost" "grep -hoE 'TUN_ADDR=10\\.201\\.[0-9]+' /etc/omnitunnel/inst/*/instance.conf 2>/dev/null | grep -oE '[0-9]+\$'" 2>/dev/null | tr '\r\n' '  ' || true)
-    fport=$(peer_ssh "$fhost" "grep -hoE 'PORT=[0-9]+' /etc/omnitunnel/inst/*/instance.conf 2>/dev/null | grep -oE '[0-9]+'" 2>/dev/null | tr '\r\n' '  ' || true)
+    fport=$(peer_port_triples "$fhost")
     fnames=$(peer_ssh "$fhost" "ls /etc/omnitunnel/inst 2>/dev/null" 2>/dev/null | tr '\r\n' '  ' || true)
     case " $fnames " in *" $kn "*) warn "the foreign already has an instance named '$kn' - pick a different name"; return;; esac
     local sub port key ta pa; sub=$(alloc_subnet "$fsub"); ta="10.201.$sub.1"; pa="10.201.$sub.2"
-    port=$(alloc_port "$(( $(port_base "$t") + sub ))" "$fport"); key=$(gen_key); type_uses_key "$t" || key=""
+    port=$(alloc_port "$(( $(port_base "$t") + sub ))" "$(printf '%s\n' "$fport" | remote_port_ranges)" "$t"); key=$(gen_key); type_uses_key "$t" || key=""
     provision_peer "$fhost" "$kn" "$t" "$fhost" "$mylip" "$port" "$key" "$pa" "$ta" "$shape" "$nc"
     create_inst "$kn" "$t" client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" "$shape" "$nc"
     inst_enable "$kn"; ok "instance '$kn' ($t) is up on both sides.  (subnet 10.201.$sub.0/24, port/key $port)"
@@ -1394,6 +1536,8 @@ wizard_add_manual() {
     if [[ "$t" == mux ]]; then
         read -erp "Parallel links N [16]: " nc; nc="${nc:-16}"
         read -erp "Download shaper rate (e.g. 90mbit / none) [none]: " shape; shape="${shape:-none}"
+    elif [[ "$t" == stripe ]]; then
+        read -erp "Striping connection workers N [90]: " nc; nc="${nc:-90}"
     fi
     cmd_add_manual "$t" "$kn" "$fhost" "$nc" "$shape" "$mylip"
 }
@@ -1527,7 +1671,7 @@ bench_run() {
     for t in $ALL_TYPES; do
         local name="bench-$t" sub=$((base+i)); i=$((i+1))
         local ta="10.201.$sub.1" pa="10.201.$sub.2" port key nc=8 shape=none
-        port=$(next_port $(( $(port_base "$t") + sub ))); key=$(gen_key)
+        port=$(next_port $(( $(port_base "$t") + sub )) "$t"); key=$(gen_key)
         type_uses_key "$t" || key=""
         echo -n "  $t ... "
         # hysteria has no tun/ping: forward the iperf port through it and measure
@@ -1627,10 +1771,10 @@ bench_run() {
     [[ "$keep" == hysteria ]] && { read -erp "Brutal-CC target bandwidth mbps [$hy_target]: " shape; shape="${shape:-$hy_target}"; }
     local fsub fport fnames
     fsub=$(peer_ssh "$fhost" "grep -hoE 'TUN_ADDR=10\\.201\\.[0-9]+' /etc/omnitunnel/inst/*/instance.conf 2>/dev/null | grep -oE '[0-9]+\$'" 2>/dev/null | tr '\r\n' '  ' || true)
-    fport=$(peer_ssh "$fhost" "grep -hoE 'PORT=[0-9]+' /etc/omnitunnel/inst/*/instance.conf 2>/dev/null | grep -oE '[0-9]+'" 2>/dev/null | tr '\r\n' '  ' || true)
+    fport=$(peer_port_triples "$fhost")
     fnames=$(peer_ssh "$fhost" "ls /etc/omnitunnel/inst 2>/dev/null" 2>/dev/null | tr '\r\n' '  ' || true)
     case " $fnames " in *" $kn "*) die "the foreign already has an instance named '$kn' - choose a different name";; esac
-    local sub port key ta pa; sub=$(alloc_subnet "$fsub"); ta="10.201.$sub.1"; pa="10.201.$sub.2"; port=$(alloc_port "$(( $(port_base "$keep") + sub ))" "$fport"); key=$(gen_key); type_uses_key "$keep" || key=""
+    local sub port key ta pa; sub=$(alloc_subnet "$fsub"); ta="10.201.$sub.1"; pa="10.201.$sub.2"; port=$(alloc_port "$(( $(port_base "$keep") + sub ))" "$(printf '%s\n' "$fport" | remote_port_ranges)" "$keep"); key=$(gen_key); type_uses_key "$keep" || key=""
     provision_peer "$fhost" "$kn" "$keep" "$fhost" "$mylip" "$port" "$key" "$pa" "$ta" "$shape" "$nc"
     create_inst "$kn" "$keep" client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" "$shape" "$nc"
     inst_enable "$kn"; ok "kept '$keep' as instance '$kn' on both sides."
