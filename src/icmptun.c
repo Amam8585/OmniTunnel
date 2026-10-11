@@ -228,6 +228,7 @@ static int decapsulate(const unsigned char *buf, int len,
 #define REORDER_TIMEOUT_MS  45
 #define IO_BATCH            128
 #define TX_BATCH            256
+#define TUN_PENDING_LIMIT    1024
 
 #define FLOW_KEY_FRAG  0x01
 #define FLOW_ROLE_TX   1
@@ -276,6 +277,56 @@ static struct {
     uint64_t reordered, reorder_timeouts, alloc_failures;
 } metrics;
 static char stats_path[128];
+/* Preserve inner-packet delivery order if nonblocking TUN writes hit EAGAIN.
+ * A bounded queue is used only during actual backpressure, not on the fast path. */
+typedef struct {
+    unsigned char data[MAX_INNER];
+    uint16_t len;
+} tun_pending_t;
+static tun_pending_t *tun_pending;
+static unsigned tun_head, tun_tail, tun_count;
+static int tun_blocked, send_blocked;
+static void tun_set_writable(int enabled) {
+    if (tun_blocked == enabled) return;
+    struct epoll_event ev = { .events = EPOLLIN | (enabled ? EPOLLOUT : 0) };
+    ev.data.fd = tun_fd;
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, tun_fd, &ev) == 0)
+        tun_blocked = enabled;
+}
+static void tun_drain(void) {
+    int budget = IO_BATCH;
+    while (tun_count && budget-- > 0) {
+        tun_pending_t *p = &tun_pending[tun_head];
+        ssize_t n = write(tun_fd, p->data, p->len);
+        if (n < 0 && errno == EINTR) { ++budget; continue; }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            tun_set_writable(1);
+            return;
+        }
+        if (n == (ssize_t)p->len) metrics.tun_tx++;
+        else metrics.tun_errors++;
+        tun_head = (tun_head + 1) % TUN_PENDING_LIMIT;
+        tun_count--;
+    }
+    tun_set_writable(0);
+}
+static void tun_deliver(const unsigned char *data, uint16_t len) {
+    if (!tun_count) {
+        ssize_t n;
+        do { n = write(tun_fd, data, len); } while (n < 0 && errno == EINTR);
+        if (n == (ssize_t)len) { metrics.tun_tx++; return; }
+        if (n >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
+            metrics.tun_errors++; return;
+        }
+    }
+    if (tun_count >= TUN_PENDING_LIMIT) { metrics.tun_errors++; return; }
+    tun_pending_t *p = &tun_pending[tun_tail];
+    memcpy(p->data, data, len);
+    p->len = len;
+    tun_tail = (tun_tail + 1) % TUN_PENDING_LIMIT;
+    tun_count++;
+    tun_set_writable(1);
+}
 static void emit_stats(uint64_t uptime_ms) {
     static uint64_t last_report;
     if (uptime_ms - last_report < 1000) return;
@@ -521,7 +572,6 @@ static uint32_t timer_heap_min_deadline(void) {
 }
 
 static void flow_flush(flow_entry_t *f) {
-    metrics.reorder_timeouts++;
     uint16_t start = f->rx_next_seq;
     uint16_t max_delivered = f->rx_next_seq;
     int any = 0;
@@ -531,8 +581,8 @@ static void flow_flush(flow_entry_t *f) {
         int idx = seq & (REORDER_WINDOW - 1);
         rslot_t *slot = &f->rbuf[idx];
         if (slot->pkt && slot->seq == seq) {
-            ssize_t w = write(tun_fd, slot->pkt, slot->len);
-            DBG("DBG reorder: timeout-flush seq=%u wrote %zd to tun\n", seq, w);
+            tun_deliver(slot->pkt, slot->len);
+            DBG("DBG reorder: timeout-flush seq=%u to tun\n", seq);
             free(slot->pkt);
             slot->pkt = NULL;
             max_delivered = seq;
@@ -549,8 +599,10 @@ static void timer_heap_process_expired(uint32_t now) {
         timer_event_t e = timer_heap[0];
         timer_heap[0] = timer_heap[--timer_heap_size];
         timer_heap_sift_down(0);
-        if (e.flow->valid && e.flow->generation == e.generation && e.flow->timer_deadline == e.deadline)
+        if (e.flow->valid && e.flow->generation == e.generation && e.flow->timer_deadline == e.deadline) {
+            metrics.reorder_timeouts++;
             flow_flush(e.flow);
+        }
         timer_heap_clean();
     }
 }
@@ -568,16 +620,16 @@ static void flow_rx_packet(flow_entry_t *f, unsigned char *inner, uint16_t inner
     uint16_t delta = (uint16_t)(seq - expected);
 
     if (delta == 0) {
-        ssize_t w = write(tun_fd, inner, inner_len);
-        DBG("DBG reorder: in-order seq=%u wrote %zd to tun\n", seq, w);
+        tun_deliver(inner, inner_len);
+        DBG("DBG reorder: in-order seq=%u to tun\n", seq);
         free(inner);
         f->rx_next_seq++;
         while (1) {
             int idx = f->rx_next_seq & (REORDER_WINDOW - 1);
             rslot_t *slot = &f->rbuf[idx];
             if (slot->pkt && slot->seq == f->rx_next_seq) {
-                ssize_t dw = write(tun_fd, slot->pkt, slot->len);
-                DBG("DBG reorder: drained seq=%u wrote %zd to tun\n", slot->seq, dw);
+                tun_deliver(slot->pkt, slot->len);
+                DBG("DBG reorder: drained seq=%u to tun\n", slot->seq);
                 free(slot->pkt);
                 slot->pkt = NULL;
                 f->rx_next_seq++;
@@ -606,8 +658,8 @@ static void flow_rx_packet(flow_entry_t *f, unsigned char *inner, uint16_t inner
            first. */
         DBG("DBG reorder: seq=%u far outside window (expected %u), resyncing\n", seq, expected);
         flow_flush(f);
-        ssize_t w = write(tun_fd, inner, inner_len);
-        DBG("DBG reorder: resync wrote %zd to tun\n", w);
+        tun_deliver(inner, inner_len);
+        DBG("DBG reorder: resync to tun\n");
         free(inner);
         f->rx_next_seq = (uint16_t)(seq + 1);
     }
@@ -618,12 +670,11 @@ static void flow_rx_packet(flow_entry_t *f, unsigned char *inner, uint16_t inner
 static int flow_epoll_timeout(void) {
     uint32_t now = (uint32_t)now_ms();
     uint32_t deadline = timer_heap_min_deadline();
-    if (sq_count && !send_blocked) return 0;
+    if ((sq_count && !send_blocked) || (tun_count && !tun_blocked)) return 0;
     if (!deadline) return 1000;
     return deadline > now ? (int)(deadline - now) : 0;
 }
 
-static int send_blocked;
 static void send_set_writable(int enabled) {
     if (send_blocked == enabled) return;
     struct epoll_event ev = { .events = EPOLLIN | (enabled ? EPOLLOUT : 0) };
@@ -832,7 +883,8 @@ int tun_main_icmp(int argc, char **argv) {
     else           { local_ident = ident; remote_ident = (uint16_t)(ident + 1); }
 
     send_queue = calloc(QUEUE_SIZE, sizeof(out_pkt_t));
-    if (!send_queue) { perror("calloc"); return 1; }
+    tun_pending = calloc(TUN_PENDING_LIMIT, sizeof(*tun_pending));
+    if (!send_queue || !tun_pending) { perror("packet queue allocation"); return 1; }
 
     if (flow_init(flow_slots) < 0) {
         fprintf(stderr, "flow table allocation failed for %u slots\n", flow_slots);
@@ -905,9 +957,11 @@ int tun_main_icmp(int argc, char **argv) {
         struct epoll_event events[2];
         int nfds = epoll_wait(epoll_fd, events, 2, flow_epoll_timeout());
         if (nfds < 0) { if (errno == EINTR) continue; break; }
+        loop_clock_ms = (uint32_t)now_ms();
 
         for (int i = 0; i < nfds; i++) {
             if (events[i].data.fd == tun_fd) {
+                if (events[i].events & EPOLLOUT) tun_drain();
                 for (int batch = 0; batch < IO_BATCH; ++batch) {
                     ssize_t n = read(tun_fd, inner, sizeof(inner));
                     if (n < 0) {
@@ -972,7 +1026,6 @@ int tun_main_icmp(int argc, char **argv) {
                         unsigned char *copy = malloc(inlen);
                         if (copy) {
                             memcpy(copy, inner, inlen);
-                            metrics.tun_tx++;
                             metrics.rx_bytes += (uint64_t)inlen;
                             flow_rx_packet(f, copy, (uint16_t)inlen, seq);
                         } else metrics.alloc_failures++;
@@ -985,12 +1038,14 @@ int tun_main_icmp(int argc, char **argv) {
         }
         timer_heap_process_expired((uint32_t)now_ms());
         send_flush();
+        tun_drain();
         emit_stats(now_ms());
     }
 
     fprintf(stderr, "shutting down\n");
     close(tun_fd); close(icmp_fd); close(epoll_fd);
     free(send_queue);
+    free(tun_pending);
     free(flow_table);
     free(timer_heap);
     if (stats_path[0]) unlink(stats_path);
