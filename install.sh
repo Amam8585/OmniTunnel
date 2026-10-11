@@ -59,7 +59,7 @@ bin_changed() { [[ -n "$1" && "$1" != "$2" ]]; }
 root() { [[ $EUID -eq 0 ]] || die "run as root"; }
 deps() {
     local missing=0 c
-    for c in gcc curl tar gzip ip iptables python3; do
+    for c in gcc curl tar gzip ip iptables python3 ssh sshpass openssl nc; do
         command -v "$c" >/dev/null 2>&1 || missing=1
     done
     printf '#include <stdio.h>\nint main(void){return 0;}\n' |
@@ -69,7 +69,7 @@ deps() {
     export DEBIAN_FRONTEND=noninteractive
     apt-get update || die "apt update failed"
     apt-get install -y --no-install-recommends build-essential libc6-dev linux-libc-dev \
-        ca-certificates curl tar gzip iproute2 iptables python3 openssh-client ||
+        ca-certificates curl tar gzip iproute2 iptables python3 openssh-client sshpass openssl netcat-openbsd ||
         die "dependency installation failed"
     printf '#include <stdio.h>\nint main(void){return 0;}\n' |
         gcc -x c -fsyntax-only - >/dev/null || die "stdio.h headers unavailable after installation"
@@ -88,6 +88,8 @@ snapshot() {
         [[ "$n" == omnitunnel.sh ]] && src="$PREFIX/omnitunnel.sh"
         [[ ! -f "$src" ]] || cp -a "$src" "$dir/$n"
     done
+    [[ ! -d "$PREFIX/scripts" ]] || cp -a "$PREFIX/scripts" "$dir/scripts"
+    [[ ! -d "$PREFIX/docs" ]] || cp -a "$PREFIX/docs" "$dir/docs"
     printf '%s\n' "$dir" > "$BACKUPS/.latest.new"
     mv -f "$BACKUPS/.latest.new" "$BACKUPS/.latest"
     log "Backup saved: $dir"
@@ -102,6 +104,12 @@ rollback() {
         if [[ -f "$dir/$n" ]]; then
             install -m 0755 "$dir/$n" "$dst.new.$$"
             mv -f "$dst.new.$$" "$dst"
+        fi
+    done
+    for n in scripts docs; do
+        if [[ -d "$dir/$n" ]]; then
+            rm -rf "$PREFIX/$n"
+            cp -a "$dir/$n" "$PREFIX/$n"
         fi
     done
     log "Restored saved files; NO service restart was performed"
@@ -139,6 +147,16 @@ prepare() {
     "$out/bin/omnitun-$ARCH" version | grep -q '^omnitun ' ||
         die "compiled core validation failed"
     install -m 0755 "$src/omnitunnel.sh" "$out/omnitunnel.sh"
+    mkdir -p "$out/scripts" "$out/docs"
+    for n in monitor.sh optimizer.sh diagnostics.sh; do
+        [[ -r "$src/scripts/$n" ]] || die "required Direct management script missing: scripts/$n"
+        bash -n "$src/scripts/$n" || die "script syntax failed: $n"
+        install -m 0755 "$src/scripts/$n" "$out/scripts/$n"
+    done
+    if [[ -d "$src/docs" ]]; then cp -a "$src/docs/." "$out/docs/"; fi
+    [[ ! -f "$src/README.md" ]] || cp -a "$src/README.md" "$out/README.md"
+    [[ ! -f "$src/LICENSE" ]] || cp -a "$src/LICENSE" "$out/LICENSE"
+    [[ ! -f "$src/CHANGELOG.md" ]] || cp -a "$src/CHANGELOG.md" "$out/CHANGELOG.md"
     # Retain Go Direct transports and Hysteria; no Chisel reverse engine.
     for n in hysteria omnistripe omniackless; do
         [[ -s "$src/bin/$n-$ARCH" ]] || die "missing Direct binary $n-$ARCH"
@@ -169,7 +187,17 @@ apply() {
         mv -f "/usr/local/bin/$n.new.$$" "/usr/local/bin/$n"
         install -m 0755 "$stage/bin/$n-$ARCH" "$PREFIX/bin/$n-$ARCH"
     done
-    install -m 0755 "$stage/omnitunnel.sh" "$PREFIX/omnitunnel.sh.new.$$"
+    # Install support tools and documentation without replacing any running service.
+    mkdir -p "$PREFIX/scripts" "$PREFIX/docs"
+    for n in monitor.sh optimizer.sh diagnostics.sh; do
+        install -m 0755 "$stage/scripts/$n" "$PREFIX/scripts/$n.new.$"
+        mv -f "$PREFIX/scripts/$n.new.$" "$PREFIX/scripts/$n"
+    done
+    if [[ -d "$stage/docs" ]]; then cp -a "$stage/docs/." "$PREFIX/docs/"; fi
+    for n in README.md LICENSE CHANGELOG.md; do
+        [[ ! -f "$stage/$n" ]] || cp -a "$stage/$n" "$PREFIX/$n"
+    done
+    install -m 0755 "$stage/omnitunnel.sh" "$PREFIX/omnitunnel.sh.new.$"
     mv -f "$PREFIX/omnitunnel.sh.new.$$" "$PREFIX/omnitunnel.sh"
     ln -sfn "$PREFIX/omnitunnel.sh" /usr/local/bin/omnitunnel
     /usr/local/bin/omnitun version || die "installed core check failed; use --rollback"
@@ -197,6 +225,7 @@ case "$ACTION" in
         snapshot
         [[ -L /usr/local/bin/omnitunnel && "$(readlink /usr/local/bin/omnitunnel)" == "$PREFIX/omnitunnel.sh" ]] &&
             rm -f /usr/local/bin/omnitunnel
+        rm -rf "$PREFIX/scripts" "$PREFIX/docs"
         rm -f "$PREFIX/omnitunnel.sh" /usr/local/bin/omnitun \
             /usr/local/bin/hysteria /usr/local/bin/omnistripe /usr/local/bin/omniackless
         ((PURGE==0)) || rm -rf /etc/omnitunnel
