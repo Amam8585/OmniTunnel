@@ -305,11 +305,20 @@ prevent_downgrade() {
     # A local source dir may lack .git metadata: never silently replace a
     # DIFFERENT binary when neither side has a traceable Git commit.
     if [[ -z "$old" && -z "$new" ]]; then
-        local installed_sha staged_sha
-        installed_sha="$(sha256sum "$BIN_DIR/omnitun" 2>/dev/null | awk '{print $1}')"
-        staged_sha="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("binary_sha256",""))' "$1/build-info.json")"
-        [[ -n "$installed_sha" && "$installed_sha" == "$staged_sha" ]] && return 0
-        die "both revisions are unknown and candidate binary differs; pin a Git SHA or manually approve --allow-downgrade"
+        # No Git metadata: only allow strict byte-identical repeated installs.
+        # A changed manager, Go engine or helper is also a potential downgrade.
+        if python3 - "$PREFIX/build-info.json" "$1/build-info.json" <<'PY'
+import json, sys
+with open(sys.argv[1],encoding="utf-8") as f:
+    previous=json.load(f)
+with open(sys.argv[2],encoding="utf-8") as f:
+    staged=json.load(f)
+keys=("source_sha256","binary_sha256","artifacts")
+if any(not previous.get(key) or previous.get(key)!=staged.get(key) for key in keys):
+    sys.exit(1)
+PY
+        then return 0; fi
+        die "unknown Git revision and changed artifact: pin an immutable commit or explicitly approve --allow-downgrade"
     fi
     [[ "$old" =~ ^[a-fA-F0-9]{40}$ && "$new" =~ ^[a-fA-F0-9]{40}$ ]] ||
         die "unknown update lineage; --allow-downgrade requires manual verification"
