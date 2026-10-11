@@ -891,6 +891,16 @@ pf_apply_all() {
     if [[ -s "$maps" ]] || iptables -t filter -C FORWARD -j "$fw" 2>/dev/null; then
         pf_owned_chain filter "$fw" FORWARD
     fi
+    if [[ ! -s "$maps" ]]; then
+        # No active advanced maps: remove only OUR empty SNAT/FORWARD hooks,
+        # otherwise stale allow/DNAT rules would survive the last removal.
+        iptables -t nat -D POSTROUTING -j "$sn" 2>/dev/null || true
+        iptables -t nat -F "$sn" 2>/dev/null || true
+        iptables -t nat -X "$sn" 2>/dev/null || true
+        iptables -t filter -D FORWARD -j "$fw" 2>/dev/null || true
+        iptables -t filter -F "$fw" 2>/dev/null || true
+        iptables -t filter -X "$fw" 2>/dev/null || true
+    fi
     if [[ -s "$maps" ]]; then
         while IFS='|' read -r proto pubip pubport dstip dstport ingress; do
             iptables -w 5 -t nat -A "$ch" -i "$ingress" -d "$pubip" -p "$proto" \
@@ -1004,6 +1014,22 @@ pf_add() {
         np="$(norm_port "$p")" || { warn "skipping invalid port '$p'"; continue; }
         [[ -e "$pf" ]] || : > "$pf"
         for pr in $([[ "$proto" == both ]] && echo "tcp udp" || echo "$proto"); do
+            # Wildcard legacy forwards overlap every public IP on that port.
+            # Refuse conflicts with any other Direct mapping/instance.
+            local other of op oi
+            for other in $(list_instances); do
+                of="$(pf_map_file "$other")"
+                if [[ -s "$of" ]]; then
+                    while IFS='|' read -r op oi mapped_port _; do
+                        if [[ "$op" == "$pr" && "$mapped_port" == "$np" ]]; then
+                            die "wildcard $pr:$np collides with advanced mapping in $other"
+                        fi
+                    done < "$of"
+                fi
+                if [[ "$other" != "$1" ]] && grep -qxF "$pr:$np" "$(inst_pf "$other")" 2>/dev/null; then
+                    die "wildcard $pr:$np already forwarded by $other"
+                fi
+            done
             rc=0; grep -qx "$pr:$np" "$pf" 2>/dev/null || rc=$?
             [[ "$rc" -le 1 ]] || die "could not read $pf (grep exit $rc) - nothing added"
             [[ "$rc" -eq 0 ]] || echo "$pr:$np" >> "$pf"; done
