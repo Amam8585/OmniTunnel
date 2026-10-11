@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -119,6 +120,22 @@ jobs:
           gcc -O1 -g -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer \
             -o /tmp/icmptun-core-tests tests/icmptun_core_test.c
           ASAN_OPTIONS=detect_leaks=1 /tmp/icmptun-core-tests
+      - name: WebSocket RFC6455 sanitizer integration
+        run: |
+          gcc -O1 -g -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer \
+            -o /tmp/ws-handshake-tests tests/ws_handshake_test.c src/monocypher.c -pthread
+          ASAN_OPTIONS=detect_leaks=1 /tmp/ws-handshake-tests
+      - name: Clang direct C core build
+        run: |
+          clang -O2 -Wall -Wextra -fsyntax-only src/icmptun.c src/obsctun.c \
+            src/obsctcp.c src/obscmux.c src/obscws.c src/main.c src/monocypher.c
+      - name: Real installer integration in isolated prefix
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends sshpass netcat-openbsd
+          bash tests/installer_integration_test.sh
       - name: Direct preservation and shell tests
         run: |
-          for t in tests/*.sh; do bash "$t"; done
+          for t in tests/*.sh; do
+            if [ "$t" != tests/installer_integration_test.sh ]; then bash "$t"; fi
+          done
