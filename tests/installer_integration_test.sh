@@ -18,7 +18,8 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 run() {
     local cmd=(env "PATH=$WORK/stubs:$PATH" "OMNITUN_SOURCE_DIR=$ROOT"
         "OMNITUN_PREFIX=$WORK/prefix" "OMNITUN_STATE_DIR=$WORK/state"
-        "OMNITUN_BIN_DIR=$WORK/bin" bash "$ROOT/install.sh")
+        "OMNITUN_BIN_DIR=$WORK/bin" "FIXTURE=$FIXTURE" \
+        "OMNITUN_TEST_FAIL_AFTER=${OMNITUN_TEST_FAIL_AFTER:-}" bash "$ROOT/install.sh")
     if (( EUID != 0 )); then sudo "${cmd[@]}" "$@"; else "${cmd[@]}" "$@"; fi
 }
 run --prepare
