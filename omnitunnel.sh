@@ -733,7 +733,7 @@ restart_pf_relays() {
 }
 inst_enable() {
     need_root; load_inst "$1"; write_service "$1"
-    systemctl enable "$(svc_name "$1")" >/dev/null 2>&1 || true
+    systemctl enable "$(svc_name "$1")" >/dev/null 2>&1 || die "could not enable service $(svc_name "$1") for reboot"
     # Explicit start/restart invoked by the operator only, never by updater.
     # Do NOT report success unless systemd and the expected interface agree.
     if ! systemctl restart "$(svc_name "$1")"; then
@@ -1250,11 +1250,6 @@ cmd_server_token() {
     elif type_is_stripe "$t"; then ensure_omnistripe
     elif type_is_ackless "$t"; then ensure_omniackless
     elif ! type_is_kernel "$t"; then ensure_binary; fi
-    # Re-running the SAME token must be idempotent. A first attempt that half-
-    # failed (or was Ctrl-C'd) leaves the instance dir behind and this used to
-    # die "already exists" on every retry - so the foreign could never be set up.
-    # Replace it, then verify the unit actually came up and roll back if it did
-    # not, so the token stays retryable.
     # Never destroy or restart an existing instance just because an old token
     # was pasted again. An exact active match is idempotent; any mismatch is
     # rejected until the operator schedules a deliberate migration.
@@ -1270,10 +1265,9 @@ cmd_server_token() {
         die "peer instance '$name' exists but differs or is stopped; not replacing or restarting users automatically"
     fi
     create_inst "$name" "$t" server "$fhost" "$mylip" "$port" "$key" "$pta" "$ppa" "$shape" "$nc" "$pmode"
-    inst_enable "$name"
-    if ! inst_running "$name"; then
+    if ! (inst_enable "$name"); then
         inst_remove "$name" >/dev/null 2>&1 || true
-        die "server side '$name' failed to start (cleaned up - fix the cause and re-run the token). check: journalctl -u $(svc_name "$name")"
+        die "server side '$name' failed start/health check and was cleaned up; check systemd journal before retrying"
     fi
     ok "foreign (server) side '$name' is up: $fhost <- $mylip"
 }
