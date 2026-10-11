@@ -255,10 +255,11 @@ typedef struct {
     uint32_t   last_seen_ms;
     uint16_t   rx_next_seq;
     uint16_t   tx_next_seq;
-    uint16_t   generation;    /* invalidates stale timer-heap entries after evict/reuse */
+    uint64_t   generation;    /* prevent stale timer alias on 16-bit wrap */
+    uint16_t   pending;       /* buffered out-of-order frames */
     uint8_t    role;
     uint8_t    valid;
-    uint32_t   timer_deadline; /* 0 = no pending reorder timeout for this flow */
+    uint64_t   timer_deadline; /* 0 = no pending reorder timeout for this flow */
     rslot_t    rbuf[REORDER_WINDOW];
 } flow_entry_t;
 
@@ -269,7 +270,7 @@ typedef struct {
 static flow_bucket_t *flow_table;
 static unsigned flow_bucket_count = DEFAULT_FLOW_SLOTS / FLOW_TABLE_WAYS;
 static unsigned flow_slots = DEFAULT_FLOW_SLOTS;
-static uint32_t loop_clock_ms;
+static uint64_t loop_clock_ms;
 static struct {
     uint64_t tun_rx, tun_tx, icmp_rx, icmp_tx, rx_bytes, tx_bytes;
     uint64_t queue_full, queue_peak, tun_queue_drops, tun_queue_peak, send_errors, recv_errors, tun_errors;
@@ -364,9 +365,9 @@ static void emit_stats(uint64_t uptime_ms) {
 }
 
 typedef struct {
-    uint32_t deadline;
+    uint64_t deadline;
     flow_entry_t *flow;
-    uint16_t generation;
+    uint64_t generation;
 } timer_event_t;
 
 static timer_event_t *timer_heap;
@@ -477,6 +478,7 @@ static void flow_evict(flow_entry_t *f) {
     for (int i = 0; i < REORDER_WINDOW; i++) {
         if (f->rbuf[i].pkt) { free(f->rbuf[i].pkt); f->rbuf[i].pkt = NULL; }
     }
+    f->pending = 0;
 }
 
 static flow_entry_t *flow_table_insert(const flow_key_t *key, uint32_t hash, uint8_t role) {
@@ -516,6 +518,7 @@ static flow_entry_t *flow_table_insert(const flow_key_t *key, uint32_t hash, uin
     victim->rx_next_seq = 0;
     victim->tx_next_seq = 0;
     victim->timer_deadline = 0;
+    victim->pending = 0;
     victim->generation++;
     for (int i = 0; i < REORDER_WINDOW; i++) victim->rbuf[i].pkt = NULL;
     return victim;
@@ -577,7 +580,7 @@ static void timer_heap_clean(void) {
     }
 }
 
-static uint32_t timer_heap_min_deadline(void) {
+static uint64_t timer_heap_min_deadline(void) {
     timer_heap_clean();
     return timer_heap_size ? timer_heap[0].deadline : 0;
 }
@@ -604,7 +607,7 @@ static void flow_flush(flow_entry_t *f) {
     f->timer_deadline = 0;
 }
 
-static void timer_heap_process_expired(uint32_t now) {
+static void timer_heap_process_expired(uint64_t now) {
     timer_heap_clean();
     while (timer_heap_size > 0 && timer_heap[0].deadline <= now) {
         timer_event_t e = timer_heap[0];
@@ -679,11 +682,11 @@ static void flow_rx_packet(flow_entry_t *f, unsigned char *inner, uint16_t inner
 /* epoll_wait timeout: the minimum remaining time across every flow
    currently waiting on a missing packet, or the normal idle timeout */
 static int flow_epoll_timeout(void) {
-    uint32_t now = (uint32_t)now_ms();
-    uint32_t deadline = timer_heap_min_deadline();
+    uint64_t now = now_ms();
+    uint64_t deadline = timer_heap_min_deadline();
     if ((sq_count && !send_blocked) || (tun_count && !tun_blocked)) return 0;
     if (!deadline) return 1000;
-    return deadline > now ? (int)(deadline - now) : 0;
+    return deadline > now ? (int)((deadline - now) < 1000 ? (deadline - now) : 1000) : 0;
 }
 
 static void send_set_writable(int enabled) {
@@ -962,13 +965,13 @@ int tun_main_icmp(int argc, char **argv) {
     struct sockaddr_in from;
     socklen_t fromlen;
 
-    loop_clock_ms = (uint32_t)now_ms();
+    loop_clock_ms = now_ms();
     while (running) {
-        loop_clock_ms = (uint32_t)now_ms();
+        loop_clock_ms = now_ms();
         struct epoll_event events[2];
         int nfds = epoll_wait(epoll_fd, events, 2, flow_epoll_timeout());
         if (nfds < 0) { if (errno == EINTR) continue; break; }
-        loop_clock_ms = (uint32_t)now_ms();
+        loop_clock_ms = now_ms();
 
         for (int i = 0; i < nfds; i++) {
             if (events[i].data.fd == tun_fd) {
@@ -1047,7 +1050,7 @@ int tun_main_icmp(int argc, char **argv) {
                 }
             }
         }
-        timer_heap_process_expired((uint32_t)now_ms());
+        timer_heap_process_expired(now_ms());
         send_flush();
         tun_drain();
         emit_stats(now_ms());
