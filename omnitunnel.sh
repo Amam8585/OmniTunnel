@@ -1037,6 +1037,7 @@ pf_map_add() {
         die "advanced mapping failed; old config restored"
     fi
     rm -f "$backup"
+    exec {lock_fd}>&-  # release lock before returning (no self-deadlock)
     ok "Direct mapping added: $proto $pubip:$pubport -> $dstip:$dstport via $ingress"
 }
 pf_map_del() {
@@ -1063,10 +1064,13 @@ pf_map_del() {
         die "Direct mapping removal failed; restored config"
     fi
     rm -f "$backup"
+    exec {lock_fd}>&-
     ok "Direct mapping removed: $proto $pubip:$pubport via $ingress"
 }
 pf_add() {
     need_root; load_inst "$1"; local proto="$2" ports="$3"
+    exec {lock_fd}>"$INST_DIR/.pf.lock"
+    flock -x "$lock_fd" || die "could not lock forward mappings"
     [[ "$proto" =~ ^(tcp|udp|both)$ ]] || die "proto must be tcp|udp|both"
     # accept several ports at once, comma-separated: pf-add <inst> tcp 8080,8081,700
     local pf pr p np rc; pf="$(inst_pf "$1")"
@@ -1094,10 +1098,14 @@ pf_add() {
             [[ "$rc" -le 1 ]] || die "could not read $pf (grep exit $rc) - nothing added"
             [[ "$rc" -eq 0 ]] || echo "$pr:$np" >> "$pf"; done
     done
-    pf_apply_all "$1"; ok "forwarding $proto/$ports through '$1' to $PEER_ADDR"
+    pf_apply_all "$1"
+    exec {lock_fd}>&-
+    ok "forwarding $proto/$ports through '$1' to $PEER_ADDR"
 }
 pf_del() {
     need_root; load_inst "$1"; local ports="$2" pf p np; pf="$(inst_pf "$1")"
+    exec {lock_fd}>"$INST_DIR/.pf.lock"
+    flock -x "$lock_fd" || die "could not lock forward mappings"
     # accept several ports at once, comma-separated: pf-del <inst> 8080,8081
     if [[ -f "$pf" ]]; then
         for p in ${ports//,/ }; do
@@ -1105,7 +1113,9 @@ pf_del() {
             rewrite_without "$pf" ":0*$np\$" || die "could not rewrite $pf - nothing removed"
         done
     fi
-    pf_apply_all "$1"; ok "removed forward(s) on port(s) $ports from '$1'"
+    pf_apply_all "$1"
+    exec {lock_fd}>&-
+    ok "removed forward(s) on port(s) $ports from '$1'"
 }
 pf_flush_chain() {
     load_inst "$1" 2>/dev/null || return 0; local ch; ch="$(dnat_chain "$1")"
