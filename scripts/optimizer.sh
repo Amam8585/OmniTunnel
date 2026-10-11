@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# Per-Direct-ICMP conservative optimizer. Never changes global sysctls, routes, or firewall.
+set -euo pipefail
+ACTION="${1:-status}"; INSTANCE="${2:-}"; PROFILE="${3:-balanced}"; ACK="${4:-}"
+[[ "$ACTION" == status || "$ACTION" == recommend || "$ACTION" == dry-run || "$ACTION" == apply || "$ACTION" == rollback || "$ACTION" == compare ]] ||
+    { echo "usage: optimizer.sh status|recommend|dry-run|apply|rollback|compare <instance> [balanced|low-latency|high-throughput] [--acknowledge]" >&2; exit 2; }
+[[ "$INSTANCE" =~ ^[a-zA-Z0-9_-]+$ ]] || { echo "invalid instance" >&2; exit 2; }
+conf="/etc/omnitunnel/inst/$INSTANCE/instance.conf"
+[[ -r "$conf" ]] || { echo "missing instance: $INSTANCE" >&2; exit 1; }
+type="$(sed -n 's/^TYPE=//p' "$conf" | head -1)"
+dev="$(sed -n 's/^DEV=//p' "$conf" | head -1)"
+[[ "$type" == icmp ]] || { echo "optimizer restricted to Direct ICMP (found: $type)" >&2; exit 1; }
+[[ "$dev" =~ ^[A-Za-z0-9_-]{1,15}$ ]] || { echo "invalid TUN device" >&2; exit 1; }
+command -v ip >/dev/null || { echo "iproute2 missing" >&2; exit 1; }
+ip link show dev "$dev" >/dev/null || { echo "interface $dev is not up; changes refused" >&2; exit 1; }
+get_qlen() { ip -o link show dev "$dev" | grep -oE 'qlen [0-9]+' | awk '{print $2}' | head -1; }
+cur="$(get_qlen)"
+[[ "$cur" =~ ^[0-9]+$ ]] || { echo "unknown queue size for $dev" >&2; exit 1; }
+case "$PROFILE" in
+    balanced) proposed=1024;;
+    low-latency) proposed=512;;
+    high-throughput) proposed=2048;;
+    *) echo "unknown profile $PROFILE" >&2; exit 2;;
+esac
+backup_dir="/var/lib/omnitunnel/optimizer"
+snap="$backup_dir/$INSTANCE.last"
+stats="/run/omnitunnel/icmp-$dev.json"
+status() {
+    echo "Device: $dev | Direct protocol: $type | current TUN txqueuelen: $cur"
+    echo "Kernel: $(uname -r); CPU cores: $(nproc); RAM: $(awk '/MemTotal:/{printf "%.0f MiB",$2/1024}' /proc/meminfo)"
+    ip -s link show dev "$dev"
+    if command -v tc >/dev/null; then tc qdisc show dev "$dev"; fi
+    if [[ -r /proc/sys/net/netfilter/nf_conntrack_max ]]; then
+        echo "Conntrack: $(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo n/a)/$(cat /proc/sys/net/netfilter/nf_conntrack_max)"
+    else
+        echo "Conntrack: module unavailable (no attempt to write nf_conntrack_max)"
+    fi
+    for setting in /proc/sys/net/core/rmem_max /proc/sys/net/core/wmem_max /proc/sys/net/core/netdev_max_backlog /proc/sys/net/ipv4/ip_forward; do
+        [[ ! -r "$setting" ]] || echo "$setting=$(cat "$setting") (read-only report)"
+    done
+    [[ ! -r "$stats" ]] || { echo "ICMP core counters:"; cat "$stats"; echo; }
+}
+case "$ACTION" in
+    status) status;;
+    recommend|dry-run)
+        status
+        echo "Candidate $PROFILE -> ip link set dev $dev txqueuelen $proposed (current=$cur)"
+        echo "Experimental only. Lower kernel drop counts can mean longer queues and worse RTT."
+        echo "No global sysctl, rp_filter, default route, firewall, qdisc, or other tunnel changed.";;
+    compare)
+        status
+        if [[ -r "$snap" ]]; then
+            echo "Previous backup: $(cat "$snap")"
+        else
+            echo "No prior measurement/backup exists."
+        fi
+        echo "Compare RTT P95/P99, actual throughput and drops at matched load: this tool does not claim a speedup.";;
+    apply)
+        [[ $EUID -eq 0 ]] || { echo "root required for apply" >&2; exit 1; }
+        [[ "$ACK" == --acknowledge ]] ||
+            { echo "Explicit opt-in required: optimizer.sh apply $INSTANCE $PROFILE --acknowledge" >&2; exit 2; }
+        mkdir -p "$backup_dir"
+        if [[ ! -f "$snap" ]]; then
+            printf '%s %s %s %s\n' "$dev" "$cur" "$PROFILE" "$(date -u +%FT%TZ)" > "$snap.tmp"
+            mv -f "$snap.tmp" "$snap"
+        fi
+        ip link set dev "$dev" txqueuelen "$proposed"
+        updated="$(get_qlen)"
+        [[ "$updated" == "$proposed" ]] ||
+            { ip link set dev "$dev" txqueuelen "$cur" || true; echo "update validation failed" >&2; exit 1; }
+        echo "$PROFILE applied to $dev: qlen $cur -> $updated; snapshot: $snap"
+        echo "No claim of improvement: compare with equivalent traffic and tail-latency samples.";;
+    rollback)
+        [[ $EUID -eq 0 ]] || { echo "root required for rollback" >&2; exit 1; }
+        [[ -r "$snap" ]] || { echo "no backup for $INSTANCE" >&2; exit 1; }
+        read -r olddev before _ < "$snap"
+        [[ "$olddev" == "$dev" && "$before" =~ ^[0-9]+$ ]] ||
+            { echo "backup does not match this interface" >&2; exit 1; }
+        ip link set dev "$dev" txqueuelen "$before"
+        [[ "$(get_qlen)" == "$before" ]] || { echo "rollback validation failed" >&2; exit 1; }
+        rm -f "$snap"
+        echo "Rolled back $dev TUN queue length to $before";;
+esac
