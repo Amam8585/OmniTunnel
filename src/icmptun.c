@@ -586,6 +586,7 @@ static uint64_t timer_heap_min_deadline(void) {
 }
 
 static void flow_flush(flow_entry_t *f) {
+    if (!f->pending) { f->timer_deadline = 0; return; }
     uint16_t start = f->rx_next_seq;
     uint16_t max_delivered = f->rx_next_seq;
     int any = 0;
@@ -599,11 +600,20 @@ static void flow_flush(flow_entry_t *f) {
             DBG("DBG reorder: timeout-flush seq=%u to tun\n", seq);
             free(slot->pkt);
             slot->pkt = NULL;
+            if (f->pending) f->pending--;
             max_delivered = seq;
             any = 1;
         }
     }
     if (any) f->rx_next_seq = (uint16_t)(max_delivered + 1);
+    /* Flush may follow a resynchronization: reclaim stale orphan slots. */
+    if (f->pending) {
+        for (int i = 0; i < REORDER_WINDOW; i++) {
+            free(f->rbuf[i].pkt);
+            f->rbuf[i].pkt = NULL;
+        }
+        f->pending = 0;
+    }
     f->timer_deadline = 0;
 }
 
@@ -622,21 +632,18 @@ static void timer_heap_process_expired(uint64_t now) {
 }
 
 static int reorder_gap_pending(const flow_entry_t *f) {
-    for (int i = 0; i < REORDER_WINDOW; i++) if (f->rbuf[i].pkt) return 1;
-    return 0;
+    return f->pending != 0;
 }
 
-/* inner/inner_len must be a heap buffer the caller is handing off
-   ownership of - flow_rx_packet either writes+frees it immediately or
-   stores it in the flow's own reorder slot until delivered or timed out. */
-static void flow_rx_packet(flow_entry_t *f, unsigned char *inner, uint16_t inner_len, uint16_t seq) {
+/* Caller owns input data. Only an out-of-order frame needs a heap copy.
+   Reorder slots own their data until delivery, timeout or eviction. */
+static void flow_rx_packet(flow_entry_t *f, const unsigned char *inner, uint16_t inner_len, uint16_t seq) {
     uint16_t expected = f->rx_next_seq;
     uint16_t delta = (uint16_t)(seq - expected);
 
     if (delta == 0) {
         tun_deliver(inner, inner_len);
         DBG("DBG reorder: in-order seq=%u to tun\n", seq);
-        free(inner);
         f->rx_next_seq++;
         while (1) {
             int idx = f->rx_next_seq & (REORDER_WINDOW - 1);
@@ -646,6 +653,7 @@ static void flow_rx_packet(flow_entry_t *f, unsigned char *inner, uint16_t inner
                 DBG("DBG reorder: drained seq=%u to tun\n", slot->seq);
                 free(slot->pkt);
                 slot->pkt = NULL;
+                if (f->pending) f->pending--;
                 f->rx_next_seq++;
             } else break;
         }
@@ -653,9 +661,13 @@ static void flow_rx_packet(flow_entry_t *f, unsigned char *inner, uint16_t inner
     } else if (delta < REORDER_WINDOW) {
         metrics.reordered++;
         int idx = seq & (REORDER_WINDOW - 1);
-        if (f->rbuf[idx].pkt && f->rbuf[idx].seq == seq) { free(inner); return; } /* duplicate */
-        if (f->rbuf[idx].pkt) free(f->rbuf[idx].pkt); /* stale leftover, shouldn't happen */
-        f->rbuf[idx].pkt = inner;
+        if (f->rbuf[idx].pkt && f->rbuf[idx].seq == seq) return; /* duplicate */
+        unsigned char *buffered = malloc(inner_len);
+        if (!buffered) { metrics.alloc_failures++; return; }
+        memcpy(buffered, inner, inner_len);
+        if (f->rbuf[idx].pkt) free(f->rbuf[idx].pkt); /* replacement */
+        else f->pending++;
+        f->rbuf[idx].pkt = buffered;
         f->rbuf[idx].len = inner_len;
         f->rbuf[idx].seq = seq;
         DBG("DBG reorder: buffered seq=%u (expected %u)\n", seq, expected);
@@ -674,7 +686,6 @@ static void flow_rx_packet(flow_entry_t *f, unsigned char *inner, uint16_t inner
         flow_flush(f);
         tun_deliver(inner, inner_len);
         DBG("DBG reorder: resync to tun\n");
-        free(inner);
         f->rx_next_seq = (uint16_t)(seq + 1);
     }
 }
@@ -1037,12 +1048,8 @@ int tun_main_icmp(int argc, char **argv) {
                             memset(&key, 0, sizeof(key));
                             f = flow_get_or_create(&key, flow_key_hash(&key), FLOW_ROLE_RX);
                         }
-                        unsigned char *copy = malloc(inlen);
-                        if (copy) {
-                            memcpy(copy, inner, inlen);
-                            metrics.rx_bytes += (uint64_t)inlen;
-                            flow_rx_packet(f, copy, (uint16_t)inlen, seq);
-                        } else metrics.alloc_failures++;
+                        metrics.rx_bytes += (uint64_t)inlen;
+                        flow_rx_packet(f, inner, (uint16_t)inlen, seq);
                     } else {
                         metrics.invalid_packets++;
                         DBG("DBG decapsulate rejected packet\n");
