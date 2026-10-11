@@ -329,7 +329,7 @@ install_fwd_dropins() {
 
 load_inst() {
     local n="$1"; inst_exists "$n" || die "no such instance: $n"
-    TYPE=""; ROLE=""; LOCAL_IP=""; PEER_IP=""; TUN_ADDR=""; PEER_ADDR=""; PORT=""; KEY=""; DEV=""; MTU="1400"; NCONN="16"; SHAPE="none"; ICMP_MODE=""; PCOUNT="400"
+    TYPE=""; ROLE=""; LOCAL_IP=""; PEER_IP=""; TUN_ADDR=""; PEER_ADDR=""; PORT=""; KEY=""; DEV=""; MTU="1400"; NCONN="16"; SHAPE="none"; ICMP_MODE=""; PCOUNT="400"; FLOW_SLOTS="1024"
     # shellcheck disable=SC1090
     source "$(inst_conf "$n")"; INAME="$n"
 }
@@ -355,6 +355,7 @@ MTU=1400
 NCONN=$nc
 SHAPE=$shape
 ICMP_MODE=$imode
+FLOW_SLOTS=${OMNITUN_ICMP_FLOW_SLOTS:-1024}
 PCOUNT=$pcount
 EOF
 }
@@ -396,7 +397,7 @@ build_execstart() {
         tcp)  echo "$TSUITE_BIN tcp -L $LOCAL_IP -R $PEER_IP -A $TUN_ADDR -P $PEER_ADDR -p $PORT -k $KEY$sflag -T $DEV -M $MTU";;
         mux)  echo "$TSUITE_BIN mux -L $LOCAL_IP -R $PEER_IP -A $TUN_ADDR -P $PEER_ADDR -p $PORT -k $KEY$sflag -N $NCONN -T $DEV -M $MTU";;
         ws)   echo "$TSUITE_BIN ws -L $LOCAL_IP -R $PEER_IP -A $TUN_ADDR -P $PEER_ADDR -p $PORT -k $KEY$sflag -N $NCONN -T $DEV -M $MTU";;
-        icmp) echo "$TSUITE_BIN icmp -L $LOCAL_IP -R $PEER_IP -A $TUN_ADDR -P $PEER_ADDR -I 4d54 -T $DEV -M $MTU$sflag${ICMP_MODE:+ -r $ICMP_MODE}";;
+        icmp) echo "$TSUITE_BIN icmp -L $LOCAL_IP -R $PEER_IP -A $TUN_ADDR -P $PEER_ADDR -I 4d54 -T $DEV -M $MTU -F ${FLOW_SLOTS:-1024}$sflag${ICMP_MODE:+ -r $ICMP_MODE}";;
         stripe) echo "$OMNISTRIPE_BIN -L $LOCAL_IP -R $PEER_IP -A $TUN_ADDR -P $PEER_ADDR -k $KEY -p $PORT -C ${PCOUNT:-400} -N $NCONN -T $DEV -M $MTU$sflag";;
         ackless) echo "$OMNIACKLESS_BIN -L $LOCAL_IP -R $PEER_IP -A $TUN_ADDR -P $PEER_ADDR -k $KEY -p $PORT -T $DEV -M $MTU$sflag";;
     esac
