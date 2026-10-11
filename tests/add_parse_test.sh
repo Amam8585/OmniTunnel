@@ -31,12 +31,12 @@ check() {
     [[ "${ADD_REST[*]-}" == "$wantrest" ]] || fail "$desc: REST='${ADD_REST[*]-}' want '$wantrest'"
 }
 
-check "1-arg form auto-derives the name"        0 auto ackless 5.6.7.8 ""                   ackless 5.6.7.8
-check "explicit name + foreign"                 0 ""   myname  5.6.7.8 ""                   ackless myname 5.6.7.8
+check "1-arg form auto-derives the name"        0 auto ackless 203.0.113.9 ""                   ackless 203.0.113.9
+check "explicit name + foreign"                 0 ""   myname  203.0.113.9 ""                   ackless myname 203.0.113.9
 check "dotted name + dotless foreign"           0 ""   my.name host1   ""                   ackless my.name host1
-check "name that itself looks like an ip"       0 ""   1.2     5.6.7.8 ""                   ackless 1.2 5.6.7.8
-check "explicit name + foreign + nconn/shape/ip" 0 ""  myname  5.6.7.8 "32 90mbit 9.9.9.9"  ackless myname 5.6.7.8 32 90mbit 9.9.9.9
-check "two positional are name,foreign (no auto)" 0 "" 5.6.7.8 32      ""                   ackless 5.6.7.8 32
+check "name that itself looks like an ip"       0 ""   1.2     203.0.113.9 ""                   ackless 1.2 203.0.113.9
+check "explicit name + foreign + nconn/shape/ip" 0 ""  myname  203.0.113.9 "32 90mbit 9.9.9.9"  ackless myname 203.0.113.9 32 90mbit 9.9.9.9
+check "two positional are name,foreign (no auto)" 0 "" 203.0.113.9 32      ""                   ackless 203.0.113.9 32
 check "too few args fails"                      1 ""   ""      ""      ""                   ackless
 
 echo "PASSED - add_parse: 1 positional arg auto-derives the name; 2+ positional args are always (name, foreign), so a dotted name with a dotless foreign still parses correctly"
