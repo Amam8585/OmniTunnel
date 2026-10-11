@@ -130,6 +130,11 @@ jobs:
           gcc -O1 -g -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer \
             -o /tmp/icmptun-core-tests tests/icmptun_core_test.c
           ASAN_OPTIONS=detect_leaks=1 /tmp/icmptun-core-tests
+      - name: Fail-closed AEAD nonce source regression
+        run: |
+          gcc -O1 -g -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer \
+            -o /tmp/secure-nonce-test tests/secure_nonce_test.c
+          ASAN_OPTIONS=detect_leaks=1 /tmp/secure-nonce-test
       - name: WebSocket RFC6455 sanitizer integration
         run: |
           gcc -O1 -g -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer \
