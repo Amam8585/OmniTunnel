@@ -214,7 +214,7 @@ prepare() {
         die "compiled core validation failed"
     install -m 0755 "$src/omnitunnel.sh" "$out/omnitunnel.sh"
     mkdir -p "$out/scripts" "$out/docs"
-    for n in monitor.sh optimizer.sh diagnostics.sh; do
+    for n in monitor.sh optimizer.sh diagnostics.sh hysteria_audit.sh; do
         [[ -r "$src/scripts/$n" ]] || die "required Direct management script missing: scripts/$n"
         bash -n "$src/scripts/$n" || die "script syntax failed: $n"
         install -m 0755 "$src/scripts/$n" "$out/scripts/$n"
@@ -275,7 +275,7 @@ validate_stage() {
         [[ -x "$stage/bin/$n-$ARCH" ]] || die "missing staged engine $n"
     done
     bash -n "$stage/omnitunnel.sh" || die "invalid staged manager"
-    for n in monitor.sh optimizer.sh diagnostics.sh; do
+    for n in monitor.sh optimizer.sh diagnostics.sh hysteria_audit.sh; do
         [[ -r "$stage/scripts/$n" ]] && bash -n "$stage/scripts/$n" ||
             die "invalid staged tool $n"
     done
@@ -331,7 +331,7 @@ apply() {
             mv -f "$BIN_DIR/$n.new.${BASHPID}" "$BIN_DIR/$n" || exit 1
         done
         mkdir -p "$PREFIX/scripts" "$PREFIX/docs" "$PREFIX/bin" || exit 1
-        for n in monitor.sh optimizer.sh diagnostics.sh; do
+        for n in monitor.sh optimizer.sh diagnostics.sh hysteria_audit.sh; do
             install -m 0755 "$stage/scripts/$n" "$PREFIX/scripts/$n.new.${BASHPID}" || exit 1
             mv -f "$PREFIX/scripts/$n.new.${BASHPID}" "$PREFIX/scripts/$n" || exit 1
         done
