@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, phase3/direct-reliability-validation]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -87,10 +87,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Python syntax, benchmark unit tests and escaped Bash command regressions
+        run: |
+          python3 -m py_compile scripts/monitor_legacy.py benchmarks/latency_report.py benchmarks/test_latency_report.py
+          python3 -m unittest discover -s benchmarks -p 'test_*.py' -v
+          python3 tests/shell_escape_regression.py
       - name: run shell tests
         run: |
           set -e
           for t in tests/*.sh; do
+            [ "$t" != tests/installer_integration_test.sh ] || continue
             echo "::group::$t"
             bash "$t"
             echo "::endgroup::"
@@ -108,6 +114,7 @@ jobs:
       - name: Validate shell syntax
         run: |
           bash -n install.sh omnitunnel.sh icmptun-ctl.sh
+          for s in scripts/*.sh; do bash -n "$s"; done
           for t in tests/*.sh; do bash -n "$t"; done
       - name: Build all C Direct engines
         run: |
@@ -129,6 +136,9 @@ jobs:
         run: |
           clang -O2 -Wall -Wextra -fsyntax-only src/icmptun.c src/obsctun.c \
             src/obsctcp.c src/obscmux.c src/obscws.c src/main.c src/monocypher.c
+      - name: Runtime optimizer paths and rollback using fake iproute2
+        run: |
+          sudo bash tests/optimizer_runtime_test.sh
       - name: Real installer integration in isolated prefix
         run: |
           sudo apt-get update -qq
