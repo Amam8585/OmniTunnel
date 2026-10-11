@@ -2261,34 +2261,422 @@ menu_main() {
     while true; do
         banner
         echo
-        nitem 1 "Benchmark all tunnels & pick the best" "$C_BGRN$C_BOLD"
-        nitem 2 "Benchmark - manual (no SSH)"           "$C_BCYN$C_BOLD"
-        nitem 3 "Manage Direct tunnels"                        "$C_BLUE$C_BOLD"
-        nitem 4 "Port forwarding"
-        nitem 5 "Status of everything"
-        nitem 6 "Update OmniTunnel"
-        nitem 7 "Remove OmniTunnel"                     "$C_BRED$C_BOLD"
-        nitem 8 "Network optimizer (dry-run by default)"
-        nitem 9 "Direct ICMP performance stats"
-        nitem 10 "Direct tunnel diagnostics"
-        nitem 0 "Exit"
+        nitem 1 "Install / Create Tunnel" "$C_BGRN$C_BOLD"
+        nitem 2 "Manage Tunnels" "$C_BLUE$C_BOLD"
+        nitem 3 "Port Forwarding"
+        nitem 4 "Status & Monitoring"
+        nitem 5 "Network Optimization"
+        nitem 6 "Diagnostics & Benchmark"
+        nitem 7 "Update OmniTunnel"
+        nitem 8 "Completely Uninstall OmniTunnel" "$C_BRED$C_BOLD"
+        nitem 9 "Exit"
         rule_green
-        printf '  %bEnter your choice [0-10]:%b ' "$C_BGRN" "$C_RESET"
+        printf '  %bEnter your choice [1-9]:%b ' "$C_BGRN" "$C_RESET"
+        local c n any
         read -r c || exit 0
         case "$c" in
-            1) bench_run; pause;;
-            2) local fh mip; read -erp "Foreign server IP: " fh; mip="$(default_local_ip)"; read -erp "This box public IP [$mip]: " x; mip="${x:-$mip}"; [[ -n "$fh" ]] && cmd_bench_manual "$fh" "$mip"; pause;;
-            3) menu_instances;;
-            4) menu_pf;;
-            5) banner "Status of everything"; echo; inst_header; rule; local a5=0
-               for n in $(list_instances); do inst_status "$n" full; a5=1; done
-               [[ "$a5" == 0 ]] && printf '  %b%s no tunnels%b\n' "$C_GREY" "$G_DOT_OFF" "$C_RESET"; pause;;
-            6) cmd_update; pause;;
-            7) cmd_uninstall; pause;;
-            8) if pick_instance; then bash "$ASSET_DIR/scripts/optimizer.sh" recommend "$PICK" balanced; fi; pause;;
-            9) if pick_instance; then bash "$ASSET_DIR/scripts/monitor.sh" stats "$PICK"; fi; pause;;
-            10) if pick_instance; then bash "$ASSET_DIR/scripts/diagnostics.sh" "$PICK"; fi; pause;;
-            0) exit 0;;
+            1) wizard_add; pause;;
+            2) menu_instances;;
+            3) menu_pf;;
+            4) banner "Status & Monitoring"; echo; inst_header; rule
+               any=0
+               for n in $(list_instances); do inst_status "$n" full; any=1; done
+               [[ "$any" == 0 ]] && info "No tunnels configured."
+               if pick_instance; then bash "$ASSET_DIR/scripts/monitor.sh" stats "$PICK"; fi
+               pause;;
+            5) if pick_instance; then bash "$ASSET_DIR/scripts/optimizer.sh" recommend "$PICK" balanced; fi; pause;;
+            6) banner "Diagnostics & Benchmark"
+               nitem 1 "Tunnel diagnostics"
+               nitem 2 "Benchmark all transports (generates traffic)"
+               nitem 3 "Manual benchmark (generates traffic)"
+               nitem 0 "Back"
+               read -rp "Choice: " c || c=0
+               case "$c" in
+                   1) if pick_instance; then bash "$ASSET_DIR/scripts/diagnostics.sh" "$PICK"; fi;;
+                   2) read -rp "Benchmark generates network traffic. Type BENCH to continue: " c
+                      [[ "$c" == BENCH ]] && bench_run;;
+                   3) local fh mip x
+                      read -erp "Foreign server IP: " fh
+                      mip="$(default_local_ip)"
+                      read -erp "This box public IP [$mip]: " x
+                      mip="${x:-$mip}"
+                      read -rp "Benchmark generates network traffic. Type BENCH to continue: " c
+                      [[ "$c" == BENCH && -n "$fh" ]] && cmd_bench_manual "$fh" "$mip";;
+               esac
+               pause;;
+            7) cmd_update; pause;;
+            8) cmd_uninstall; pause;;
+            9|0) exit 0;;
+            *) warn "Choose a number from 1 to 9"; pause;;
+        esac
+    done
+}
+
+# ------------------------------------------------------------------- main -----
+mkdir -p "$INST_DIR" "$PEER_DIR" 2>/dev/null || true
+# remember how we were invoked so guard_peer_downgrade can re-exec after a
+# self-update (see that function).
+OMNI_ARGV=("$@")
+case "${1:-menu}" in
+    menu|"")          need_root; ensure_binary; menu_main;;
+    bench)            need_root; bench_run;;
+    add)              need_root; wizard_add;;
+    add-auto)         shift; cmd_add_auto "$@";;
+    add-manual)       shift; cmd_add_manual "$@";;
+    server-token)     need_root; cmd_server_token "${2:?token}";;
+    bench-manual)     shift; cmd_bench_manual "$@";;
+    bench-server)     need_root; cmd_bench_server "${2:?token}";;
+    bench-clean)      need_root; cmd_bench_clean;;
+    list)             for n in $(list_instances); do inst_status "$n"; done;;
+    status)           inst_status "${2:?instance}";;
+    enable)           inst_enable "${2:?instance}";;
+    remove)           need_root; remove_instance_fully "${2:?instance}";;
+    _remove)          need_root; inst_remove "${2:?instance}";;
+    pf-add)           pf_add "${2:?}" "${3:?}" "${4:?}";;
+    pf-del)           pf_del "${2:?}" "${3:?}";;
+    pf-map-add)       pf_map_add "${2:?name}" "${3:?protocol}" "${4:?public_ip}" "${5:?public_port}" "${6:?destination_ip}" "${7:?destination_port}" "${8:?ingress_interface}";;
+    pf-map-del)       pf_map_del "${2:?name}" "${3:?protocol}" "${4:?public_ip}" "${5:?public_port}" "${6:?ingress_interface}";;
+    stats)            bash "$ASSET_DIR/scripts/monitor.sh" stats "${2:?instance}" "${3:-}";;
+    monitor)          bash "$ASSET_DIR/scripts/monitor.sh" monitor "${2:?instance}" "${3:-}";;
+    optimizer)        shift; bash "$ASSET_DIR/scripts/optimizer.sh" "$@";;
+    diagnostics)      bash "$ASSET_DIR/scripts/diagnostics.sh" "${2:?instance}";;
+    _postup)          cmd_postup "${2:?}";;
+    _prefwd)          cmd_prefwd;;
+    _peercreate)      shift; cmd_peercreate "$@";;
+    ensure-binary)    ensure_binary; ok "core ready at $TSUITE_BIN ($(arch_tag))";;
+    fix-forwarding)   need_root; ensure_forwarding ""
+                      for n in $(list_instances); do
+                          inst_exists "$n" || continue
+                          load_inst "$n"; ensure_forwarding "$DEV"
+                      done
+                      repair_all_forwarding
+                      off="$(forwarding_offenders)"
+                      if persist_forwarding; then pmsg="persisted in $FWD_SYSCTL_FILE"
+                      else pmsg="NOT persisted ($FWD_SYSCTL_FILE unwritable) - will reset on reboot"; fi
+                      if [[ -z "$off" ]]; then ok "IP forwarding on for every interface; $pmsg"
+                      else warn "could not turn it on for: ${off% }; $pmsg"; fi
+                      dn="$(install_fwd_dropins)"
+                      [[ "$dn" -gt 0 ]] && info "added the boot-time forwarding hook to $dn existing unit(s) - no restart needed"
+                      ovr="$(forwarding_conf_overrides)"
+                      [[ -n "$ovr" ]] && warn "these sysctl files are applied AFTER $FWD_SYSCTL_FILE and decide the value at boot: ${ovr% }"
+                      true;;
+    update|upgrade)   need_root; cmd_update;;
+    uninstall|purge)  need_root; cmd_uninstall;;
+    version|-v|--version) echo "tunnelctl $VERSION (core: $($TSUITE_BIN version 2>/dev/null || echo n/a))";;
+    *) echo "usage: $0 [menu|bench|add|list|status <n>|enable <n>|remove <n>|pf-add <n> <proto> <port>|pf-del <n> <port>|pf-map-add <n> <proto> <public-ip> <pubport> <dest-ip> <dstport> <ingress-if>|pf-map-del <n> <proto> <public-ip> <pubport> <ingress-if>|stats <n> [--json]|monitor <n> [--json]|optimizer <action> <n>|diagnostics <n>|fix-forwarding|update|uninstall]";;
+esac    # Do not sweep chains by name: chain names alone are not ownership proof.
+    # Instance-specific cleanup above owns its firewall removal. Unknown chains
+    # are retained for manual review to protect unrelated services.
+    local leftover
+    leftover="$(iptables -t nat -S 2>/dev/null | grep -oE 'TSUITE_[A-Z0-9_]+' | sort -u || true)"
+    [[ -z "$leftover" ]] || warn "Unrecognized NAT chains preserved for manual review: $leftover"
+    # 4) core binaries + relay helper
+    rm -f "$TSUITE_BIN" "$HYSTERIA_BIN" "$HY_RELAY" "$FWD_SYSCTL_FILE"
+    rm -rf /etc/systemd/system/omnitun-*.service.d
+    # 5) state, the command symlink, then the install dir (this script lives there)
+    rm -rf "$ROOT_DIR"
+    rm -f "$BINLINK"
+    ok "OmniTunnel removed. Deleting its own files now - goodbye."
+    rm -rf "$ASSET_DIR"
+    exit 0
+}
+
+# -------------------------------------------------------------------- menus ---
+# count instances by state for the header strip
+_state_counts() {
+    RUN=0; STOP=0; local n
+    for n in $(list_instances); do inst_running "$n" && RUN=$((RUN+1)) || STOP=$((STOP+1)); done
+}
+UI_W=62
+_rule() { local i s=""; for ((i=0;i<UI_W;i++)); do s="$s${G_H}"; done; printf '%s' "$s"; }
+rule() { printf '  %b%s%b\n' "$C_GREY" "$(_rule)" "$C_RESET"; }
+# A double rule used between the header blocks of the home screen.
+_drule() { local i s=""; for ((i=0;i<UI_W;i++)); do s="${s}═"; done; printf '%s' "$s"; }
+rule_amber() { printf '  %b%s%b\n' "$C_BYEL" "$(_drule)" "$C_RESET"; }
+rule_green() { printf '  %b%s%b\n' "$C_BGRN" "$(_drule)" "$C_RESET"; }
+# label: value line of the header blocks
+kv() { printf '  %b%-16s%b %b%s%b\n' "$C_BCYN" "$1" "$C_RESET" "${3:-$C_WHITE}" "$2" "$C_RESET"; }
+# home-screen menu entry:  1. Label
+nitem() { printf '   %b%s. %s%b\n' "${3:-$C_WHITE}" "$1" "$2" "$C_RESET"; }
+# Choose an existing tunnel by NUMBER (never by typing its name - that is
+# error-prone and impossible for a non-ASCII / Persian name, and the terminal's
+# backspace can eat into the prompt when editing multibyte input). Sets PICK to
+# the chosen instance name; returns non-zero if there are none or the user cancels.
+pick_instance() {
+    PICK=""; local names=() n i=1
+    for n in $(list_instances); do names+=("$n"); done
+    if [[ ${#names[@]} -eq 0 ]]; then warn "no tunnels yet"; return 1; fi
+    printf '  %bpick a tunnel:%b\n' "$C_DIM" "$C_RESET"
+    for n in "${names[@]}"; do printf '   %b%d%b. %s\n' "$C_BCYN$C_BOLD" "$i" "$C_RESET" "$n"; i=$((i+1)); done
+    printf '   %b0%b. cancel\n  %b❯%b ' "$C_DIM" "$C_RESET" "$C_BCYN$C_BOLD" "$C_RESET"
+    local ch; read -r ch || true
+    [[ "$ch" =~ ^[0-9]+$ ]] || { warn "please enter a number"; return 1; }
+    [[ "$ch" =~ ^0+$ ]] && return 1
+    ch="$(pick_num "$ch" "${#names[@]}")" || { warn "no tunnel numbered $ch"; return 1; }
+    PICK="${names[$((ch-1))]}"
+    return 0
+}
+# Choose the forward protocol by number. Sets PROTO to tcp / udp / both.
+pick_proto() {
+    PROTO=""
+    printf '  %bprotocol:%b\n' "$C_DIM" "$C_RESET"
+    printf '   %b1%b. tcp\n   %b2%b. udp\n   %b3%b. udp + tcp  (both)\n' \
+        "$C_BCYN$C_BOLD" "$C_RESET" "$C_BCYN$C_BOLD" "$C_RESET" "$C_BCYN$C_BOLD" "$C_RESET"
+    printf '  %b❯%b ' "$C_BCYN$C_BOLD" "$C_RESET"; local pn; read -r pn || true
+    case "$pn" in 1) PROTO=tcp;; 2) PROTO=udp;; 3) PROTO=both;; *) warn "pick 1, 2 or 3"; return 1;; esac
+    return 0
+}
+# List instance $1's forwarded ports by number; set PORT_PICK to the chosen one.
+pick_fwd_port() {
+    PORT_PICK=""; PORT_KIND=""; local pf mc p dh dp ports=() kinds=() labels=() seen=" " i=1 x ch
+    pf="$(inst_pf "$1")"; mc=""
+    if [[ -s "$pf" ]]; then
+        while IFS=: read -r _ p; do [[ -z "$p" || "$seen" == *" $p "* ]] && continue
+            seen+="$p "; ports+=("$p"); kinds+=(pf); labels+=("port $p"); done < "$pf"
+    fi
+    [[ ${#ports[@]} -eq 0 ]] && { warn "this tunnel has no forwards"; return 1; }
+    printf '  %bwhich forward to remove:%b\n' "$C_DIM" "$C_RESET"
+    for x in "${labels[@]}"; do printf '   %b%d%b. %s\n' "$C_BCYN$C_BOLD" "$i" "$C_RESET" "$x"; i=$((i+1)); done
+    printf '   %b0%b. cancel\n  %b❯%b ' "$C_DIM" "$C_RESET" "$C_BCYN$C_BOLD" "$C_RESET"; read -r ch || true
+    [[ "$ch" =~ ^[0-9]+$ ]] || { warn "enter a number"; return 1; }
+    [[ "$ch" =~ ^0+$ ]] && return 1
+    ch="$(pick_num "$ch" "${#ports[@]}")" || { warn "no forward numbered $ch"; return 1; }
+    PORT_PICK="${ports[$((ch-1))]}"; PORT_KIND="${kinds[$((ch-1))]}"
+    return 0
+}
+
+# The home screen: wordmark, build info, this box, then the menu. Sub-screens
+# get the compact one-line header instead (pass a crumb).
+banner() {
+    clear 2>/dev/null || true
+    local crumb="${1:-}" myip; myip="$(default_local_ip 2>/dev/null)"
+    _state_counts
+    local fwd=0 n c m pf mc
+    for n in $(list_instances); do
+        pf="$(inst_pf "$n")"; c=0; m=0
+        [[ -s "$pf" ]] && c=$(grep -c . "$pf" 2>/dev/null || true)
+        [[ "$c" =~ ^[0-9]+$ ]] || c=0
+        fwd=$((fwd+c))
+    done
+    if [[ -n "$crumb" ]]; then
+        local right; right="${myip:-?} · $(arch_tag)"
+        local pad=$(( UI_W - ${#crumb} - ${#right} - 14 )); [[ $pad -lt 1 ]] && pad=1
+        printf '\n  %bOMNITUNNEL%b  %b%s%b%*s%b%s%b\n' \
+            "$C_BCYN$C_BOLD" "$C_RESET" "$C_WHITE$C_BOLD" "$crumb" "$C_RESET" \
+            "$pad" "" "$C_GREY" "$right" "$C_RESET"
+        rule_amber
+        printf '  %b%-16s%b %b%s running%b, %b%s stopped%b   %b%-10s%b %b%s%b\n' \
+            "$C_BCYN" "Tunnels:" "$C_RESET" \
+            "$([[ $RUN -gt 0 ]] && printf '%s' "$C_BGRN" || printf '%s' "$C_GREY")" "$RUN" "$C_RESET" \
+            "$([[ $STOP -gt 0 ]] && printf '%s' "$C_BRED" || printf '%s' "$C_GREY")" "$STOP" "$C_RESET" \
+            "$C_BCYN" "Forwards:" "$C_RESET" "$C_WHITE" "$fwd" "$C_RESET"
+        rule_amber
+        return 0
+    fi
+    printf '%b\n' "$C_BCYN$C_BOLD"
+    cat <<'EOF'
+  █████ █   █ █   █ █████ █████ █   █ █   █ █   █ █████ █
+  █   █ ██ ██ ██  █   █     █   █   █ ██  █ ██  █ █     █
+  █   █ █ █ █ █ █ █   █     █   █   █ █ █ █ █ █ █ ████  █
+  █   █ █   █ █  ██   █     █   █   █ █  ██ █  ██ █     █
+  █████ █   █ █   █ █████   █   █████ █   █ █   █ █████ █████
+EOF
+    printf '%b' "$C_RESET"
+    printf '  %bOmniTunnel Direct Manager%b\n\n' "$C_WHITE" "$C_RESET"
+    kv "Script Version:" "$VERSION"
+    kv "Core Version:" "$("$TSUITE_BIN" version 2>/dev/null || echo 'not installed')"
+    kv "Source:" "github.com/Amam8585/OmniTunnel"
+    rule_amber
+    kv "IP Address:" "${myip:-unknown}"
+    kv "Architecture:" "$(arch_tag)"
+    kv "Tunnels:" "$RUN running, $STOP stopped" "$([[ $RUN -gt 0 ]] && printf '%s' "$C_BGRN" || printf '%s' "$C_GREY")"
+    kv "Port forwards:" "$fwd"
+    kv "Core:" "$([[ -x "$TSUITE_BIN" ]] && echo Installed || echo missing)" "$([[ -x "$TSUITE_BIN" ]] && printf '%s' "$C_BGRN" || printf '%s' "$C_BRED")"
+    local off; off="$(forwarding_offenders)"
+    if [[ -n "$off" ]]; then
+        kv "IP forwarding:" "OFF on ${off% }" "$C_BRED"
+        printf '  %b%s%b\n' "$C_BYEL" "forwards silently drop while this is off - fix with: omnitunnel fix-forwarding" "$C_RESET"
+    fi
+    local ovr; ovr="$(forwarding_conf_overrides)"
+    if [[ -n "$ovr" ]]; then
+        kv "Forwarding conf:" "overridden at boot by ${ovr% }" "$C_BYEL"
+    fi
+    rule_amber
+    return 0
+}
+# a section heading used inside the sub-screens
+heading() { printf '  %b%s%b\n' "$C_GREY" "$1" "$C_RESET"; }
+# a numbered menu item:  key  label  [hint]  [key-colour]
+mitem() {
+    local kc="${4:-$C_BCYN$C_BOLD}"
+    printf '    %b%s%b  %b%-24s%b %b%s%b\n' "$kc" "$1" "$C_RESET" "$C_WHITE" "$2" "$C_RESET" "$C_GREY" "${3:-}" "$C_RESET"
+}
+# the persistent key legend that closes every screen
+keyhint() { printf '\n'; rule; printf '  %b%s%b\n' "$C_GREY" "$1" "$C_RESET"; }
+prompt() { printf '\n  %b❯%b ' "$C_BCYN$C_BOLD" "$C_RESET"; }
+# ------------------------------------------------------- benchmark table ------
+# "652 Mbits/sec" / "870 Kbits/sec" / "1.2 Gbits/sec" -> a plain mbit number
+_mbit() { awk -v s="$1" 'BEGIN{ n=s+0; if (s ~ /Kbits/) n/=1000; else if (s ~ /Gbits/) n*=1000; if (s !~ /[0-9]/) n=0; printf "%.6g", n }'; }
+_bar()  { local n="$1" i s=""; for ((i=0;i<n;i++)); do s="${s}█"; done; printf '%s' "$s"; }
+_gt()   { awk -v a="$1" -v b="$2" 'BEGIN{exit !(a>b)}'; }
+# Sorted, bar-charted results. Reads ROWS[] (type|download|loss|ping), RAW_DL,
+# RAW_PING. Marks the outright winner and, separately, the fastest fully
+# obfuscated transport - the distinction the whole run exists to answer.
+bench_table() {
+    local r t dl ul ls pg v max=0 sv=0 stealth="" sorted=() line
+    banner "Benchmark results"
+    for r in "${ROWS[@]}"; do
+        IFS='|' read -r t dl ul ls pg <<< "$r"; v="$(_mbit "$dl")"
+        sorted+=("$(printf '%012.3f|%s' "$v" "$r")")
+        if _gt "$v" "$max"; then max="$v"; fi
+        case "$t" in udp|tcp|mux|ws|hysteria|fou|icmp) if _gt "$v" "$sv"; then sv="$v"; stealth="$t"; fi;; esac
+    done
+    local OIFS="$IFS"; IFS=$'\n'; sorted=($(printf '%s\n' "${sorted[@]}" | sort -r)); IFS="$OIFS"
+    echo
+    printf '  %braw path (plain TCP, policed)%b   down %b%s%b / up %b%s%b   rtt %b%s ms%b\n\n' \
+        "$C_GREY" "$C_RESET" "$C_WHITE" "${RAW_DL:-n/a}" "$C_RESET" "$C_WHITE" "${RAW_UL:-n/a}" "$C_RESET" "$C_WHITE" "${RAW_PING:-n/a}" "$C_RESET"
+    printf '    %b%-12s %-14s %-8s %-8s %-6s %-5s %s%b\n' "$C_GREY" "TYPE" "" "DOWNLOAD" "UPLOAD" "LOSS" "PING" "NOTE" "$C_RESET"
+    local first=1 n bar bc lcol lsc ucol mark note dnum unum
+    for line in "${sorted[@]}"; do
+        v="${line%%|*}"; r="${line#*|}"; IFS='|' read -r t dl ul ls pg <<< "$r"
+        n=$(awk -v a="$v" -v m="$max" 'BEGIN{ if (m<=0) {print 0; exit} k=int(14*a/m+0.5); if (k<1 && a>0) k=1; print k }')
+        bar="$(_bar "$n")$(printf '%*s' $((14-n)) '')"
+        bc="$C_BCYN"; lcol="$C_WHITE"; mark=" "; note=""
+        if [[ "$first" == 1 ]]; then bc="$C_BGRN"; mark="$G_ARROW"; note="fastest"; first=0; fi
+        if [[ "$t" == "$stealth" ]]; then note="${note:+$note · }stealth pick"; fi
+        if _gt "$(awk -v m="$max" 'BEGIN{print m/50}')" "$v"; then bc="$C_GREY"; lcol="$C_GREY"; fi
+        lsc="$C_BGRN"; [[ "$ls" != "0%" ]] && lsc="$C_BYEL"
+        dnum="$dl"; [[ "$dl" == *bits/sec* ]] && dnum="${dl%% *}$(printf '%s' "${dl#* }" | cut -c1)"
+        unum="$ul"; [[ "$ul" == *bits/sec* ]] && unum="${ul%% *}$(printf '%s' "${ul#* }" | cut -c1)"
+        ucol="$lcol"; [[ "$ul" == FAIL || "$ul" == n/a ]] && ucol="$C_BYEL"
+        printf '  %b%s%b %b%-12s%b %b%s%b %b%-8s%b %b%-8s%b %b%-6s%b %-5s %b%s%b\n' \
+            "$C_BGRN" "$mark" "$C_RESET" "$lcol" "$t" "$C_RESET" \
+            "$bc" "$bar" "$C_RESET" "$lcol" "$dnum" "$C_RESET" \
+            "$ucol" "$unum" "$C_RESET" \
+            "$lsc" "$ls" "$C_RESET" "$pg" "$C_GREY" "$note" "$C_RESET"
+    done
+    echo
+    return 0
+}
+menu_instances() {
+    while true; do
+        banner "Manage tunnels"
+        local any=0 n
+        echo; inst_header; rule
+        for n in $(list_instances); do inst_status "$n" full; any=1; done
+        [[ "$any" == 0 ]] && printf '  %b%s no tunnels yet - add one below%b\n' "$C_GREY" "$G_DOT_OFF" "$C_RESET"
+        echo
+        nitem 1 "Add a tunnel  (auto - sets up the foreign over SSH)" "$C_BGRN$C_BOLD"
+        nitem 2 "Add a tunnel  (manual - paste a token abroad)"       "$C_BCYN$C_BOLD"
+        nitem 3 "Remove a tunnel"                                     "$C_BRED$C_BOLD"
+        nitem 4 "Restart a tunnel"
+        nitem 5 "Live logs"
+        nitem 0 "Back"
+        rule_green
+        printf '  %bEnter your choice [0-5]:%b ' "$C_BGRN" "$C_RESET"
+        read -r c || exit 0
+        case "$c" in
+            1) wizard_add; pause;;
+            2) wizard_add_manual; pause;;
+            3) if pick_instance; then remove_instance_fully "$PICK"; fi; pause;;
+            4) if pick_instance; then inst_enable "$PICK"; fi; pause;;
+            5) if pick_instance; then journalctl -u "$(svc_name "$PICK")" -n 40 --no-pager 2>/dev/null || true; fi; pause;;
+            0) return;;
+        esac
+    done
+}
+menu_pf() {
+    while true; do
+        banner "Port forwarding"
+        heading "a port hit on this box is tunneled to the far side"
+        local n pf mc any=0
+        for n in $(list_instances); do
+            pf="$(inst_pf "$n")"; any=1
+            printf '  %b%s%b %b%s%b\n' "$C_MAG" "$G_V" "$C_RESET" "$C_BOLD$C_WHITE" "$n" "$C_RESET"
+            local shown=0
+            if [[ -s "$pf" ]]; then
+                local proto port
+                while IFS=: read -r proto port; do [[ -z "$proto" ]] && continue
+                    shown=1
+                    printf '       %b%s%b %b%-4s%b %s\n' "$C_GREEN" "$G_ARROW" "$C_RESET" "$C_CYAN" "$proto" "$C_RESET" "$port"; done < "$pf"
+            fi
+            [[ "$shown" == 0 ]] && printf '       %b(no forwards)%b\n' "$C_DIM" "$C_RESET"
+        done
+        [[ "$any" == 0 ]] && printf '  %b(add a tunnel first)%b\n' "$C_DIM" "$C_RESET"
+        echo
+        nitem 1 "Add a forward     (pick tunnel · protocol · port)" "$C_BGRN$C_BOLD"
+        nitem 2 "Remove a forward  (pick tunnel · port)"            "$C_BRED$C_BOLD"
+        nitem 0 "Back"
+        rule_green
+        printf '  %bEnter your choice [0-2]:%b ' "$C_BGRN" "$C_RESET"
+        read -r c || exit 0
+        case "$c" in
+            1) if pick_instance; then n="$PICK"
+                 if pick_proto; then read -erp "  port number: " po
+                     if [[ "$po" =~ ^[0-9]+$ ]]; then pf_add "$n" "$PROTO" "$po"; else warn "port must be a number"; fi
+                 fi
+               fi; pause;;
+            2) if pick_instance; then n="$PICK"
+                 if pick_fwd_port "$n"; then
+                     pf_del "$n" "$PORT_PICK"
+                 fi
+               fi; pause;;
+            0) return;;
+        esac
+    done
+}
+group() { printf '\n  %b%s%b\n' "$C_GREY" "$1" "$C_RESET"; }
+menu_main() {
+    while true; do
+        banner
+        echo
+        nitem 1 "Install / Create Tunnel" "$C_BGRN$C_BOLD"
+        nitem 2 "Manage Tunnels" "$C_BLUE$C_BOLD"
+        nitem 3 "Port Forwarding"
+        nitem 4 "Status & Monitoring"
+        nitem 5 "Network Optimization"
+        nitem 6 "Diagnostics & Benchmark"
+        nitem 7 "Update OmniTunnel"
+        nitem 8 "Completely Uninstall OmniTunnel" "$C_BRED$C_BOLD"
+        nitem 9 "Exit"
+        rule_green
+        printf '  %bEnter your choice [1-9]:%b ' "$C_BGRN" "$C_RESET"
+        local c n any
+        read -r c || exit 0
+        case "$c" in
+            1) wizard_add; pause;;
+            2) menu_instances;;
+            3) menu_pf;;
+            4) banner "Status & Monitoring"; echo; inst_header; rule
+               any=0
+               for n in $(list_instances); do inst_status "$n" full; any=1; done
+               [[ "$any" == 0 ]] && info "No tunnels configured."
+               if pick_instance; then bash "$ASSET_DIR/scripts/monitor.sh" stats "$PICK"; fi
+               pause;;
+            5) if pick_instance; then bash "$ASSET_DIR/scripts/optimizer.sh" recommend "$PICK" balanced; fi; pause;;
+            6) banner "Diagnostics & Benchmark"
+               nitem 1 "Tunnel diagnostics"
+               nitem 2 "Benchmark all transports (generates traffic)"
+               nitem 3 "Manual benchmark (generates traffic)"
+               nitem 0 "Back"
+               read -rp "Choice: " c || c=0
+               case "$c" in
+                   1) if pick_instance; then bash "$ASSET_DIR/scripts/diagnostics.sh" "$PICK"; fi;;
+                   2) read -rp "Benchmark generates network traffic. Type BENCH to continue: " c
+                      [[ "$c" == BENCH ]] && bench_run;;
+                   3) local fh mip x
+                      read -erp "Foreign server IP: " fh
+                      mip="$(default_local_ip)"
+                      read -erp "This box public IP [$mip]: " x
+                      mip="${x:-$mip}"
+                      read -rp "Benchmark generates network traffic. Type BENCH to continue: " c
+                      [[ "$c" == BENCH && -n "$fh" ]] && cmd_bench_manual "$fh" "$mip";;
+               esac
+               pause;;
+            7) cmd_update; pause;;
+            8) cmd_uninstall; pause;;
+            9|0) exit 0;;
+            *) warn "Choose a number from 1 to 9"; pause;;
         esac
     done
 }
