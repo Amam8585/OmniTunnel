@@ -23,7 +23,7 @@ export LOG="$WORK/firewall.log"
 cat > "$WORK/bin/iptables" <<'SH'
 #!/usr/bin/env bash
 echo "$*" >> "$LOG"
-case "$*" in *" -C "*) exit 1;; esac
+case "$*" in *" -C "*|*" -S "*) exit 1;; esac
 exit 0
 SH
 cat > "$WORK/bin/ip" <<'SH'
