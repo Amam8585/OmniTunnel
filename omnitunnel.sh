@@ -2257,8 +2257,8 @@ menu_instances() {
         for n in $(list_instances); do inst_status "$n" full; any=1; done
         [[ "$any" == 0 ]] && printf '  %b%s no tunnels yet - add one below%b\n' "$C_GREY" "$G_DOT_OFF" "$C_RESET"
         echo
-        nitem 1 "Add a tunnel  (auto - sets up the foreign over SSH)" "$C_BGRN$C_BOLD"
-        nitem 2 "Add a tunnel  (manual - paste a token abroad)"       "$C_BCYN$C_BOLD"
+        nitem 1 "Add a tunnel (manual token; no SSH credentials)" "$C_BGRN$C_BOLD"
+        nitem 2 "Add a tunnel (automatic SSH provisioning)"       "$C_BCYN$C_BOLD"
         nitem 3 "Remove a tunnel"                                     "$C_BRED$C_BOLD"
         nitem 4 "Restart a tunnel"
         nitem 5 "Live logs"
@@ -2267,7 +2267,7 @@ menu_instances() {
         printf '  %bEnter your choice [0-5]:%b ' "$C_BGRN" "$C_RESET"
         read -r c || exit 0
         case "$c" in
-            1) wizard_add; pause;;
+            1) wizard_add_manual; pause;;
             2) wizard_add_manual; pause;;
             3) if pick_instance; then remove_instance_fully "$PICK"; fi; pause;;
             4) if pick_instance; then inst_enable "$PICK"; fi; pause;;
