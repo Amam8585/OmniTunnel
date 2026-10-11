@@ -822,22 +822,98 @@ inst_detail() {
 }
 
 # ------------------------------------------------------------- port fwd -------
+# Advanced Direct mapping entries: proto|public-ip|public-port|dest-ip|dest-port|ingress-if
+pf_map_file() { echo "$INST_DIR/$1/map.conf"; }
+pf_snat_chain() { echo "OMNI_S_$(printf '%s' "$1" | cksum | awk '{print $1}')"; }
+pf_filter_chain() { echo "OMNI_F_$(printf '%s' "$1" | cksum | awk '{print $1}')"; }
+pf_ipv4() { python3 -c 'import ipaddress,sys; ipaddress.IPv4Address(sys.argv[1])' "$1" 2>/dev/null; }
+pf_owned_chain() {
+    local table="$1" chain="$2" hook="$3"
+    if ! iptables -w 5 -t "$table" -N "$chain" 2>/dev/null; then
+        iptables -w 5 -t "$table" -C "$hook" -j "$chain" 2>/dev/null ||
+            die "chain $table/$chain exists without an OmniTunnel hook: refusing to flush another owner's rules"
+    fi
+    iptables -w 5 -t "$table" -F "$chain" ||
+        die "unable to flush our own $table/$chain"
+    iptables -w 5 -t "$table" -C "$hook" -j "$chain" 2>/dev/null ||
+        iptables -w 5 -t "$table" -I "$hook" 1 -j "$chain" ||
+        die "failed to hook $table/$chain"
+}
+pf_check_chain_collisions() {
+    local mine="$1" other
+    for other in $(list_instances); do
+        [[ "$other" == "$mine" ]] && continue
+        if [[ "$(dnat_chain "$other")" == "$(dnat_chain "$mine")" ||
+              "$(pf_snat_chain "$other")" == "$(pf_snat_chain "$mine")" ||
+              "$(pf_filter_chain "$other")" == "$(pf_filter_chain "$mine")" ]]; then
+            die "firewall chain naming collision between $mine and $other (no rules changed)"
+        fi
+    done
+}
 pf_apply_all() {
     load_inst "$1"
-    # hysteria forwards ports outside iptables: TCP via per-port relays (no engine
-    # restart), UDP in-config (restart only if the UDP set changed).
-    if type_is_hysteria "$TYPE"; then
-        hy_pf_reconcile "$1"
-        return 0
+    if type_is_hysteria "$TYPE"; then hy_pf_reconcile "$1"; return 0; fi
+    local pf maps ch sn fw proto pubip pubport dstip dstport ingress
+    pf="$(inst_pf "$1")"; maps="$(pf_map_file "$1")"
+    [[ -r "$pf" || -r "$maps" ]] || return 0
+    pf_check_chain_collisions "$1"
+    ch="$(dnat_chain "$1")"
+    sn="$(pf_snat_chain "$1")"
+    fw="$(pf_filter_chain "$1")"
+    # Preflight ALL config lines before mutating any firewall chain.
+    if [[ -s "$maps" ]]; then
+        while IFS='|' read -r proto pubip pubport dstip dstport ingress; do
+            [[ "$proto" == tcp || "$proto" == udp ]] || die "invalid mapped protocol"
+            pf_ipv4 "$pubip" && pf_ipv4 "$dstip" || die "invalid mapped IPv4"
+            norm_port "$pubport" >/dev/null && norm_port "$dstport" >/dev/null ||
+                die "invalid mapped port"
+            [[ "$ingress" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] ||
+                die "unsafe ingress interface name in mapping"
+            ip -o -4 addr show dev "$ingress" |
+                awk '{print $4}' | cut -d/ -f1 | grep -qxF "$pubip" ||
+                die "public IP $pubip is not owned by interface $ingress"
+            ip -4 route get "$dstip" | grep -qE "(^| )dev $DEV( |$)" ||
+                die "destination $dstip does not route through Direct device $DEV"
+        done < "$maps"
     fi
-    local pf; pf="$(inst_pf "$1")"; [[ -f "$pf" ]] || return 0
-    local ch; ch="$(dnat_chain "$1")"
-    iptables -t nat -N "$ch" 2>/dev/null || true; iptables -t nat -F "$ch"
-    iptables -t nat -C PREROUTING -j "$ch" 2>/dev/null || iptables -t nat -I PREROUTING 1 -j "$ch"
-    iptables -t nat -C POSTROUTING -o "$DEV" -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o "$DEV" -j MASQUERADE
-    local proto port
-    while IFS=: read -r proto port; do [[ -z "$proto" ]] && continue
-        iptables -t nat -A "$ch" -p "$proto" --dport "$port" -j DNAT --to-destination "$PEER_ADDR:$port"; done < "$pf"
+    pf_owned_chain nat "$ch" PREROUTING
+    # The old -o DEVICE MASQUERADE remains for legacy wildcard pf.conf.
+    if [[ -s "$pf" ]]; then
+        iptables -w 5 -t nat -C POSTROUTING -o "$DEV" -j MASQUERADE 2>/dev/null ||
+            iptables -w 5 -t nat -A POSTROUTING -o "$DEV" -j MASQUERADE ||
+            die "legacy MASQUERADE could not be installed"
+    fi
+    if [[ -s "$maps" ]]; then
+        pf_owned_chain nat "$sn" POSTROUTING
+        pf_owned_chain filter "$fw" FORWARD
+        while IFS='|' read -r proto pubip pubport dstip dstport ingress; do
+            iptables -w 5 -t nat -A "$ch" -i "$ingress" -d "$pubip" -p "$proto" \
+                --dport "$pubport" -j DNAT --to-destination "$dstip:$dstport" ||
+                die "DNAT mapping apply failed"
+            iptables -w 5 -t nat -A "$sn" -o "$DEV" -d "$dstip" -p "$proto" \
+                --dport "$dstport" -j SNAT --to-source "$TUN_ADDR" ||
+                die "SNAT mapping apply failed"
+            iptables -w 5 -t filter -A "$fw" -i "$ingress" -o "$DEV" \
+                -d "$dstip" -p "$proto" --dport "$dstport" \
+                -m conntrack --ctstate NEW,ESTABLISHED -j ACCEPT ||
+                die "FORWARD allow rule failed"
+            iptables -w 5 -t filter -A "$fw" -i "$DEV" -o "$ingress" \
+                -s "$dstip" -p "$proto" --sport "$dstport" \
+                -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT ||
+                die "FORWARD return rule failed"
+        done < "$maps"
+    fi
+    if [[ -s "$pf" ]]; then
+        local port
+        while IFS=: read -r proto port; do
+            [[ -z "$proto" ]] && continue
+            [[ "$proto" == tcp || "$proto" == udp ]] || die "invalid legacy protocol"
+            norm_port "$port" >/dev/null || die "invalid legacy port"
+            iptables -w 5 -t nat -A "$ch" -p "$proto" --dport "$port" \
+                -j DNAT --to-destination "$PEER_ADDR:$port" ||
+                die "legacy DNAT forwarding failed"
+        done < "$pf"
+    fi
 }
 pf_add() {
     need_root; load_inst "$1"; local proto="$2" ports="$3"
