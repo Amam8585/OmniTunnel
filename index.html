@@ -460,7 +460,7 @@
         <span>install — run on each box</span>
         <button class="copy-btn" onclick="copyInstall(this)">copy</button>
       </div>
-      <pre id="install-cmd"><span class="tok-cmd">curl</span> -fsSL https://raw.githubusercontent.com/Amam8585/OmniTunnel/phase2/direct-performance-engineering/install.sh -o /tmp/omnitunnel-install.sh <span class="tok-dim">&&</span> <span class="tok-cmd">sudo bash</span> /tmp/omnitunnel-install.sh --prepare</pre>
+      <pre id="install-cmd"><span class="tok-cmd">curl</span> -fsSL https://raw.githubusercontent.com/Amam8585/OmniTunnel/phase2/direct-performance-engineering/install.sh -o /tmp/omnitunnel-install.sh <span class="tok-dim">&&</span> <span class="tok-cmd">sudo env</span> OMNITUN_REF=phase2/direct-performance-engineering bash /tmp/omnitunnel-install.sh --prepare</pre>
     </div>
     <p class="install-note">Development-only staging on a disposable test VM: checks dependencies, compiles Direct engines and saves a candidate without restarting any running tunnel. Activation requires separate review, explicit apply and verified lab tests.</p>
 
@@ -676,7 +676,7 @@ omnitunnel add-auto   stripe striped &lt;foreign_ip&gt;</div>
 
 <script>
   function copyInstall(btn) {
-    var text = "curl -fsSL https://raw.githubusercontent.com/Amam8585/OmniTunnel/phase2/direct-performance-engineering/install.sh -o /tmp/omnitunnel-install.sh && sudo bash /tmp/omnitunnel-install.sh --prepare";
+    var text = "curl -fsSL https://raw.githubusercontent.com/Amam8585/OmniTunnel/phase2/direct-performance-engineering/install.sh -o /tmp/omnitunnel-install.sh && sudo env OMNITUN_REF=phase2/direct-performance-engineering bash /tmp/omnitunnel-install.sh --prepare";
     navigator.clipboard.writeText(text).then(function () {
       var orig = btn.textContent;
       btn.textContent = "copied";
