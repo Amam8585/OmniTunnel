@@ -78,7 +78,8 @@ active_units() {
         exe="$(readlink "$proc" 2>/dev/null || true)"
         case "$exe" in
             "$BIN_DIR/omnitun"|"$BIN_DIR/icmptun"|"$PREFIX/"*|/usr/local/bin/omnitun|/usr/local/bin/icmptun)
-                printf 'PID:%s [%s]\n' "${proc#/proc/}" "$exe";;
+                local pid="${proc#/proc/}"
+                printf 'PID:%s [%s]\n' "${pid%/exe}" "$exe";;
         esac
     done
 }
@@ -300,7 +301,25 @@ prevent_downgrade() {
     local old new status
     old="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("commit",""))' "$PREFIX/build-info.json")"
     new="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("commit",""))' "$1/build-info.json")"
-    [[ "$old" == "$new" ]] && return 0
+    if [[ "$old" == "$new" && -n "$old" ]]; then return 0; fi
+    # A local source dir may lack .git metadata: never silently replace a
+    # DIFFERENT binary when neither side has a traceable Git commit.
+    if [[ -z "$old" && -z "$new" ]]; then
+        # No Git metadata: only allow strict byte-identical repeated installs.
+        # A changed manager, Go engine or helper is also a potential downgrade.
+        if python3 - "$PREFIX/build-info.json" "$1/build-info.json" <<'PY'
+import json, sys
+with open(sys.argv[1],encoding="utf-8") as f:
+    previous=json.load(f)
+with open(sys.argv[2],encoding="utf-8") as f:
+    staged=json.load(f)
+keys=("source_sha256","binary_sha256","artifacts")
+if any(not previous.get(key) or previous.get(key)!=staged.get(key) for key in keys):
+    sys.exit(1)
+PY
+        then return 0; fi
+        die "unknown Git revision and changed artifact: pin an immutable commit or explicitly approve --allow-downgrade"
+    fi
     [[ "$old" =~ ^[a-fA-F0-9]{40}$ && "$new" =~ ^[a-fA-F0-9]{40}$ ]] ||
         die "unknown update lineage; --allow-downgrade requires manual verification"
     status="$(curl -fsSL "https://api.github.com/repos/$REPO/compare/$old...$new" |
@@ -329,6 +348,7 @@ apply() {
         for n in omnitun hysteria omnistripe omniackless; do
             install -m 0755 "$stage/bin/$n-$ARCH" "$BIN_DIR/$n.new.${BASHPID}" || exit 1
             mv -f "$BIN_DIR/$n.new.${BASHPID}" "$BIN_DIR/$n" || exit 1
+            [[ "$PREFIX" == /opt/omnitunnel || "${OMNITUN_TEST_FAIL_AFTER:-}" != after-binary ]] || exit 79
         done
         mkdir -p "$PREFIX/scripts" "$PREFIX/docs" "$PREFIX/bin" || exit 1
         for n in monitor.sh optimizer.sh diagnostics.sh hysteria_audit.sh; do
@@ -343,9 +363,14 @@ apply() {
         done
         install -m 0755 "$stage/omnitunnel.sh" "$PREFIX/omnitunnel.sh.new.${BASHPID}" || exit 1
         mv -f "$PREFIX/omnitunnel.sh.new.${BASHPID}" "$PREFIX/omnitunnel.sh" || exit 1
+        [[ "$PREFIX" == /opt/omnitunnel || "${OMNITUN_TEST_FAIL_AFTER:-}" != after-manager ]] || exit 79
         cp -a "$stage/build-info.json" "$PREFIX/build-info.json.new.${BASHPID}" || exit 1
         mv -f "$PREFIX/build-info.json.new.${BASHPID}" "$PREFIX/build-info.json" || exit 1
         ln -sfn "$PREFIX/omnitunnel.sh" "$LINK" || exit 1
+        if [[ "$PREFIX" != /opt/omnitunnel && "${OMNITUN_TEST_FAIL_AFTER:-}" == partial-write ]]; then
+            printf 'partial simulated FS write\n' >> "$PREFIX/omnitunnel.sh"
+            exit 79
+        fi
         [[ "$PREFIX" == /opt/omnitunnel || "${OMNITUN_TEST_FAIL_AFTER:-}" != after-copy ]] || exit 79
         "$BIN_DIR/omnitun" version | grep -q '^omnitun ' || exit 1
         bash -n "$PREFIX/omnitunnel.sh" || exit 1
@@ -388,6 +413,12 @@ if [[ "$ACTION" == check ]]; then
     exit 0
 fi
 root
+# A single lock covers staging pointer, snapshots, apply, rollback and removal.
+# Prevent overlapping installers from racing to replace the same paths.
+mkdir -p "$STATE"
+command -v flock >/dev/null 2>&1 || die "flock required for safe multi-instance upgrades"
+exec {installer_lock}>"$STATE/.installer.lock"
+flock -w 60 "$installer_lock" || die "installer busy: another operation holds $STATE/.installer.lock"
 case "$ACTION" in
     backup) ((DRY)) && exit 0; snapshot;;
     rollback)

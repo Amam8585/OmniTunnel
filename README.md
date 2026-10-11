@@ -25,7 +25,7 @@ The former **Reverse-MUX/Chisel** mechanism, its manager commands and service cr
 Run on a disposable VM, not the production pair:
 
 ```bash
-OMNITUN_REF=refactor/direct-only-icmp-performance bash <(curl -fsSL https://raw.githubusercontent.com/Amam8585/OmniTunnel/refactor/direct-only-icmp-performance/install.sh) --prepare
+OMNITUN_REF=main bash <(curl -fsSL https://raw.githubusercontent.com/Amam8585/OmniTunnel/main/install.sh) --prepare
 ```
 
 The installer detects Ubuntu 22.04/24.04 or Debian 12/13 and CPU architecture, installs missing build packages, builds C from source, validates it and stages it. **It does not restart or replace running services.** Only after verifying the build and scheduling maintenance should you use `sudo bash install.sh --apply` from a local checkout. Applying while active instances are detected requires an additional explicit `--allow-active`, but even then there is **no automatic restart**.

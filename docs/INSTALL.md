@@ -7,7 +7,7 @@ Test on a disposable Ubuntu 22.04/24.04 or Debian 12/13 VM with CAP_NET_RAW, CAP
 ## Prepare only (no live service restart)
 
 ```bash
-OMNITUN_REF=refactor/direct-only-icmp-performance bash <(curl -fsSL https://raw.githubusercontent.com/Amam8585/OmniTunnel/refactor/direct-only-icmp-performance/install.sh) --prepare
+OMNITUN_REF=main bash <(curl -fsSL https://raw.githubusercontent.com/Amam8585/OmniTunnel/main/install.sh) --prepare
 ```
 
 This detects OS/architecture, checks/install required compiler+headers, downloads the selected source as a tar archive, compiles the entire C Direct program, validates the version, and stages C + all supported auxiliary Direct binaries and manager scripts. Staging never modifies installed executable files, configurations or systemd units. If downloaded files are untrusted, manually verify source and commit ID and pin `OMNITUN_REF` to a reviewed immutable commit hash before running as root.
@@ -48,14 +48,14 @@ sudo omnitunnel optimizer recommend YOUR_ICMP_INSTANCE balanced
 sudo omnitunnel optimizer dry-run YOUR_ICMP_INSTANCE low-latency
 ```
 
-Optional experimental changes to **one owned ICMP interface only**, with explicit consent:
+Optional experimental changes to **one owned Direct L3 interface only**, with explicit consent:
 
 ```bash
 sudo omnitunnel optimizer apply YOUR_ICMP_INSTANCE balanced --acknowledge
 sudo omnitunnel optimizer rollback YOUR_ICMP_INSTANCE
 ```
 
-The proposed queue lengths (512/1024/2048) are **experimental presets, not benchmark-proven improvements**. No sysctl-wide TCP/UDP tuning is performed by this optimizer. System qdisc, GRE, FOU, WireGuard, firewall rules and default route are left unchanged. Optimizer qlen updates are runtime-only and are not currently persisted after reboot.
+Balanced preserves the existing queue length. Low Latency and High Throughput propose bounded changes; these are **experimental hypotheses, not benchmark-proven improvements**. No sysctl-wide TCP/UDP tuning is performed by this optimizer. System qdisc, GRE, FOU, WireGuard, firewall rules and default route are left unchanged. Optimizer qlen updates are runtime-only and are not currently persisted after reboot.
 
 To test a larger ICMP per-process flow table on a new instance only, set `OMNITUN_ICMP_FLOW_SLOTS=16384` when adding a **new** ICMP instance. The command line uses `-F 16384`. Supported powers of 2 are 1024 through 65536. Bigger tables may consume hundreds of MiB; do not assume better performance.
 
@@ -80,3 +80,29 @@ Avoid the old legacy `icmptun-ctl.sh` controller for new ICMP performance experi
 6. Do not merge/deploy if CI or two-peer experiments fail.
 
 **Important:** `omnitunnel update` now stages, not activates. The existing legacy uninstaller inside `omnitunnel.sh` is separate from the new installer `--uninstall` and removes tunnel instances; do not run it on a machine containing live production users.
+
+## Phase 3 experimental testing (disposable VM only)
+
+This Phase 3 branch has not passed CI or two-peer acceptance testing. Use a
+reviewed full Git commit SHA, not a movable development branch name, when
+staging a source candidate:
+
+    curl -fsSL https://raw.githubusercontent.com/Amam8585/OmniTunnel/phase3/direct-reliability-validation/install.sh -o /tmp/omni-phase3.sh
+    sudo env OMNITUN_REF=<REVIEWED_40_CHARACTER_COMMIT_SHA> bash /tmp/omni-phase3.sh --prepare
+
+Run the automated installer rollback test and compare SHA256 entries in the
+build-info.json staged manifest before applying. The installer does not
+restart active Direct tunnels, and apply is forbidden when they are detected
+unless --allow-active is explicitly supplied. Never use --allow-active on
+production just to bypass a failed maintenance procedure.
+
+    sudo bash /tmp/omni-phase3.sh --check
+    sudo bash /tmp/omni-phase3.sh --backup
+    sudo bash /tmp/omni-phase3.sh --rollback
+
+Program-file rollback alone does not revert a changed active netfilter
+generation; check the instance's pf.active file, private chain ownership
+and the lab connectivity/return path separately. A live firewall update is
+not globally atomic across tables in Phase 3.
+
+See PHASE3_VALIDATION.md for the unverified CI and lab acceptance gates.

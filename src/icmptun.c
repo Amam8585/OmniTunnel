@@ -39,6 +39,8 @@
 #define QUEUE_SIZE     4096
 #define MAX_PKT        2048
 #define MAX_INNER      1500
+#define TUN_READ_CAP   65536  /* detect GSO or oversized inner packet without truncating */
+#define QUEUE_HIGH_WATER (QUEUE_SIZE * 3 / 4)
 #define MIN_ICMP_PAYLOAD 56        /* Linux `ping` default payload size - pad
                                        up to this so small tunneled packets
                                        (TCP ACKs, DNS, etc) don't stand out by
@@ -91,8 +93,7 @@ static uint16_t cksum(const void *buf, int len) {
 }
 
 static int encapsulate(const void *inner, int inner_len, uint16_t seq, out_pkt_t *out) {
-    if (inner_len > mtu) {
-        fprintf(stderr, "drop oversized inner packet: %d > mtu %d\n", inner_len, mtu);
+    if (inner_len <= 0 || inner_len > mtu || inner_len > MAX_INNER) {
         return -1;
     }
     /* Pad the ICMP payload up to a normal ping size when the real inner
@@ -256,7 +257,7 @@ typedef struct {
 
 typedef struct {
     flow_key_t key;
-    uint32_t   last_seen_ms;
+    uint64_t   last_seen_ms;
     uint16_t   rx_next_seq;
     uint16_t   tx_next_seq;
     uint64_t   generation;    /* prevent stale timer alias on 16-bit wrap */
@@ -279,7 +280,8 @@ static struct {
     uint64_t tun_rx, tun_tx, icmp_rx, icmp_tx, rx_bytes, tx_bytes;
     uint64_t queue_full, queue_peak, tun_queue_drops, tun_queue_peak, send_errors, recv_errors, tun_errors;
     uint64_t invalid_packets, flow_evictions, flow_collisions, active_flows;
-    uint64_t reordered, reorder_timeouts, alloc_failures;
+    uint64_t reordered, reorder_timeouts, alloc_failures, tun_oversized, queue_pressure;
+    uint64_t flow_lookup_calls, flow_lookup_probes, queue_pauses;
 } metrics;
 static char stats_path[128];
 /* Preserve inner-packet delivery order if nonblocking TUN writes hit EAGAIN.
@@ -290,10 +292,22 @@ typedef struct {
 } tun_pending_t;
 static tun_pending_t *tun_pending;
 static unsigned tun_head, tun_tail, tun_count;
-static int tun_blocked, send_blocked;
+static int tun_blocked, send_blocked, tun_read_paused;
+static void tun_set_readable(int enabled) {
+    int pause = !enabled;
+    if (tun_read_paused == pause) return;
+    struct epoll_event ev = {
+        .events = (enabled ? EPOLLIN : 0) | (tun_blocked ? EPOLLOUT : 0)
+    };
+    ev.data.fd = tun_fd;
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, tun_fd, &ev) == 0)
+        tun_read_paused = pause;
+    else
+        metrics.tun_errors++;
+}
 static void tun_set_writable(int enabled) {
     if (tun_blocked == enabled) return;
-    struct epoll_event ev = { .events = EPOLLIN | (enabled ? EPOLLOUT : 0) };
+    struct epoll_event ev = { .events = (tun_read_paused ? 0 : EPOLLIN) | (enabled ? EPOLLOUT : 0) };
     ev.data.fd = tun_fd;
     if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, tun_fd, &ev) == 0)
         tun_blocked = enabled;
@@ -350,7 +364,10 @@ static void emit_stats(uint64_t uptime_ms) {
       "\"send_errors\":%llu,\"recv_errors\":%llu,\"tun_errors\":%llu,"
       "\"invalid_packets\":%llu,\"active_flows\":%llu,\"flow_evictions\":%llu,"
       "\"flow_collisions\":%llu,\"reorder_events\":%llu,\"reorder_timeouts\":%llu,"
-      "\"alloc_failures\":%llu,\"flow_capacity\":%u}\n",
+      "\"alloc_failures\":%llu,\"flow_capacity\":%u,"
+      "\"tun_oversized\":%llu,\"queue_pressure\":%llu,\"queue_pauses\":%llu,"
+      "\"tun_read_paused\":%d,\"flow_lookup_calls\":%llu,\"flow_lookup_probes\":%llu,"
+      "\"flow_table_bytes\":%llu}\n",
       (unsigned long long)uptime_ms, (unsigned long long)metrics.tun_rx,
       (unsigned long long)metrics.tun_tx, (unsigned long long)metrics.icmp_rx,
       (unsigned long long)metrics.icmp_tx, (unsigned long long)metrics.rx_bytes,
@@ -363,7 +380,14 @@ static void emit_stats(uint64_t uptime_ms) {
       (unsigned long long)metrics.active_flows, (unsigned long long)metrics.flow_evictions,
       (unsigned long long)metrics.flow_collisions, (unsigned long long)metrics.reordered,
       (unsigned long long)metrics.reorder_timeouts, (unsigned long long)metrics.alloc_failures,
-      flow_slots);
+      flow_slots,
+      (unsigned long long)metrics.tun_oversized,
+      (unsigned long long)metrics.queue_pressure,
+      (unsigned long long)metrics.queue_pauses,
+      tun_read_paused,
+      (unsigned long long)metrics.flow_lookup_calls,
+      (unsigned long long)metrics.flow_lookup_probes,
+      (unsigned long long)((size_t)flow_bucket_count * sizeof(*flow_table)));
     if (fclose(f) == 0) rename(tmp, stats_path);
     else unlink(tmp);
 }
@@ -462,7 +486,9 @@ static inline int flow_key_eq(const flow_key_t *a, const flow_key_t *b) {
 
 static flow_entry_t *flow_table_lookup(const flow_key_t *key, uint32_t hash) {
     flow_bucket_t *b = &flow_table[hash & (flow_bucket_count - 1)];
+    metrics.flow_lookup_calls++;
     for (int i = 0; i < FLOW_TABLE_WAYS; i++) {
+        metrics.flow_lookup_probes++;
         flow_entry_t *f = &b->slots[i];
         if (f->valid && flow_key_eq(&f->key, key)) {
             f->last_seen_ms = loop_clock_ms;
@@ -756,6 +782,8 @@ static void send_flush(void) {
         sq_count--;
     }
     send_set_writable(0);
+    if (tun_read_paused && sq_count <= QUEUE_HIGH_WATER / 2)
+        tun_set_readable(1);
 }
 
 static int tun_create(const char *dev, int mtu_) {
@@ -1000,6 +1028,7 @@ int tun_main_icmp(int argc, char **argv) {
     fflush(stdout);
 
     unsigned char inner[MAX_INNER], rawbuf[MAX_PKT];
+    unsigned char tun_raw[TUN_READ_CAP];
     struct sockaddr_in from;
     socklen_t fromlen;
 
@@ -1014,20 +1043,36 @@ int tun_main_icmp(int argc, char **argv) {
         for (int i = 0; i < nfds; i++) {
             if (events[i].data.fd == tun_fd) {
                 if (events[i].events & EPOLLOUT) tun_drain();
-                for (int batch = 0; batch < IO_BATCH; ++batch) {
-                    ssize_t n = read(tun_fd, inner, sizeof(inner));
+                for (int batch = 0; batch < IO_BATCH && (events[i].events & EPOLLIN) && !tun_read_paused; ++batch) {
+                    if (sq_count >= QUEUE_HIGH_WATER && send_blocked) {
+                        metrics.queue_pauses++;
+                        tun_set_readable(0);
+                        break;
+                    }
+                    ssize_t n = read(tun_fd, tun_raw, sizeof(tun_raw));
                     if (n < 0) {
                         if (errno != EAGAIN) { metrics.tun_errors++; DBG("tun read error: %s\n", strerror(errno)); }
                         break;
                     }
                     if (n == 0) break;
                     metrics.tun_rx++;
-                    DBG("DBG tun_read n=%zd\n", n);
-                    if (sq_count >= QUEUE_SIZE) { metrics.queue_full++; continue; }
+                    if (n > mtu || n > MAX_INNER) { metrics.tun_oversized++; continue; }
+                    /* Prioritize draining before dropping on a nearly-full
+                     * bounded ring. A blocked ICMP socket stops new intake
+                     * during this iteration instead of building bufferbloat. */
+                    if (sq_count >= QUEUE_HIGH_WATER && !send_blocked) {
+                        metrics.queue_pressure++;
+                        send_flush();
+                    }
+                    if (sq_count >= QUEUE_SIZE) {
+                        metrics.queue_full++;
+                        if (send_blocked) { metrics.queue_pauses++; tun_set_readable(0); break; }
+                        continue;
+                    }
 
                     flow_key_t key;
                     uint16_t seq = 0;
-                    if (flow_key_from_inner(inner, (int)n, &key)) {
+                    if (flow_key_from_inner(tun_raw, (int)n, &key)) {
                         flow_entry_t *f = flow_get_or_create(&key, flow_key_hash(&key), FLOW_ROLE_TX);
                         seq = f->tx_next_seq++;
                     }
@@ -1037,13 +1082,18 @@ int tun_main_icmp(int argc, char **argv) {
                        for more than one packet */
 
                     out_pkt_t *slot = &send_queue[sq_tail];
-                    if (encapsulate(inner, (int)n, seq, slot) == 0) {
+                    if (encapsulate(tun_raw, (int)n, seq, slot) == 0) {
                         sq_tail = next_idx(sq_tail);
                         sq_count++;
                         if ((uint64_t)sq_count > metrics.queue_peak) metrics.queue_peak = (uint64_t)sq_count;
                         DBG("DBG queued for send, sq_count=%d dest=%s\n", sq_count, inet_ntoa(slot->dest.sin_addr));
                     } else {
-                        DBG("DBG encapsulate failed\n");
+                        metrics.tun_oversized++;
+                    }
+                    if (sq_count >= QUEUE_HIGH_WATER && send_blocked) {
+                        metrics.queue_pauses++;
+                        tun_set_readable(0);
+                        break;
                     }
                 }
                 send_flush(); /* bound queueing delay: do not wait for unlimited TUN drain */

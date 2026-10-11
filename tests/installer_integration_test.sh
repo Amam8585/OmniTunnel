@@ -47,11 +47,19 @@ for key in ("binary_sha256","source_sha256","compiler","build_flags","version","
 PY
 h="$(sha256sum "$WORK/bin/omnitun" | cut -d' ' -f1)"
 run --prepare
-if OMNITUN_TEST_FAIL_AFTER=after-copy run --apply; then
-    fail "apply fault injection ignored"
-fi
+for fault in after-binary after-manager partial-write after-copy; do
+    if OMNITUN_TEST_FAIL_AFTER="$fault" run --apply; then
+        fail "apply fault injection '$fault' ignored"
+    fi
+    [[ "$(sha256sum "$WORK/bin/omnitun" | cut -d' ' -f1)" == "$h" ]] ||
+        fail "binary rollback failed after $fault"
+    cmp -s "$stage/omnitunnel.sh" "$WORK/prefix/omnitunnel.sh" ||
+        fail "manager rollback failed after $fault"
+done
+# A second successful apply must keep verified content and avoid unexplained downgrade.
+run --apply
 [[ "$(sha256sum "$WORK/bin/omnitun" | cut -d' ' -f1)" == "$h" ]] ||
-    fail "automatic rollback did not restore core binary"
+    fail "repeated installation changed core binary"
 run --backup
 echo break > "$WORK/bin/omnitun"
 run --rollback
@@ -62,4 +70,4 @@ if run --uninstall; then fail "uninstall touched active Direct instance"; fi
 : > "$FIXTURE"
 run --uninstall
 [[ ! -e "$WORK/bin/omnitun" ]] || fail "uninstall failed"
-echo "PASS: real C prepare/apply/verify, corrupted stage, legacy active guard, auto/manual rollback, uninstall"
+echo "PASS: real C prepare/apply/verify, tamper + 4 fault injections, legacy multi-unit guard, repeated apply, auto/manual rollback, uninstall"

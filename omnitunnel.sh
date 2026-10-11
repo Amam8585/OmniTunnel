@@ -37,7 +37,7 @@ HYSTERIA_BIN="${OMNITUN_HYSTERIA_BIN:-/usr/local/bin/hysteria}"
 HY_MASQ_HOST="www.bing.com"
 # where the shipped per-arch binaries live (install.sh drops them here)
 ASSET_DIR="${OMNITUN_ASSETS:-/opt/omnitunnel}"
-RAW_BASE="https://raw.githubusercontent.com/Amam8585/OmniTunnel/${OMNITUN_REF:-phase2/direct-performance-engineering}"
+RAW_BASE="https://raw.githubusercontent.com/Amam8585/OmniTunnel/${OMNITUN_REF:-main}"
 
 # shellcheck disable=SC2034
 C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'; C_ITAL=$'\033[3m'
@@ -827,17 +827,12 @@ pf_map_file() { echo "$INST_DIR/$1/map.conf"; }
 pf_snat_chain() { echo "OMNI_S_$(printf '%s' "$1" | cksum | awk '{print $1}')"; }
 pf_filter_chain() { echo "OMNI_F_$(printf '%s' "$1" | cksum | awk '{print $1}')"; }
 pf_ipv4() { python3 -c 'import ipaddress,sys; ipaddress.IPv4Address(sys.argv[1])' "$1" 2>/dev/null; }
+# Stage a never-before-used, short chain and populate it while the old
+# generation continues forwarding. No global NAT/FILTER/MANGLE flush is used.
 pf_owned_chain() {
-    local table="$1" chain="$2" hook="$3"
-    if ! iptables -w 5 -t "$table" -N "$chain" 2>/dev/null; then
-        iptables -w 5 -t "$table" -C "$hook" -j "$chain" 2>/dev/null ||
-            die "chain $table/$chain exists without an OmniTunnel hook: refusing to flush another owner's rules"
-    fi
-    iptables -w 5 -t "$table" -F "$chain" ||
-        die "unable to flush our own $table/$chain"
-    iptables -w 5 -t "$table" -C "$hook" -j "$chain" 2>/dev/null ||
-        iptables -w 5 -t "$table" -I "$hook" 1 -j "$chain" ||
-        die "failed to hook $table/$chain"
+    local table="$1" name="$2"
+    iptables -w 5 -t "$table" -N "$name" ||
+        die "refusing to reuse pre-existing firewall chain: $table/$name"
 }
 pf_check_chain_collisions() {
     local mine="$1" other
@@ -846,21 +841,46 @@ pf_check_chain_collisions() {
         if [[ "$(dnat_chain "$other")" == "$(dnat_chain "$mine")" ||
               "$(pf_snat_chain "$other")" == "$(pf_snat_chain "$mine")" ||
               "$(pf_filter_chain "$other")" == "$(pf_filter_chain "$mine")" ]]; then
-            die "firewall chain naming collision between $mine and $other (no rules changed)"
+            die "firewall chain collision between $mine and $other"
         fi
     done
+}
+pf_state_file() { echo "$INST_DIR/$1/pf.active"; }
+pf_new_chain() {
+    local prefix="$1" n="$2"
+    # Under iptables 29-char limit, avoid names derived from long instance IDs.
+    printf 'OT%s_%s\n' "$prefix" "$(printf '%s-%s-%s-%s' "$n" "$$" "$RANDOM" "$RANDOM" | cksum | awk '{print $1}')"
+}
+pf_detach_owned_chain() {
+    local table="$1" hook="$2" name="$3"
+    [[ -n "$name" ]] || return 0
+    if iptables -w 5 -t "$table" -C "$hook" -j "$name" 2>/dev/null; then
+        iptables -w 5 -t "$table" -D "$hook" -j "$name" ||
+            { warn "could not detach historical $table/$name; leaving it untouched"; return 1; }
+    fi
+    iptables -w 5 -t "$table" -F "$name" 2>/dev/null || true
+    iptables -w 5 -t "$table" -X "$name" 2>/dev/null || true
 }
 pf_apply_all() {
     load_inst "$1"
     if type_is_hysteria "$TYPE"; then hy_pf_reconcile "$1"; return 0; fi
-    local pf maps ch sn fw proto pubip pubport dstip dstport ingress
-    pf="$(inst_pf "$1")"; maps="$(pf_map_file "$1")"
-    [[ -r "$pf" || -r "$maps" ]] || return 0
-    pf_check_chain_collisions "$1"
-    ch="$(dnat_chain "$1")"
-    sn="$(pf_snat_chain "$1")"
-    fw="$(pf_filter_chain "$1")"
-    # Preflight ALL config lines before mutating any firewall chain.
+    local name="$1" pf maps old_dn old_sn old_fw new_dn new_sn new_fw
+    local proto pubip pubport dstip dstport ingress port
+    local state temp commit_ok=0
+    pf="$(inst_pf "$name")"; maps="$(pf_map_file "$name")"; state="$(pf_state_file "$name")"
+    [[ -r "$pf" || -r "$maps" || -r "$state" ]] || return 0
+    pf_check_chain_collisions "$name"
+    if [[ -r "$state" ]]; then
+        IFS='|' read -r old_dn old_sn old_fw < "$state"
+        [[ "$old_dn" =~ ^OTD_[0-9]+$ && "$old_sn" =~ ^OTS_[0-9]+$ &&
+           "$old_fw" =~ ^OTF_[0-9]+$ ]] ||
+            die "corrupt pf.active: refusing to mutate untrusted chain names"
+    else
+        old_dn="$(dnat_chain "$name")"
+        old_sn="$(pf_snat_chain "$name")"
+        old_fw="$(pf_filter_chain "$name")"
+    fi
+    # Validate ALL entries before allocating any new chain.
     if [[ -s "$maps" ]]; then
         while IFS='|' read -r proto pubip pubport dstip dstport ingress; do
             [[ "$proto" == tcp || "$proto" == udp ]] || die "invalid mapped protocol"
@@ -868,68 +888,108 @@ pf_apply_all() {
             norm_port "$pubport" >/dev/null && norm_port "$dstport" >/dev/null ||
                 die "invalid mapped port"
             [[ "$ingress" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] ||
-                die "unsafe ingress interface name in mapping"
+                die "unsafe ingress interface"
             ip -o -4 addr show dev "$ingress" |
                 awk '{print $4}' | cut -d/ -f1 | grep -qxF "$pubip" ||
-                die "public IP $pubip is not owned by interface $ingress"
+                die "public IP $pubip is not assigned to $ingress"
             ip -4 route get "$dstip" | grep -qE "(^| )dev $DEV( |$)" ||
-                die "destination $dstip does not route through Direct device $DEV"
+                die "destination $dstip does not route through $DEV"
         done < "$maps"
     fi
-    pf_owned_chain nat "$ch" PREROUTING
-    # The old -o DEVICE MASQUERADE remains for legacy wildcard pf.conf.
+    if [[ -s "$pf" ]]; then
+        while IFS=: read -r proto port; do
+            [[ "$proto" == tcp || "$proto" == udp ]] ||
+                die "invalid legacy forwarding protocol"
+            norm_port "$port" >/dev/null || die "invalid legacy forwarding port"
+        done < "$pf"
+    fi
+    new_dn="$(pf_new_chain D "$name")"
+    new_sn="$(pf_new_chain S "$name")"
+    new_fw="$(pf_new_chain F "$name")"
+    # Refuse collisions before attempting creation: NEVER flush a chain
+    # already present and potentially belonging to another firewall owner.
+    for item in "nat:$new_dn" "nat:$new_sn" "filter:$new_fw"; do
+        local table="${item%%:*}" chain="${item#*:}"
+        iptables -w 5 -t "$table" -S "$chain" >/dev/null 2>&1 &&
+            die "staging chain name collision: $table/$chain (no change)"
+    done
+    # Entire candidate is built unhooked. Failure never empties old chains.
+    local staged=0
+    if (
+        set -e
+        iptables -w 5 -t nat -N "$new_dn" || exit 1
+        iptables -w 5 -t nat -N "$new_sn" || exit 1
+        iptables -w 5 -t filter -N "$new_fw" || exit 1
+        if [[ -s "$maps" ]]; then
+            while IFS='|' read -r proto pubip pubport dstip dstport ingress; do
+                iptables -w 5 -t nat -A "$new_dn" -i "$ingress" -d "$pubip" -p "$proto" \
+                    --dport "$pubport" -j DNAT --to-destination "$dstip:$dstport" || exit 1
+                # Scope SNAT to connections originally destined to this exact
+                # public tuple. Unrelated egress to the same backend is excluded.
+                iptables -w 5 -t nat -A "$new_sn" -o "$DEV" -d "$dstip" -p "$proto" \
+                    --dport "$dstport" -m conntrack --ctdir ORIGINAL \
+                    --ctorigdst "$pubip" --ctorigdstport "$pubport" \
+                    -j SNAT --to-source "$TUN_ADDR" || exit 1
+                iptables -w 5 -t filter -A "$new_fw" -i "$ingress" -o "$DEV" \
+                    -d "$dstip" -p "$proto" --dport "$dstport" \
+                    -m conntrack --ctstate NEW,ESTABLISHED -j ACCEPT || exit 1
+                iptables -w 5 -t filter -A "$new_fw" -i "$DEV" -o "$ingress" \
+                    -s "$dstip" -p "$proto" --sport "$dstport" \
+                    -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT || exit 1
+            done < "$maps"
+        fi
+        if [[ -s "$pf" ]]; then
+            while IFS=: read -r proto port; do
+                iptables -w 5 -t nat -A "$new_dn" -p "$proto" --dport "$port" \
+                    -j DNAT --to-destination "$PEER_ADDR:$port" || exit 1
+            done < "$pf"
+        fi
+    ); then
+        staged=1
+    fi
+    if (( ! staged )); then
+        iptables -w 5 -t nat -F "$new_dn" 2>/dev/null || true
+        iptables -w 5 -t nat -X "$new_dn" 2>/dev/null || true
+        iptables -w 5 -t nat -F "$new_sn" 2>/dev/null || true
+        iptables -w 5 -t nat -X "$new_sn" 2>/dev/null || true
+        iptables -w 5 -t filter -F "$new_fw" 2>/dev/null || true
+        iptables -w 5 -t filter -X "$new_fw" 2>/dev/null || true
+        die "staged forwarding candidate failed; existing hooks not modified"
+    fi
+    # Hooks first: old chains remain active until every candidate is attached.
+    # Across tables this is not one atomic transaction, but never an empty
+    # forwarding generation and recoverable on any failed hook change.
+    if iptables -w 5 -t nat -I PREROUTING 1 -j "$new_dn" &&
+       iptables -w 5 -t nat -I POSTROUTING 1 -j "$new_sn" &&
+       iptables -w 5 -t filter -I FORWARD 1 -j "$new_fw"; then
+        commit_ok=1
+    fi
+    if (( ! commit_ok )); then
+        pf_detach_owned_chain nat PREROUTING "$new_dn" || true
+        pf_detach_owned_chain nat POSTROUTING "$new_sn" || true
+        pf_detach_owned_chain filter FORWARD "$new_fw" || true
+        die "failed to switch forwarding: old hooks preserved"
+    fi
+    temp="$(mktemp "$state.XXXXXX")" || die "forwarding state tempfile failed"
+    if ! printf '%s|%s|%s\n' "$new_dn" "$new_sn" "$new_fw" > "$temp" ||
+       ! mv -f "$temp" "$state"; then
+        pf_detach_owned_chain nat PREROUTING "$new_dn" || true
+        pf_detach_owned_chain nat POSTROUTING "$new_sn" || true
+        pf_detach_owned_chain filter FORWARD "$new_fw" || true
+        die "unable to persist new forwarding generation"
+    fi
+    # Retire old generation only AFTER the new one is visible and durable.
+    pf_detach_owned_chain nat PREROUTING "$old_dn" || true
+    pf_detach_owned_chain nat POSTROUTING "$old_sn" || true
+    pf_detach_owned_chain filter FORWARD "$old_fw" || true
+    # Preserve legacy wildcard forwards' existing MASQUERADE policy while
+    # they exist; remove only the interface-owned rule when no longer needed.
     if [[ -s "$pf" ]]; then
         iptables -w 5 -t nat -C POSTROUTING -o "$DEV" -j MASQUERADE 2>/dev/null ||
             iptables -w 5 -t nat -A POSTROUTING -o "$DEV" -j MASQUERADE ||
-            die "legacy MASQUERADE could not be installed"
+            die "legacy MASQUERADE failed"
     fi
-    # Clearing only our previously registered chains also removes obsolete
-    # mappings when the last map.conf line is deleted.
-    if [[ -s "$maps" ]] || iptables -t nat -C POSTROUTING -j "$sn" 2>/dev/null; then
-        pf_owned_chain nat "$sn" POSTROUTING
-    fi
-    if [[ -s "$maps" ]] || iptables -t filter -C FORWARD -j "$fw" 2>/dev/null; then
-        pf_owned_chain filter "$fw" FORWARD
-    fi
-    if [[ ! -s "$maps" ]]; then
-        # No active advanced maps: remove only OUR empty SNAT/FORWARD hooks,
-        # otherwise stale allow/DNAT rules would survive the last removal.
-        iptables -t nat -D POSTROUTING -j "$sn" 2>/dev/null || true
-        iptables -t nat -F "$sn" 2>/dev/null || true
-        iptables -t nat -X "$sn" 2>/dev/null || true
-        iptables -t filter -D FORWARD -j "$fw" 2>/dev/null || true
-        iptables -t filter -F "$fw" 2>/dev/null || true
-        iptables -t filter -X "$fw" 2>/dev/null || true
-    fi
-    if [[ -s "$maps" ]]; then
-        while IFS='|' read -r proto pubip pubport dstip dstport ingress; do
-            iptables -w 5 -t nat -A "$ch" -i "$ingress" -d "$pubip" -p "$proto" \
-                --dport "$pubport" -j DNAT --to-destination "$dstip:$dstport" ||
-                die "DNAT mapping apply failed"
-            iptables -w 5 -t nat -A "$sn" -o "$DEV" -d "$dstip" -p "$proto" \
-                --dport "$dstport" -j SNAT --to-source "$TUN_ADDR" ||
-                die "SNAT mapping apply failed"
-            iptables -w 5 -t filter -A "$fw" -i "$ingress" -o "$DEV" \
-                -d "$dstip" -p "$proto" --dport "$dstport" \
-                -m conntrack --ctstate NEW,ESTABLISHED -j ACCEPT ||
-                die "FORWARD allow rule failed"
-            iptables -w 5 -t filter -A "$fw" -i "$DEV" -o "$ingress" \
-                -s "$dstip" -p "$proto" --sport "$dstport" \
-                -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT ||
-                die "FORWARD return rule failed"
-        done < "$maps"
-    fi
-    if [[ -s "$pf" ]]; then
-        local port
-        while IFS=: read -r proto port; do
-            [[ -z "$proto" ]] && continue
-            [[ "$proto" == tcp || "$proto" == udp ]] || die "invalid legacy protocol"
-            norm_port "$port" >/dev/null || die "invalid legacy port"
-            iptables -w 5 -t nat -A "$ch" -p "$proto" --dport "$port" \
-                -j DNAT --to-destination "$PEER_ADDR:$port" ||
-                die "legacy DNAT forwarding failed"
-        done < "$pf"
-    fi
+    return 0
 }
 pf_mapping_conflict() {
     local owner="$1" proto="$2" pubip="$3" pubport="$4" ingress="$5"
@@ -977,6 +1037,7 @@ pf_map_add() {
         die "advanced mapping failed; old config restored"
     fi
     rm -f "$backup"
+    exec {lock_fd}>&-  # release lock before returning (no self-deadlock)
     ok "Direct mapping added: $proto $pubip:$pubport -> $dstip:$dstport via $ingress"
 }
 pf_map_del() {
@@ -1003,10 +1064,13 @@ pf_map_del() {
         die "Direct mapping removal failed; restored config"
     fi
     rm -f "$backup"
+    exec {lock_fd}>&-
     ok "Direct mapping removed: $proto $pubip:$pubport via $ingress"
 }
 pf_add() {
     need_root; load_inst "$1"; local proto="$2" ports="$3"
+    exec {lock_fd}>"$INST_DIR/.pf.lock"
+    flock -x "$lock_fd" || die "could not lock forward mappings"
     [[ "$proto" =~ ^(tcp|udp|both)$ ]] || die "proto must be tcp|udp|both"
     # accept several ports at once, comma-separated: pf-add <inst> tcp 8080,8081,700
     local pf pr p np rc; pf="$(inst_pf "$1")"
@@ -1034,10 +1098,14 @@ pf_add() {
             [[ "$rc" -le 1 ]] || die "could not read $pf (grep exit $rc) - nothing added"
             [[ "$rc" -eq 0 ]] || echo "$pr:$np" >> "$pf"; done
     done
-    pf_apply_all "$1"; ok "forwarding $proto/$ports through '$1' to $PEER_ADDR"
+    pf_apply_all "$1"
+    exec {lock_fd}>&-
+    ok "forwarding $proto/$ports through '$1' to $PEER_ADDR"
 }
 pf_del() {
     need_root; load_inst "$1"; local ports="$2" pf p np; pf="$(inst_pf "$1")"
+    exec {lock_fd}>"$INST_DIR/.pf.lock"
+    flock -x "$lock_fd" || die "could not lock forward mappings"
     # accept several ports at once, comma-separated: pf-del <inst> 8080,8081
     if [[ -f "$pf" ]]; then
         for p in ${ports//,/ }; do
@@ -1045,10 +1113,28 @@ pf_del() {
             rewrite_without "$pf" ":0*$np\$" || die "could not rewrite $pf - nothing removed"
         done
     fi
-    pf_apply_all "$1"; ok "removed forward(s) on port(s) $ports from '$1'"
+    pf_apply_all "$1"
+    exec {lock_fd}>&-
+    ok "removed forward(s) on port(s) $ports from '$1'"
 }
 pf_flush_chain() {
     load_inst "$1" 2>/dev/null || return 0; local ch; ch="$(dnat_chain "$1")"
+    # Remove current generation recorded for this exact instance, not any
+    # globally shared chain. Legacy names are retained for old installations.
+    local state old_dn old_sn old_fw
+    state="$(pf_state_file "$1")"
+    if [[ -r "$state" ]]; then
+        IFS='|' read -r old_dn old_sn old_fw < "$state"
+        if [[ "$old_dn" =~ ^OTD_[0-9]+$ && "$old_sn" =~ ^OTS_[0-9]+$ &&
+              "$old_fw" =~ ^OTF_[0-9]+$ ]]; then
+            pf_detach_owned_chain nat PREROUTING "$old_dn" || true
+            pf_detach_owned_chain nat POSTROUTING "$old_sn" || true
+            pf_detach_owned_chain filter FORWARD "$old_fw" || true
+            rm -f "$state"
+        else
+            warn "corrupt forwarding state; refusing to touch arbitrary firewall chains"
+        fi
+    fi
     iptables -t nat -D PREROUTING -j "$ch" 2>/dev/null || true
     iptables -t nat -F "$ch" 2>/dev/null || true; iptables -t nat -X "$ch" 2>/dev/null || true
     iptables -t nat -D POSTROUTING -o "$DEV" -j MASQUERADE 2>/dev/null || true
@@ -1872,10 +1958,10 @@ cmd_update() {
         warn "Refusing legacy/unknown installer: only verified stage-only updaters are allowed."
         return 1
     fi
-    OMNITUN_REF="${OMNITUN_REF:-phase2/direct-performance-engineering}" bash "$tmp" --update || rc=$?
+    OMNITUN_REF="${OMNITUN_REF:-main}" bash "$tmp" --update || rc=$?
     rm -f "$tmp"
     [[ $rc -eq 0 ]] || { warn "update failed (exit $rc)"; return 1; }
-    info "Update staged; activate explicitly with install.sh --apply."
+    info "Update staged, pinned and checksummed; activate via reviewed install.sh --apply after validation. No running service restarted."
     return 0
 }
 

@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
-# Direct optimizer. Read-only diagnostics cover all eleven carriers.\n# Only owned L3 instance queue lengths are explicitly adjustable.
+# Direct optimizer. Read-only diagnostics cover all eleven carriers.
+# Only owned L3 instance queue lengths are explicitly adjustable.
 set -euo pipefail
 ACTION="${1:-status}"; INSTANCE="${2:-}"; PROFILE="${3:-balanced}"; ACK="${4:-}"
-[[ "$ACTION" == status || "$ACTION" == recommend || "$ACTION" == dry-run || "$ACTION" == apply || "$ACTION" == rollback || "$ACTION" == compare ]] ||
-    { echo "usage: optimizer.sh status|recommend|dry-run|apply|rollback|compare <instance> [balanced|low-latency|high-throughput] [--acknowledge]" >&2; exit 2; }
+[[ "$ACTION" == status || "$ACTION" == analyze || "$ACTION" == recommend || "$ACTION" == dry-run || "$ACTION" == apply || "$ACTION" == rollback || "$ACTION" == compare ]] ||
+    { echo "usage: optimizer.sh status|analyze|recommend|dry-run|apply|rollback|compare <instance> [balanced|low-latency|high-throughput] [--acknowledge]" >&2; exit 2; }
 [[ "$INSTANCE" =~ ^[a-zA-Z0-9_-]+$ ]] || { echo "invalid instance" >&2; exit 2; }
-conf="/etc/omnitunnel/inst/$INSTANCE/instance.conf"
+CONFIG_ROOT="${OMNITUN_CONFIG_ROOT:-/etc/omnitunnel}"
+STATE_ROOT="${OMNITUN_OPTIMIZER_STATE_DIR:-/var/lib/omnitunnel/optimizer}"
+[[ "$CONFIG_ROOT" = /* && "$STATE_ROOT" = /* ]] || { echo "config/state must be absolute paths" >&2; exit 2; }
+conf="$CONFIG_ROOT/inst/$INSTANCE/instance.conf"
 [[ -r "$conf" ]] || { echo "missing instance: $INSTANCE" >&2; exit 1; }
 type="$(sed -n 's/^TYPE=//p' "$conf" | head -1)"
 dev="$(sed -n 's/^DEV=//p' "$conf" | head -1)"
@@ -15,7 +19,7 @@ case "$type" in
 esac
 if [[ "$type" == hysteria ]]; then
     case "$ACTION" in
-        status|recommend|dry-run|compare)
+        status|analyze|recommend|dry-run|compare)
             echo "Hysteria: QUIC/SOCKS engine, no dedicated kernel TUN device."
             echo "Engine: $(/usr/local/bin/hysteria version 2>&1 | head -1 || echo not-installed)"
             echo "Only native engine/relay diagnostics possible; no interface modified.";;
@@ -35,13 +39,15 @@ case "$PROFILE" in
     high-throughput) proposed="$((cur < 2048 ? 2048 : cur))";;
     *) echo "unknown profile $PROFILE" >&2; exit 2;;
 esac
-backup_dir="/var/lib/omnitunnel/optimizer"
+backup_dir="$STATE_ROOT"
 snap="$backup_dir/$INSTANCE.last"
 stats="/run/omnitunnel/icmp-$dev.json"
 status() {
     echo "Device: $dev | Direct protocol: $type | current TUN txqueuelen: $cur"
     echo "Kernel: $(uname -r); CPU cores: $(nproc); RAM: $(awk '/MemTotal:/{printf "%.0f MiB",$2/1024}' /proc/meminfo)"
-    ip -s link show dev "$dev"\n    echo "Interface details and MTU:"; ip -d link show dev "$dev" || true
+    ip -s link show dev "$dev"
+    echo "Interface details and MTU:"
+    ip -d link show dev "$dev" || true
     if command -v tc >/dev/null; then tc qdisc show dev "$dev"; fi
     if [[ -r /proc/sys/net/netfilter/nf_conntrack_max ]]; then
         echo "Conntrack: $(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo n/a)/$(cat /proc/sys/net/netfilter/nf_conntrack_max)"
@@ -54,10 +60,13 @@ status() {
     [[ ! -r "$stats" ]] || { echo "ICMP core counters:"; cat "$stats"; echo; }
 }
 case "$ACTION" in
-    status) status;;
+    status|analyze) status;;
     recommend|dry-run)
         status
-        echo "Candidate $PROFILE -> ip link set dev $dev txqueuelen $proposed (current=$cur)"
+        echo "Direct $type profile $PROFILE: original qlen=$cur; proposed qlen=$proposed"
+        echo "Trade-off: a smaller queue may lower latency but increase drops; a larger one may buffer bursts but worsen tail latency."
+        echo "Restart required: no. Rollback: optimizer.sh rollback $INSTANCE. Verify: matched-load RTT P95/P99, goodput, TUN tx_dropped."
+        echo "Candidate command (NOT executed): ip link set dev $dev txqueuelen $proposed"
         echo "Experimental only. Lower kernel drop counts can mean longer queues and worse RTT."
         echo "Hypothetical, NOT certified: compare matched-load goodput, P95/P99, and drops."
         echo "GRE/FOU/VXLAN use kernel transport; no fake userspace transport is created."
@@ -76,13 +85,13 @@ case "$ACTION" in
             { echo "Explicit opt-in required: optimizer.sh apply $INSTANCE $PROFILE --acknowledge" >&2; exit 2; }
         [[ "$dev" == ts-* || "$dev" =~ ^ts[0-9]{4,}$ ]] ||
             { echo "non-owned-looking interface, refusing change: $dev" >&2; exit 1; }
+        [[ "$proposed" != "$cur" ]] ||
+            { echo "Balanced/no-op: queue unchanged; no snapshot created"; exit 0; }
         mkdir -p "$backup_dir"
         if [[ ! -f "$snap" ]]; then
             printf '%s %s %s %s\n' "$dev" "$cur" "$PROFILE" "$(date -u +%FT%TZ)" > "$snap.tmp"
             mv -f "$snap.tmp" "$snap"
         fi
-        [[ "$proposed" != "$cur" ]] ||
-            { echo "Balanced/no-op: the current queue is unchanged"; exit 0; }
         ip link set dev "$dev" txqueuelen "$proposed"
         updated="$(get_qlen)"
         [[ "$updated" == "$proposed" ]] ||

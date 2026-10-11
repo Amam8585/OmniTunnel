@@ -80,14 +80,14 @@ def main():
         if prev:
             dt=max(0.001,(current["timestamp_ms"]-prev["timestamp_ms"])/1000)
             current["kernel_rates_per_second"]={
-                k:max(0,(v-prev["kernel_interface_counters"][k])/dt)
+                k:((v-prev["kernel_interface_counters"][k])/dt if v>=prev["kernel_interface_counters"][k] else None)
                 for k,v in current["kernel_interface_counters"].items()
                 if v is not None and prev["kernel_interface_counters"].get(k) is not None}
             p,old=current["process"],prev["process"]
             if p["pid"] and p["pid"]==old["pid"] and p["cpu_ticks"] is not None:
                 import os
                 p["cpu_percent_one_core"]=round(
-                    100*max(0,p["cpu_ticks"]-old["cpu_ticks"])/os.sysconf("SC_CLK_TCK")/dt,1)
+                    100*(p["cpu_ticks"]-old["cpu_ticks"])/os.sysconf("SC_CLK_TCK")/dt,1) if p["cpu_ticks"]>=old["cpu_ticks"] else None
         current["process"].pop("cpu_ticks",None)
         if fmt=="--json":
             print(json.dumps(current,ensure_ascii=False),flush=True)
