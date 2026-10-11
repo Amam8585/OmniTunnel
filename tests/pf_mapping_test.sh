@@ -11,7 +11,7 @@ extract() {
          if(name in want){print;if($0 !~/}/)block=1}
       }}' "$SCRIPT"
 }
-eval "$(extract 'norm_port inst_path inst_pf list_instances dnat_chain pf_map_file pf_snat_chain pf_filter_chain pf_ipv4 pf_owned_chain pf_check_chain_collisions pf_apply_all pf_mapping_conflict pf_map_add pf_map_del pf_flush_chain')"
+eval "$(extract 'norm_port inst_path inst_pf list_instances dnat_chain pf_map_file pf_snat_chain pf_filter_chain pf_ipv4 pf_owned_chain pf_state_file pf_new_chain pf_detach_owned_chain pf_check_chain_collisions pf_apply_all pf_mapping_conflict pf_map_add pf_map_del pf_flush_chain')"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 mkdir -p "$WORK/bin" "$WORK/inst/a" "$WORK/inst/b"
@@ -57,6 +57,10 @@ grep -qF -- '--to-destination 10.1.1.2:8443' "$LOG" || fail "DNAT destination po
 grep -qF -- '-d 192.0.2.11' "$LOG" || fail "public IP match omitted"
 grep -qF -- '--to-source 10.1.1.1' "$LOG" || fail "SNAT not interface-specific"
 grep -qF -- '-t filter -A' "$LOG" || fail "filter FORWARD ACL missing"
+grep -qF -- '--ctorigdst 192.0.2.10 --ctorigdstport 443' "$LOG" ||
+    fail "SNAT is not restricted to the original forwarded public tuple"
+grep -qF -- '-t nat -I PREROUTING 1 -j OTD_' "$LOG" ||
+    fail "new DNAT chain not hooked after staging"
 if (pf_map_add b tcp 192.0.2.10 443 10.1.2.2 8443 eth0); then
     fail "same ingress/public IP port collision accepted"
 fi
