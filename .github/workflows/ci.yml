@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'phase3/**']
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -134,6 +134,8 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends sshpass netcat-openbsd
           bash tests/installer_integration_test.sh
+      - name: Python benchmark regression
+        run: python3 -m unittest discover -s benchmarks -p 'test_*.py' -v
       - name: Direct preservation and shell tests
         run: |
           for t in tests/*.sh; do
