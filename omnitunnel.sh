@@ -655,6 +655,8 @@ write_service() {
 Description=OmniTunnel hysteria instance $1 ($ROLE $LOCAL_IP -> $PEER_IP)
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -675,6 +677,8 @@ EOF
 Description=OmniTunnel $TYPE instance $1 ($ROLE $LOCAL_IP -> $PEER_IP)
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
 
 [Service]
 Type=oneshot
@@ -694,6 +698,8 @@ EOF
 Description=OmniTunnel $TYPE instance $1 ($ROLE $LOCAL_IP -> $PEER_IP)
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -730,13 +736,18 @@ restart_pf_relays() {
 inst_enable() {
     need_root; load_inst "$1"; write_service "$1"
     systemctl enable "$(svc_name "$1")" >/dev/null 2>&1 || true
-    # A failed unit start must NOT silently abort the whole (set -euo pipefail)
-    # run - that reads as the tool "cancelling/disconnecting" with no message.
-    # Warn and carry on; callers that care check inst_running afterwards.
-    systemctl restart "$(svc_name "$1")" 2>/dev/null \
-        || warn "service $(svc_name "$1") did not start cleanly - see: journalctl -u $(svc_name "$1")"
-    sleep 2; inst_status "$1" || true
-    restart_pf_relays "$1"   # drop stale relay connections to the old tunnel
+    # Explicit start/restart invoked by the operator only, never by updater.
+    # Do NOT report success unless systemd and the expected interface agree.
+    if ! systemctl restart "$(svc_name "$1")"; then
+        die "service $(svc_name "$1") failed to start; inspect: journalctl -u $(svc_name "$1") -n 80"
+    fi
+    sleep 1
+    inst_running "$1" || die "service $(svc_name "$1") is not active"
+    if ! type_is_hysteria "$TYPE" && ! ip link show dev "$DEV" >/dev/null 2>&1; then
+        die "service $(svc_name "$1") started but Direct interface $DEV was not created"
+    fi
+    inst_status "$1" || true
+    restart_pf_relays "$1"
 }
 inst_running() { systemctl is-active "$(svc_name "$1")" >/dev/null 2>&1; }
 inst_header() {
@@ -1106,11 +1117,8 @@ guard_peer_downgrade() {
     ver_gt "$pver" "$VERSION" || return 0         # we are same-or-newer: safe to push
     warn "The foreign $h runs v$pver but this box is older (v$VERSION)."
     warn "Updating this box first so the tunnel/benchmark can't downgrade the foreign..."
-    if cmd_update; then
-        ok "Updated to the latest - re-running..."
-        OMNI_SELFUPDATED=1 exec "$SCRIPT_PATH" ${OMNI_ARGV[@]+"${OMNI_ARGV[@]}"}
-    fi
-    die "self-update failed - run 'omnitunnel update' on this box and retry, so the newer foreign ($h v$pver) isn't downgraded."
+    cmd_update || true
+    die "foreign $h runs newer v$pver; update staged only. Explicitly apply new build at maintenance before provisioning."
 }
 
 # push the manager + the peer's own-arch binary, then bring up the server side
@@ -1153,7 +1161,9 @@ cmd_peercreate() {
     elif type_is_ackless "$2"; then ensure_omniackless
     elif ! type_is_kernel "$2"; then ensure_binary; fi
     create_inst "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" "${11}" "${12:-}" "${13:-400}"
-    inst_enable "$1" >/dev/null 2>&1 || true; ok "peer instance '$1' up"
+    inst_enable "$1" >/dev/null || die "peer instance $1 failed; check journalctl"
+    inst_running "$1" || die "peer service $1 inactive"
+    ok "peer instance '$1' up"
 }
 
 # Non-interactive add for scripting/automation.
@@ -1659,8 +1669,10 @@ cmd_update() {
         warn "(run the installer on a box that can reach GitHub, or copy them over)."
         return 1
     fi
-    bash "$tmp" --update; local rc=$?; rm -f "$tmp"
-    [[ $rc -eq 0 ]] || { warn "update failed"; return 1; }
+    local rc=0
+    bash "$tmp" --update || rc=$?
+    rm -f "$tmp"
+    [[ $rc -eq 0 ]] || { warn "update failed (exit $rc)"; return 1; }
     info "Update staged; activate explicitly with install.sh --apply."
     return 0
 }
