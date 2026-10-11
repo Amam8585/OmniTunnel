@@ -300,7 +300,16 @@ prevent_downgrade() {
     local old new status
     old="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("commit",""))' "$PREFIX/build-info.json")"
     new="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("commit",""))' "$1/build-info.json")"
-    [[ "$old" == "$new" ]] && return 0
+    if [[ "$old" == "$new" && -n "$old" ]]; then return 0; fi
+    # A local source dir may lack .git metadata: never silently replace a
+    # DIFFERENT binary when neither side has a traceable Git commit.
+    if [[ -z "$old" && -z "$new" ]]; then
+        local installed_sha staged_sha
+        installed_sha="$(sha256sum "$BIN_DIR/omnitun" 2>/dev/null | awk '{print $1}')"
+        staged_sha="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("binary_sha256",""))' "$1/build-info.json")"
+        [[ -n "$installed_sha" && "$installed_sha" == "$staged_sha" ]] && return 0
+        die "both revisions are unknown and candidate binary differs; pin a Git SHA or manually approve --allow-downgrade"
+    fi
     [[ "$old" =~ ^[a-fA-F0-9]{40}$ && "$new" =~ ^[a-fA-F0-9]{40}$ ]] ||
         die "unknown update lineage; --allow-downgrade requires manual verification"
     status="$(curl -fsSL "https://api.github.com/repos/$REPO/compare/$old...$new" |
@@ -329,6 +338,7 @@ apply() {
         for n in omnitun hysteria omnistripe omniackless; do
             install -m 0755 "$stage/bin/$n-$ARCH" "$BIN_DIR/$n.new.${BASHPID}" || exit 1
             mv -f "$BIN_DIR/$n.new.${BASHPID}" "$BIN_DIR/$n" || exit 1
+            [[ "$PREFIX" == /opt/omnitunnel || "${OMNITUN_TEST_FAIL_AFTER:-}" != after-binary ]] || exit 79
         done
         mkdir -p "$PREFIX/scripts" "$PREFIX/docs" "$PREFIX/bin" || exit 1
         for n in monitor.sh optimizer.sh diagnostics.sh hysteria_audit.sh; do
@@ -343,6 +353,7 @@ apply() {
         done
         install -m 0755 "$stage/omnitunnel.sh" "$PREFIX/omnitunnel.sh.new.${BASHPID}" || exit 1
         mv -f "$PREFIX/omnitunnel.sh.new.${BASHPID}" "$PREFIX/omnitunnel.sh" || exit 1
+        [[ "$PREFIX" == /opt/omnitunnel || "${OMNITUN_TEST_FAIL_AFTER:-}" != after-manager ]] || exit 79
         cp -a "$stage/build-info.json" "$PREFIX/build-info.json.new.${BASHPID}" || exit 1
         mv -f "$PREFIX/build-info.json.new.${BASHPID}" "$PREFIX/build-info.json" || exit 1
         ln -sfn "$PREFIX/omnitunnel.sh" "$LINK" || exit 1
@@ -388,6 +399,12 @@ if [[ "$ACTION" == check ]]; then
     exit 0
 fi
 root
+# A single lock covers staging pointer, snapshots, apply, rollback and removal.
+# Prevent overlapping installers from racing to replace the same paths.
+mkdir -p "$STATE"
+command -v flock >/dev/null 2>&1 || die "flock required for safe multi-instance upgrades"
+exec {installer_lock}>"$STATE/.installer.lock"
+flock -w 60 "$installer_lock" || die "installer busy: another operation holds $STATE/.installer.lock"
 case "$ACTION" in
     backup) ((DRY)) && exit 0; snapshot;;
     rollback)
