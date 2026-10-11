@@ -351,6 +351,20 @@ apply() {
         bash -n "$PREFIX/omnitunnel.sh" || exit 1
         cmp -s "$PREFIX/omnitunnel.sh" "$stage/omnitunnel.sh" || exit 1
         cmp -s "$PREFIX/build-info.json" "$stage/build-info.json" || exit 1
+        python3 - "$PREFIX/build-info.json" "$BIN_DIR" "$ARCH" <<'PY' || exit 1
+import hashlib,json,pathlib,sys
+with open(sys.argv[1],encoding="utf-8") as stream:
+    meta=json.load(stream)
+root=pathlib.Path(sys.argv[2])
+arch=sys.argv[3]
+for engine in ("omnitun","hysteria","omnistripe","omniackless"):
+    want=meta["artifacts"].get("bin/"+engine+"-"+arch)
+    f=root/engine
+    assert want and f.is_file()
+    assert hashlib.sha256(f.read_bytes()).hexdigest()==want,(engine,"installed digest differs")
+print("All installed Direct executable SHA256 values matched their stage")
+PY
+
     ); then
         log "Build installed and verified; running services NOT restarted"
     else
@@ -363,6 +377,12 @@ apply() {
 }
 if [[ "$ACTION" == check ]]; then
     log "Core: $("$BIN_DIR/omnitun" version 2>/dev/null || echo not-installed)"
+    if [[ -r "$PREFIX/build-info.json" ]]; then
+        log "Installed immutable build manifest:"
+        cat "$PREFIX/build-info.json"
+    else
+        log "No installed build manifest (legacy/unmanaged installation)"
+    fi
     log "Active units:"; active_units
     [[ -c /dev/net/tun ]] && log "TUN present" || log "TUN missing"
     exit 0
@@ -381,7 +401,8 @@ case "$ACTION" in
         snapshot
         [[ -L "$LINK" && "$(readlink "$LINK")" == "$PREFIX/omnitunnel.sh" ]] &&
             rm -f "$LINK"
-        rm -rf "$PREFIX/scripts" "$PREFIX/docs"
+        rm -rf "$PREFIX/scripts" "$PREFIX/docs" "$PREFIX/bin"
+        rm -f "$PREFIX/build-info.json" "$PREFIX/README.md" "$PREFIX/CHANGELOG.md" "$PREFIX/LICENSE"
         rm -f "$PREFIX/omnitunnel.sh" "$BIN_DIR/omnitun" \
             "$BIN_DIR/hysteria" "$BIN_DIR/omnistripe" "$BIN_DIR/omniackless"
         ((PURGE==0)) || rm -rf /etc/omnitunnel
