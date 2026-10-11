@@ -906,13 +906,20 @@ pf_apply_all() {
     new_dn="$(pf_new_chain D "$name")"
     new_sn="$(pf_new_chain S "$name")"
     new_fw="$(pf_new_chain F "$name")"
+    # Refuse collisions before attempting creation: NEVER flush a chain
+    # already present and potentially belonging to another firewall owner.
+    for item in "nat:$new_dn" "nat:$new_sn" "filter:$new_fw"; do
+        local table="${item%%:*}" chain="${item#*:}"
+        iptables -w 5 -t "$table" -S "$chain" >/dev/null 2>&1 &&
+            die "staging chain name collision: $table/$chain (no change)"
+    done
     # Entire candidate is built unhooked. Failure never empties old chains.
     local staged=0
     if (
         set -e
-        iptables -w 5 -t nat -N "$new_dn"
-        iptables -w 5 -t nat -N "$new_sn"
-        iptables -w 5 -t filter -N "$new_fw"
+        iptables -w 5 -t nat -N "$new_dn" || exit 1
+        iptables -w 5 -t nat -N "$new_sn" || exit 1
+        iptables -w 5 -t filter -N "$new_fw" || exit 1
         if [[ -s "$maps" ]]; then
             while IFS='|' read -r proto pubip pubport dstip dstport ingress; do
                 iptables -w 5 -t nat -A "$new_dn" -i "$ingress" -d "$pubip" -p "$proto" \
@@ -1102,6 +1109,22 @@ pf_del() {
 }
 pf_flush_chain() {
     load_inst "$1" 2>/dev/null || return 0; local ch; ch="$(dnat_chain "$1")"
+    # Remove current generation recorded for this exact instance, not any
+    # globally shared chain. Legacy names are retained for old installations.
+    local state old_dn old_sn old_fw
+    state="$(pf_state_file "$1")"
+    if [[ -r "$state" ]]; then
+        IFS='|' read -r old_dn old_sn old_fw < "$state"
+        if [[ "$old_dn" =~ ^OTD_[0-9]+$ && "$old_sn" =~ ^OTS_[0-9]+$ &&
+              "$old_fw" =~ ^OTF_[0-9]+$ ]]; then
+            pf_detach_owned_chain nat PREROUTING "$old_dn" || true
+            pf_detach_owned_chain nat POSTROUTING "$old_sn" || true
+            pf_detach_owned_chain filter FORWARD "$old_fw" || true
+            rm -f "$state"
+        else
+            warn "corrupt forwarding state; refusing to touch arbitrary firewall chains"
+        fi
+    fi
     iptables -t nat -D PREROUTING -j "$ch" 2>/dev/null || true
     iptables -t nat -F "$ch" 2>/dev/null || true; iptables -t nat -X "$ch" 2>/dev/null || true
     iptables -t nat -D POSTROUTING -o "$DEV" -j MASQUERADE 2>/dev/null || true
