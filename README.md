@@ -22,17 +22,232 @@ The former **Reverse-MUX/Chisel** mechanism, its manager commands and service cr
 
 ## Safe source-build staging
 
-Run on a disposable VM, not the production pair:
+No single tunnel wins everywhere. What an ISP lets through — and how fast — is
+**per-route and per-transport**, and it changes. OmniTunnel ships all twelve and
+lets you **benchmark them and keep the winner**:
+
+| Mode | What it is | Best when |
+|------|------------|-----------|
+| `gre`  | IP-over-GRE, native kernel tunnel (no key) | The ISP polices TCP/UDP but leaves protocol-47 alone — often **full line-rate** |
+| `icmp` | IP-over-ICMP, blends in as ping (no key) | Only ICMP passes untouched — frequently unpoliced too |
+| `udp`  | IP-over-UDP, XChaCha20-Poly1305, no header/handshake | UDP is allowed — usually the fastest of the encrypted carriers |
+| `tcp`  | IP-over-TCP, one connection that looks like a long HTTPS session | UDP is blocked but a single TCP stream runs clean |
+| `mux`  | **Multi-connection TCP** — N parallel links, each inner flow pinned to one link | Hostile DPI that blocks UDP *and* poisons long-lived TCP 5-tuples |
+| `ws`   | **Multi-connection WebSocket** — real HTTP `Upgrade` handshake, AEAD payload inside masked WS frames | You need `mux`'s throughput but the carrier must be **indistinguishable from a browser/CDN WebSocket** on 443/80 |
+| `hysteria` | **Hysteria2 / QUIC** — bundled engine with the loss-agnostic *Brutal* congestion control, salamander obfuscation and a real website masquerade | UDP passes but is **rate-policed or lossy**: Brutal ignores the induced loss and pushes at a fixed rate, so a policed UDP path that crawls at a few Mbit for `udp` runs an order of magnitude faster here — while looking exactly like HTTP/3 |
+| `fou`  | **GRE-in-UDP** (Foo-over-UDP), native kernel tunnel (no key) — a GRE tunnel wrapped inside an ordinary UDP packet on a port you choose | You want GRE's near-line-rate speed but the ISP blocks raw protocol-47, or the carrier must **look like plain UDP** instead of a GRE tunnel |
+| `vxlan` | **VXLAN**, native kernel tunnel (no key) — Ethernet-in-UDP, the standard datacenter overlay | A kernel UDP carrier that blends in as ordinary overlay traffic; useful where `fou`'s GRE-in-UDP is fingerprinted but VXLAN is not |
+| `reverse-mux` | **ICMP echo-*reply* + single-flow MUX** (no key) — the icmp engine with the emitted echo type forced to reply, plus a chisel reverse tunnel that collapses every user connection into **one** flow | The relay→foreign **upload** is policed: many parallel connections get shredded (they collapse to a few Mbit) while a single sustained flow stays near line-rate. Also dodges paths that drop echo-*request* (type 8) in one direction but pass echo-*reply* (type 0) |
+| `stripe` | **Connection-striping TCP** — shards one flow across many fresh, short-lived connections so no single 5-tuple is ever kept alive long enough to be capped | The ISP **byte-caps each 5-tuple** (e.g. ~8760 B, then the connection is silently blackholed): a single long-lived TCP stream dies after a few KB, so `stripe` keeps spreading the flow over a rolling pool of brand-new connections and no one of them reaches the cap |
+| `ackless` | **ACK-less raw-TCP carrier** — data-only `flags=0` raw-TCP segments spread across up to `-Fmax` (default 6) concurrent flows, each inner packet pinned to one flow by a 5-tuple hash, with an app-level ARQ (selective NACK/ACK) instead of the kernel's per-packet ACKs | The ISP **caps packets-per-5-tuple** rather than bytes: a normal TCP stream's ACK/retransmit chatter burns the packet budget, so `ackless` sends only data-bearing segments (and spreads them over several flows) and recovers loss itself |
+
+Many ISPs police only the *common* transports (TCP/UDP) and pass the "tunnel"
+protocols — GRE (IP proto 47) and ICMP — at the link's real physical rate. On
+one heavily-filtered Iran ISP tested, TCP/UDP were crushed to ~1 Mbit while
+**GRE ran at ~650 Mbit and ICMP at ~350 Mbit** to the same foreign box. That is
+exactly why you benchmark first and keep the winner. `gre`/`icmp` are plaintext
+carriers (the inner proxy traffic is already encrypted); `udp`/`tcp`/`mux` add
+their own XChaCha20-Poly1305.
+
+The `mux` transport is the headline. On an ISP that blocks UDP and drops ~half
+of new TCP handshakes, a naive single TCP tunnel melts down to a fraction of
+the path. `mux` opens N links (each retried from a **fresh source port** until
+one lands), spreads inner flows across them, and paces the aggregate just under
+the raw rate so the links never overshoot — reaching **~90% of the raw path
+speed** where a single tunnel managed under 15%.
+
+All obfuscated transports are **unsignatured**: a random 24-byte nonce followed
+by AEAD ciphertext, no magic bytes, no plaintext handshake — indistinguishable
+from random traffic to a DPI box.
+
+---
+
+## Install
+
+No compiler needed — the right static binary for your CPU (**amd64** or
+**arm64**) ships with the project.
+
+### Run this one line on your **Iran** server:
 
 ```bash
-OMNITUN_REF=main bash <(curl -fsSL https://raw.githubusercontent.com/Amam8585/OmniTunnel/main/install.sh) --prepare
+bash <(curl -fsSL https://raw.githubusercontent.com/Free-Guy-IR/OmniTunnel/main/install.sh) && omnitunnel
+```
+
+That's it. You run it **only on the Iran side**. When you add a tunnel (or run
+the benchmark), the manager asks for the foreign server's IP and SSH login and
+then **installs and configures the foreign side for you automatically over
+SSH** — deploys the matching binary for the foreign box's CPU, brings up the
+server end, and enables it on boot. You never have to log into the foreign box
+by hand.
+
+> Prefer to set the foreign side up yourself? Just run the same one-liner there
+> too — the tool is symmetric.
+
+From a checkout instead of the one-liner:
+
+```bash
+git clone https://github.com/Free-Guy-IR/OmniTunnel
+cd OmniTunnel && sudo ./install.sh && omnitunnel
+```
+
+### Near-zero-config: a working tunnel in one more command
+
+You do not have to be an expert. On a fresh Iran box run the one-liner above,
+then bring a tunnel up with a single command — the only thing you supply is the
+**transport and the foreign IP**:
+
+```bash
+omnitunnel add-auto ackless <foreign-ip>        # far side set up for you over SSH
+```
+
+If your ISP blocks outbound SSH to the foreign, use the manual path instead —
+still just transport + foreign IP, plus pasting two lines on the far side:
+
+```bash
+omnitunnel add-manual ackless <foreign-ip>      # prints two lines to paste abroad
+```
+
+Either way the manager auto-generates the pre-shared key and allocates the
+subnet, port, tun device and MTU, so no other input is needed. The instance name
+is derived automatically (`ackless`, then `ackless1`, …) when you omit it.
+
+---
+
+## First run: benchmark & pick the best
+
+From the main menu choose **“Benchmark all tunnels & pick the best.”** Point it
+at a foreign server (IP + SSH login) and it will:
+
+1. measure the **raw** path (download, upload + rtt),
+2. bring up each of the twelve tunnels in turn and measure **download, upload,
+   packet loss and ping** through it,
+3. print a comparison table,
+4. **remove every test tunnel from both sides**, then let you keep exactly one
+   as a permanent instance.
+
+Real numbers, measured end-to-end through the manager on a fast Iran→foreign
+route — an Iran server to a foreign box:
+
 ```
 
 The installer detects Ubuntu 22.04/24.04 or Debian 12/13 and CPU architecture, installs missing build packages, builds C from source, validates it and stages it. **It does not restart or replace running services.** Only after verifying the build and scheduling maintenance should you use `sudo bash install.sh --apply` from a local checkout. Applying while active instances are detected requires an additional explicit `--allow-active`, but even then there is **no automatic restart**.
 
-For regular production users, remain on the working version until all tests pass. Do not apply an experimental build on both sides simultaneously.
+    TYPE                        DOWNLOAD UPLOAD   LOSS   PING  NOTE
+  → gre          ██████████████ 700M     FAIL     0%     71    fastest
+    fou          █████████████  641M     4.62M    0%     78    stealth pick
+    icmp         ████████████  624M     395M     0%     84
+    vxlan        ███████████   562M     120M     0%     77
+    mux          ███████████   539M     99.2M    0%     70
+    udp          ███████████   532M     81.7M    0%     77
+    ws           ██████        300M     79.2M    0%     79
+    reverse-mux  █████         233M     FAIL     0%     83
+    hysteria     ████          198M     FAIL     0%     83
+    tcp          █             69.6M    99.5M    0%     81
+    stripe       —             pending   pending   —        —     awaits real two-box bench
+    ackless      ████████████  622M     597M     0%     1     lab (netns, not real-path)
+```
 
-## After lab installation
+The `gre`…`tcp` rows were measured 10 September 2026, one Iran relay to one
+foreign box, every transport built and torn down in sequence by `omnitunnel
+bench` itself. The `ackless` row (622/597 Mbit, 0% loss) is an **interim lab
+figure** measured on a single disposable host over a `netns`+`veth` loopback with
+`tc-netem` on a clean profile — it is a *relative* sanity measurement, **not a
+real Iran→foreign throughput** and not directly comparable to the real rows
+above; its real-path numbers from a two-box `omnitunnel bench` are still pending.
+The `stripe` row cannot be measured in a single-host `netns` (its engine, like
+the `udp`/`tcp`/`mux`/`ws` carriers, needs `omnitunnel`'s per-end setup on both
+boxes), so it awaits a real two-box bench — it is **not broken**, just not yet
+benched here.
+
+The bar is scaled to the fastest tunnel; **→** marks the outright winner and
+**stealth pick** marks the fastest *fully obfuscated* transport. Read the two
+columns against each other: kernel `gre` takes the download at 700 Mbit but
+returns **nothing** upstream, and `fou` pairs 641 down with a collapsed 4.62 up.
+The only transport that carries both directions here is `icmp` — 624 down and
+**395 up, roughly five times the 77.7 Mbit the raw path itself managed**. A
+download-only ranking would have picked exactly the wrong tunnel on this link.
+
+The winner is **link-specific**: where the ISP fingerprints GRE the encrypted
+UDP carriers lead, where it rate-crushes UDP the plaintext `gre`/`icmp` do, and
+on a lossy path `hysteria` does. Nothing wins everywhere — which is the whole
+point of benchmarking: **run it on your own link and keep the winner.** Re-run it
+from the menu any time conditions change.
+
+> A real measurement taken end-to-end through the manager on one representative
+> route; your own link will land differently — benchmark it and keep the winner.
+
+### The other shape: a route that polices *upload*
+
+Download-fast is not the whole story. On a hostile Iran→foreign path the
+**relay→foreign upload** is often the policed direction, and it fails in a
+specific way: **one** sustained flow runs near line-rate, but the moment real
+users open many parallel connections the aggregate collapses. Measured on such a
+route (relay → NL, `iperf3` through the tunnel):
+
+| what was measured | upload |
+|---|---|
+| plain ICMP tunnel, single flow (`-P 1`, 20 s sustained) | **185 Mbit** — stable |
+| plain ICMP tunnel, 8 parallel flows (`-P 8`) | **21.8 Mbit** — collapses |
+| `reverse-mux` (same tunnel + single-flow MUX), `-P 8` | **226 Mbit** |
+| `reverse-mux`, `-P 32` | **240 Mbit** |
+
+Same link, same ICMP carrier — the only difference is that `reverse-mux` funnels
+every connection into one flow, so the policer never sees the parallel burst it
+punishes. On that route it is a **~10×** upload difference, which is why the
+benchmark measures both directions rather than download alone.
+
+On the very same path, raw ICMP echo-*request* (type 8) was **100 % dropped**
+while echo-*reply* (type 0) passed untouched — the directional, type-specific
+block `reverse-mux` is built to walk around.
+
+### The third shape: a route that byte-caps every connection
+
+A newer failure mode some ISPs apply is a **per-5-tuple byte cap**: each
+connection is allowed to carry a fixed budget (observed around **~8760 B**) and
+is then silently blackholed — no RST, the flow just stops. Every long-lived
+carrier (`tcp`, `mux`, `ws`, even the kernel tunnels) dies after that first
+budget, because each of their connections is meant to live for the whole
+session. `stripe` is the transport for exactly this path: it shards the flow
+across a rolling pool of short-lived connections and retires each one well
+before it reaches the cap, so the policer never has a long-lived 5-tuple to
+punish.
+
+| what was measured | result |
+|---|---|
+| `stripe`, local network-namespace loopback proof, download-only | **126 Mbit** |
+| `stripe`, local netns, bidirectional | **stable** (no stall, no collapse) |
+| `stripe`, real Iran→foreign path, sustained bulk TCP | **stalls** — carrier comes up (ping 0% loss, both ends active) but single and parallel iperf3 do not sustain; real-path throughput pending |
+
+These are a **local-netns functional proof only** — they show the transport
+sustains throughput without hitting a cap, not a real-link figure. Real-path
+numbers on a genuinely byte-capped route are still to be measured. `stripe` and
+`ackless` now appear as rows in the headline comparison above: the `ackless`
+figure there is the same class of interim `netns`+`netem` lab measurement (a
+relative sanity check, not a real Iran→foreign number), and the `stripe` row is
+left pending because its engine cannot be benched on a single host. Both get
+real numbers from a two-box `omnitunnel bench` before they are presented as
+real-path results.
+
+**Known limitation.** On a real Iran→foreign path the `stripe` carrier
+establishes cleanly but a sustained inner bulk-TCP transfer does not hold up,
+while `ackless` on the same path sustains tens of Mbit at 0% loss. This is
+inherent to stripe's rolling pool of short-lived connections and its bounded
+reassembly window under heavy cross-connection reordering, not an MTU/MSS-clamp
+interaction — the per-tun TCPMSS clamp is identical for every transport and the
+other tun transports do not stall. For high sustained throughput use `ackless`;
+`stripe` is the right choice specifically for a per-5-tuple byte-capped path
+where every long-lived carrier is blackholed.
+
+---
+
+## When the foreign box can't be reached over SSH
+
+Some Iran ISPs block **outbound port 22** (and DNS to GitHub) entirely, so the
+automatic "set up the far side over SSH" step can't run. Two built-in ways
+around it — **neither touches any server's own SSH or port 22:**
+
+**1. Manual mode (no SSH at all).** From the manage menu pick *“Add a tunnel —
+MANUAL”*, or:
 
 ```bash
 sudo omnitunnel                      # Direct tunnel manager
@@ -47,7 +262,189 @@ sudo omnitunnel optimizer recommend INSTANCE balanced
 sudo omnitunnel optimizer dry-run INSTANCE low-latency
 ```
 
-Optional per-interface-only experimental queue tuning is explicit and reversible:
+It brings up the near (Iran) side and prints two lines to paste on the foreign
+box (which abroad can reach GitHub fine):
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/Free-Guy-IR/OmniTunnel/main/install.sh)
+omnitunnel server-token <token>
+```
+
+The `<token>` carries the key, port and addresses — the tunnel comes straight
+up. No SSH between the two boxes is ever used.
+
+**2. SOCKS5 proxy for provisioning.** If you already have a working SOCKS5 proxy
+on the Iran box, the auto setup can tunnel its SSH/SCP through it (as the
+original icmptun did) — save a peer with a proxy and the manager adds
+`ProxyCommand=nc -X 5 -x host:port` to every provisioning connection.
+
+> The tunnel always uses **its own port** (e.g. 51820), never 22. Installing or
+> running OmniTunnel never changes any server's SSH login or SSH port.
+
+---
+
+## Topologies (many-to-many)
+
+Each tunnel is an **instance** with its own tun device, systemd unit, subnet,
+port and port-forward chain, so any shape works and instances never collide:
+
+- **one Iran → many foreign** — add several instances on one box
+- **many Iran → one foreign** — the foreign box hosts one server instance per
+  Iran box
+- **many → many** — any combination of the above
+
+The manager auto-allocates a non-overlapping subnet and a free port for every
+new instance, and (given an SSH login to the far side) brings up both ends.
+
+---
+
+## Port forwarding
+
+Expose a port on one side and have it tunneled to the other:
+
+```bash
+omnitunnel pf-add <instance> both 443     # tcp+udp 443 -> peer over the tunnel
+omnitunnel pf-add <instance> tcp  8080
+omnitunnel pf-del <instance> 443
+```
+
+or use the **Port forwarding** menu.
+
+---
+
+## CLI (for scripting)
+
+```bash
+omnitunnel add                       # interactive add wizard
+omnitunnel add-auto <type> [name] <foreign_ip> [nconn] [shape] [my_ip]
+omnitunnel add-manual <type> [name] <foreign_ip> [nconn] [shape] [my_ip]
+omnitunnel server-token <token>      # paste on the foreign for the manual path
+omnitunnel list
+omnitunnel status  <instance>
+omnitunnel remove  <instance>        # removes ONLY that instance (both-side safe)
+omnitunnel pf-add  <instance> <tcp|udp|both> <port>
+omnitunnel bench
+omnitunnel update                    # pull the latest from GitHub (see below)
+omnitunnel uninstall                 # remove every tunnel + all files, incl. itself
+```
+
+The core binary can also be driven directly:
+
+```bash
+omnitun mux -L <local-ip> -R <peer-ip> -A <local-tun-ip> -P <peer-tun-ip> \
+            -p <port> -k <64-hex-key> -N 16 [-s] -T <dev> -M 1400
+omnitun udp  ...     omnitun tcp  ...     omnitun icmp ...
+```
+
+`-s` marks the server (listening) side; the client omits it.
+
+### Creating a `stripe` tunnel
+
+`stripe` is created the same way as any other transport — pick it in the
+interactive wizard or name it on the CLI:
+
+```bash
+omnitunnel add
+omnitunnel add-auto stripe main <foreign-ip> [N]
+omnitunnel add-manual stripe main <foreign-ip> [N]
+```
+
+The wizard asks only for the number of **striping connection workers N**
+(default 90); subnet, port and the port-count pool are allocated for you. It is
+provisioned with a generated pre-shared key that authenticates the stripe frames
+(the inner proxy traffic is separately encrypted) and, like every other
+transport, never touches the box's own SSH or port 22.
+
+Unlike the other transports `stripe` runs on its **own static engine**
+(`omnistripe`, a separate Go binary in [`bin/`](bin/)), so it is driven directly
+through that binary rather than through `omnitun`:
+
+```bash
+omnistripe -L <local-ip> -R <peer-ip> -A <local-tun-ip> -P <peer-tun-ip> \
+           -p 40000 -C 400 -N 90 -T tsstripe0 -M 1400 [-s]
+```
+
+Flags:
+
+| flag | meaning | default |
+|------|---------|---------|
+| `-L` | local source/bind IP | — |
+| `-R` | peer IP the client dials | — |
+| `-A` | this box's tun address | — |
+| `-P` | peer's tun address | — |
+| `-k` | pre-shared key authenticating the stripe frames (required; the manager generates and provisions it) | — |
+| `-p` | base destination port of the striped pool | `40000` |
+| `-C` | number of destination ports in the pool | `400` |
+| `-N` | connection (striping) workers | `90` |
+| `-dl` | download-side pool size | `0` (derive from `-N`) |
+| `-T` | tun device name | `tsstripe0` |
+| `-M` | tun MTU | `1400` |
+| `-s` | run as the server (listener) side; the client omits it | off |
+| `-u` | client→server chunk bytes | `6800` |
+| `-d` | server→client chunk bytes | `8600` |
+
+`-u`/`-d` set how much data each striped connection carries before it is
+retired. They are **hard-capped at 8656 bytes** (the on-wire ceiling of 8760 B
+minus the 104-byte frame header); any larger value is clamped down to 8656, so
+no single connection ever outlives a ~8760 B per-5-tuple byte cap.
+
+### Creating an `ackless` tunnel
+
+`ackless` is the transport for a path that **caps packets-per-5-tuple** rather
+than bytes. It carries data-only `flags=0` raw-TCP segments — no SYN/ACK/
+retransmit chatter to burn the packet budget — and recovers loss itself with an
+app-level ARQ (selective NACK/ACK). It spreads those segments across up to
+`-Fmax` (default 6) concurrent ACK-less flows, pinning each inner packet to one
+flow by a 5-tuple hash. Where `stripe` spreads a flow over short-lived
+connections to dodge a per-5-tuple **byte** cap, `ackless` strips the per-packet
+ACK overhead (and uses a handful of flows) to dodge a per-5-tuple **packet** cap.
+
+Bring it up like any other transport — the only input is the foreign IP; the
+name is auto-derived and the key/subnet/port/device/MTU are allocated for you:
+
+```bash
+omnitunnel add                               # interactive wizard, pick ackless
+omnitunnel add-auto ackless <foreign-ip>     # name auto-derived; far side over SSH
+omnitunnel add-manual ackless <foreign-ip>   # no SSH; prints two lines to paste abroad
+```
+
+The manual path prints the two lines to run on the foreign box:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/Free-Guy-IR/OmniTunnel/main/install.sh)
+omnitunnel server-token <token>
+```
+
+Like `stripe`, `ackless` runs on its **own static engine** (`omniackless`, a
+separate Go binary in [`bin/`](bin/)), so it can also be driven directly:
+
+```bash
+omniackless -L <local-ip> -R <peer-ip> -A <local-tun-ip> -P <peer-tun-ip> \
+            -p 49000 -T tsackless0 -M 1400 -k <key> [-s]
+```
+
+Flags:
+
+| flag | meaning | default |
+|------|---------|---------|
+| `-L` | local source/bind IP | — |
+| `-R` | peer IP the client dials | — |
+| `-A` | this box's tun address | — |
+| `-P` | peer's tun address | — |
+| `-k` | pre-shared key authenticating the carrier (the manager generates and provisions it) | — |
+| `-p` | base port | `49000` |
+| `-T` | tun device name | `tsackless0` |
+| `-M` | tun MTU | `1400` |
+| `-s` | run as the server (listener) side; the client omits it | off |
+| `-Fmax` | number of concurrent ACK-less flows the carrier runs; inner packets are hashed across them | `6` |
+| `-F` / `-Fmin` / `-auto` | initial / minimum flow count and the adaptive-scaling toggle — accepted for forward compatibility, but this build runs the full `-Fmax` set | `2` / `1` / `true` |
+
+---
+
+## Updating & removing
+
+**Update.** Re-running the one-liner is the update path — it's idempotent and
+version-aware:
 
 ```bash
 sudo omnitunnel optimizer apply INSTANCE balanced --acknowledge
@@ -62,11 +459,43 @@ For a **new** Direct ICMP instance only, `OMNITUN_ICMP_FLOW_SLOTS=16384` sets th
 
 ## Documentation
 
-- [Architecture and ownership](docs/ARCHITECTURE.md)
-- [Safe installer, updating and rollback](docs/INSTALL.md)
-- [Benchmark methodology — no results claimed](benchmarks/README.md)
-- [Direct security boundaries](docs/SECURITY.md)
-- [Change log](CHANGELOG.md)
+- **One static core binary** (`omnitun`) — a busybox-style multi-call program
+  that dispatches to `udp` / `tcp` / `mux` / `ws` / `icmp`. No shared-library
+  dependencies: crypto is vendored ([Monocypher](https://monocypher.org),
+  XChaCha20-Poly1305), so it builds and cross-compiles trivially and runs on
+  any modern Linux kernel.
+- **Bundled `hysteria` engine** — the `hysteria` transport is powered by the
+  upstream [Hysteria2](https://github.com/apernet/hysteria) static binary,
+  shipped in [`bin/`](bin/) for both CPUs. The manager generates its YAML
+  (salamander obfs + website masquerade + self-signed TLS) and runs it under
+  systemd. The engine keeps an always-on localhost SOCKS5, and each **TCP
+  port-forward is a tiny standalone relay** that dials through that SOCKS5 as
+  its own systemd unit — so adding or removing a forward starts/stops one relay
+  and **never restarts the engine or disturbs the live QUIC session or other
+  forwards** (UDP forwards are the one exception and still live in-config). No
+  tun device or iptables DNAT is used for this type.
+- **Bundled `omnistripe` engine** — the `stripe` transport is powered by its own
+  self-contained static Go binary ([`src/omnistripe`](src/omnistripe)), shipped
+  in [`bin/`](bin/) for both CPUs as `omnistripe-amd64` / `omnistripe-arm64`. It
+  owns a `tsstripe*` tun device and shards the inner flow across a rolling pool
+  of short-lived TCP connections (base port `-p`, `-C` ports wide), each retired
+  before it reaches the per-5-tuple byte cap. Like the C core it needs no shared
+  libraries and cross-compiles trivially.
+- **Bundled `omniackless` engine** — the `ackless` transport is powered by its
+  own self-contained static Go binary ([`src/omniackless`](src/omniackless)),
+  shipped in [`bin/`](bin/) for both CPUs as `omniackless-amd64` /
+  `omniackless-arm64`. It owns a `tsackless*` tun device and carries data-only
+  `flags=0` raw-TCP segments across up to `-Fmax` (default 6) concurrent flows
+  with an app-level ARQ, self-managing its raw sockets and the `nft` rules that
+  suppress the kernel's RST/ACK for those flows (set up on start, torn down on
+  exit). Like the C core it needs no shared libraries and cross-compiles trivially.
+- Prebuilt for **amd64** and **arm64** under [`bin/`](bin/), also attached to
+  each release.
+- **`omnitunnel.sh`** — the English TUI manager: benchmark, instance
+  add/remove/restart, port forwarding, systemd persistence, BBR + fq/tbf
+  tuning, and automatic far-side provisioning over SSH.
+- State lives under `/etc/omnitunnel` and never touches an existing
+  `/etc/icmptun` install.
 
 ## Build and verification
 
