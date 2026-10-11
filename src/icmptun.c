@@ -364,7 +364,10 @@ static void emit_stats(uint64_t uptime_ms) {
       "\"send_errors\":%llu,\"recv_errors\":%llu,\"tun_errors\":%llu,"
       "\"invalid_packets\":%llu,\"active_flows\":%llu,\"flow_evictions\":%llu,"
       "\"flow_collisions\":%llu,\"reorder_events\":%llu,\"reorder_timeouts\":%llu,"
-      "\"alloc_failures\":%llu,\"flow_capacity\":%u}\n",
+      "\"alloc_failures\":%llu,\"flow_capacity\":%u,"
+      "\"tun_oversized\":%llu,\"queue_pressure\":%llu,\"queue_pauses\":%llu,"
+      "\"tun_read_paused\":%d,\"flow_lookup_calls\":%llu,\"flow_lookup_probes\":%llu,"
+      "\"flow_table_bytes\":%llu,\"timer_heap_bytes\":%llu}\n",
       (unsigned long long)uptime_ms, (unsigned long long)metrics.tun_rx,
       (unsigned long long)metrics.tun_tx, (unsigned long long)metrics.icmp_rx,
       (unsigned long long)metrics.icmp_tx, (unsigned long long)metrics.rx_bytes,
@@ -377,7 +380,15 @@ static void emit_stats(uint64_t uptime_ms) {
       (unsigned long long)metrics.active_flows, (unsigned long long)metrics.flow_evictions,
       (unsigned long long)metrics.flow_collisions, (unsigned long long)metrics.reordered,
       (unsigned long long)metrics.reorder_timeouts, (unsigned long long)metrics.alloc_failures,
-      flow_slots);
+      flow_slots,
+      (unsigned long long)metrics.tun_oversized,
+      (unsigned long long)metrics.queue_pressure,
+      (unsigned long long)metrics.queue_pauses,
+      tun_read_paused,
+      (unsigned long long)metrics.flow_lookup_calls,
+      (unsigned long long)metrics.flow_lookup_probes,
+      (unsigned long long)((size_t)flow_bucket_count * sizeof(*flow_table)),
+      (unsigned long long)((size_t)timer_heap_capacity * sizeof(*timer_heap)));
     if (fclose(f) == 0) rename(tmp, stats_path);
     else unlink(tmp);
 }
