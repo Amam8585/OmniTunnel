@@ -7,7 +7,7 @@ Test on a disposable Ubuntu 22.04/24.04 or Debian 12/13 VM with CAP_NET_RAW, CAP
 ## Prepare only (no live service restart)
 
 ```bash
-OMNITUN_REF=refactor/direct-only-icmp-performance bash <(curl -fsSL https://raw.githubusercontent.com/Amam8585/OmniTunnel/refactor/direct-only-icmp-performance/install.sh) --prepare
+OMNITUN_REF=main bash <(curl -fsSL https://raw.githubusercontent.com/Amam8585/OmniTunnel/main/install.sh) --prepare
 ```
 
 This detects OS/architecture, checks/install required compiler+headers, downloads the selected source as a tar archive, compiles the entire C Direct program, validates the version, and stages C + all supported auxiliary Direct binaries and manager scripts. Staging never modifies installed executable files, configurations or systemd units. If downloaded files are untrusted, manually verify source and commit ID and pin `OMNITUN_REF` to a reviewed immutable commit hash before running as root.
