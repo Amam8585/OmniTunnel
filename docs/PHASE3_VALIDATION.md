@@ -19,7 +19,7 @@ Production Iran/foreign hosts were NOT contacted and NO live stress tests were r
 - ICMP cumulative counters cover oversized TUN frames, ring pressure, TUN pauses,
   flow lookup probes and flow table byte footprint. Wrapped sequence/reorder and
   timer exhaustion have offline regression test cases.
-- WebSocket validates Sec-WebSocket-Accept, 64-bit lengths, RSV/FIN, client masks,
+- Crypto entropy: replacing the deterministic emergency nonce fallback in tcrypto.h with fail-closed kernel CSPRNG, with a mock failure test (unexecuted); WebSocket now batches cryptographic masking keys.\n- WebSocket validates Sec-WebSocket-Accept, 64-bit lengths, RSV/FIN, client masks,
   and serialized Ping/Pong. A previous non-RFC server sent a hardcoded Accept value:
   connecting a Phase 3 client to such an old server requires an explicit
   OMNITUN_WS_ALLOW_LEGACY_ACCEPT=1 compatibility exception after review.
