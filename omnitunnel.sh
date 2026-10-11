@@ -1,8 +1,7 @@
 #!/bin/bash
-# tunnelctl.sh - Multi-protocol obfuscated tunnel suite (part of the icmptun
-# project). Drives ONE prebuilt static core binary ("tsuite") over an English
-# TUI. No compiler needed on the box: the right binary for the CPU (amd64 or
-# arm64) is shipped with the project.
+# OmniTunnel Direct Manager (development branch).
+# All Direct carriers are retained. New installer compiles the C Direct core;
+# Go Direct engines are bundled. Dedicated Reverse-MUX/Chisel is removed.
 #
 #   gre      IP-over-GRE (kernel)  - often unpoliced / full line-rate
 #   icmp     IP-over-ICMP          - blends in as ping (no key)
@@ -20,7 +19,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.9.7"
+VERSION="3.0.0"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -38,7 +37,7 @@ HYSTERIA_BIN="${OMNITUN_HYSTERIA_BIN:-/usr/local/bin/hysteria}"
 HY_MASQ_HOST="www.bing.com"
 # where the shipped per-arch binaries live (install.sh drops them here)
 ASSET_DIR="${OMNITUN_ASSETS:-/opt/omnitunnel}"
-RAW_BASE="https://raw.githubusercontent.com/Amam8585/OmniTunnel/${OMNITUN_REF:-main}"
+RAW_BASE="https://raw.githubusercontent.com/Amam8585/OmniTunnel/${OMNITUN_REF:-refactor/direct-only-icmp-performance}"
 
 # shellcheck disable=SC2034
 C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'; C_ITAL=$'\033[3m'
@@ -139,7 +138,6 @@ ensure_hysteria() {
     install -m 0755 "$cand" "$HYSTERIA_BIN"
 }
 
-# locate this box's chisel binary (shipped in bin/, or downloadable)
 omnistripe_local_bin() {
     local a="$1" d
     for d in "$ASSET_DIR/bin" "$SCRIPT_DIR/bin"; do [[ -f "$d/omnistripe-$a" ]] && { echo "$d/omnistripe-$a"; return 0; }; done
@@ -1683,7 +1681,14 @@ cmd_update() {
         return 1
     fi
     local rc=0
-    bash "$tmp" --update || rc=$?
+    # Reject legacy third-party installers that silently restart running units.
+    # This marker is a compatibility guard, NOT a cryptographic signature.
+    if ! grep -q '^# OmniTunnel Direct safe installer:' "$tmp"; then
+        rm -f "$tmp"
+        warn "Refusing legacy/unknown installer: only verified stage-only updaters are allowed."
+        return 1
+    fi
+    OMNITUN_REF="${OMNITUN_REF:-refactor/direct-only-icmp-performance}" bash "$tmp" --update || rc=$?
     rm -f "$tmp"
     [[ $rc -eq 0 ]] || { warn "update failed (exit $rc)"; return 1; }
     info "Update staged; activate explicitly with install.sh --apply."
