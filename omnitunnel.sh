@@ -883,9 +883,15 @@ pf_apply_all() {
             iptables -w 5 -t nat -A POSTROUTING -o "$DEV" -j MASQUERADE ||
             die "legacy MASQUERADE could not be installed"
     fi
-    if [[ -s "$maps" ]]; then
+    # Clearing only our previously registered chains also removes obsolete
+    # mappings when the last map.conf line is deleted.
+    if [[ -s "$maps" ]] || iptables -t nat -C POSTROUTING -j "$sn" 2>/dev/null; then
         pf_owned_chain nat "$sn" POSTROUTING
+    fi
+    if [[ -s "$maps" ]] || iptables -t filter -C FORWARD -j "$fw" 2>/dev/null; then
         pf_owned_chain filter "$fw" FORWARD
+    fi
+    if [[ -s "$maps" ]]; then
         while IFS='|' read -r proto pubip pubport dstip dstport ingress; do
             iptables -w 5 -t nat -A "$ch" -i "$ingress" -d "$pubip" -p "$proto" \
                 --dport "$pubport" -j DNAT --to-destination "$dstip:$dstport" ||
@@ -914,6 +920,80 @@ pf_apply_all() {
                 die "legacy DNAT forwarding failed"
         done < "$pf"
     fi
+}
+pf_mapping_conflict() {
+    local owner="$1" proto="$2" pubip="$3" pubport="$4" ingress="$5"
+    local other f old_proto old_pub old_port old_dst old_dport old_ing
+    for other in $(list_instances); do
+        f="$(inst_pf "$other")"
+        if [[ -s "$f" ]] && grep -Eq "^$proto:$pubport$" "$f"; then
+            die "legacy wildcard forward $proto/$pubport already reserved by $other"
+        fi
+        f="$(pf_map_file "$other")"
+        [[ -s "$f" ]] || continue
+        while IFS='|' read -r old_proto old_pub old_port old_dst old_dport old_ing; do
+            if [[ "$old_proto" == "$proto" && "$old_pub" == "$pubip" &&
+                  "$old_port" == "$pubport" && "$old_ing" == "$ingress" ]]; then
+                die "Direct mapped port $proto $pubip:$pubport on $ingress already owned by $other"
+            fi
+        done < "$f"
+    done
+}
+pf_map_add() {
+    need_root
+    local name="$1" proto="$2" pubip="$3" pubport="$4" dstip="$5" dstport="$6" ingress="$7"
+    local file backup rec
+    load_inst "$name"
+    type_is_hysteria "$TYPE" && die "Hysteria uses independent SOCKS relay forwarding"
+    [[ "$proto" == tcp || "$proto" == udp ]] || die "protocol must be tcp/udp"
+    pf_ipv4 "$pubip" && pf_ipv4 "$dstip" || die "invalid public/destination IPv4"
+    pubport="$(norm_port "$pubport")" || die "invalid public port"
+    dstport="$(norm_port "$dstport")" || die "invalid destination port"
+    [[ "$ingress" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] || die "invalid ingress interface"
+    # Lock all instance maps so two concurrent administrators cannot allocate
+    # the same public-IP:port simultaneously.
+    exec {lock_fd}>"$INST_DIR/.pf.lock"
+    flock -x "$lock_fd" || die "could not lock forwarding records"
+    pf_mapping_conflict "$name" "$proto" "$pubip" "$pubport" "$ingress"
+    rec="$proto|$pubip|$pubport|$dstip|$dstport|$ingress"
+    file="$(pf_map_file "$name")"
+    backup="$(mktemp "$file.XXXXXX")" || die "cannot create map backup"
+    [[ ! -e "$file" ]] || cp -a "$file" "$backup"
+    printf '%s\n' "$rec" >> "$file"
+    if ! (pf_apply_all "$name"); then
+        cp -a "$backup" "$file"
+        (pf_apply_all "$name") || true
+        rm -f "$backup"
+        die "advanced mapping failed; old config restored"
+    fi
+    rm -f "$backup"
+    ok "Direct mapping added: $proto $pubip:$pubport -> $dstip:$dstport via $ingress"
+}
+pf_map_del() {
+    need_root
+    local name="$1" proto="$2" pubip="$3" pubport="$4" ingress="$5" file backup
+    load_inst "$name"
+    [[ "$proto" == tcp || "$proto" == udp ]] || die "invalid protocol"
+    pf_ipv4 "$pubip" || die "invalid public IP"
+    pubport="$(norm_port "$pubport")" || die "invalid port"
+    [[ "$ingress" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] || die "invalid ingress interface"
+    exec {lock_fd}>"$INST_DIR/.pf.lock"
+    flock -x "$lock_fd" || die "cannot lock forwarding records"
+    file="$(pf_map_file "$name")"
+    [[ -s "$file" ]] || die "no Direct mappings for $name"
+    backup="$(mktemp "$file.XXXXXX")" || die "cannot snapshot map"
+    cp -a "$file" "$backup"
+    awk -F'|' -v p="$proto" -v ip="$pubip" -v port="$pubport" -v dev="$ingress" \
+        '!($1==p && $2==ip && $3==port && $6==dev)' "$backup" > "$file"
+    if cmp -s "$backup" "$file"; then rm -f "$backup"; die "mapping not found"; fi
+    if ! (pf_apply_all "$name"); then
+        cp -a "$backup" "$file"
+        (pf_apply_all "$name") || true
+        rm -f "$backup"
+        die "Direct mapping removal failed; restored config"
+    fi
+    rm -f "$backup"
+    ok "Direct mapping removed: $proto $pubip:$pubport via $ingress"
 }
 pf_add() {
     need_root; load_inst "$1"; local proto="$2" ports="$3"
@@ -946,6 +1026,14 @@ pf_flush_chain() {
     iptables -t nat -D PREROUTING -j "$ch" 2>/dev/null || true
     iptables -t nat -F "$ch" 2>/dev/null || true; iptables -t nat -X "$ch" 2>/dev/null || true
     iptables -t nat -D POSTROUTING -o "$DEV" -j MASQUERADE 2>/dev/null || true
+    local sn fw
+    sn="$(pf_snat_chain "$1")"; fw="$(pf_filter_chain "$1")"
+    iptables -t nat -D POSTROUTING -j "$sn" 2>/dev/null || true
+    iptables -t nat -F "$sn" 2>/dev/null || true
+    iptables -t nat -X "$sn" 2>/dev/null || true
+    iptables -t filter -D FORWARD -j "$fw" 2>/dev/null || true
+    iptables -t filter -F "$fw" 2>/dev/null || true
+    iptables -t filter -X "$fw" 2>/dev/null || true
 }
 
 # --------------------------------------------------------------- remove -------
@@ -2115,6 +2203,8 @@ case "${1:-menu}" in
     _remove)          need_root; inst_remove "${2:?instance}";;
     pf-add)           pf_add "${2:?}" "${3:?}" "${4:?}";;
     pf-del)           pf_del "${2:?}" "${3:?}";;
+    pf-map-add)       pf_map_add "${2:?name}" "${3:?protocol}" "${4:?public_ip}" "${5:?public_port}" "${6:?destination_ip}" "${7:?destination_port}" "${8:?ingress_interface}";;
+    pf-map-del)       pf_map_del "${2:?name}" "${3:?protocol}" "${4:?public_ip}" "${5:?public_port}" "${6:?ingress_interface}";;
     stats)            bash "$ASSET_DIR/scripts/monitor.sh" stats "${2:?instance}" "${3:-}";;
     monitor)          bash "$ASSET_DIR/scripts/monitor.sh" monitor "${2:?instance}" "${3:-}";;
     optimizer)        shift; bash "$ASSET_DIR/scripts/optimizer.sh" "$@";;
@@ -2142,5 +2232,5 @@ case "${1:-menu}" in
     update|upgrade)   need_root; cmd_update;;
     uninstall|purge)  need_root; cmd_uninstall;;
     version|-v|--version) echo "tunnelctl $VERSION (core: $($TSUITE_BIN version 2>/dev/null || echo n/a))";;
-    *) echo "usage: $0 [menu|bench|add|list|status <n>|enable <n>|remove <n>|pf-add <n> <proto> <port>|pf-del <n> <port>|stats <n> [--json]|monitor <n> [--json]|optimizer <action> <n>|diagnostics <n>|fix-forwarding|update|uninstall]";;
+    *) echo "usage: $0 [menu|bench|add|list|status <n>|enable <n>|remove <n>|pf-add <n> <proto> <port>|pf-del <n> <port>|pf-map-add <n> <proto> <public-ip> <pubport> <dest-ip> <dstport> <ingress-if>|pf-map-del <n> <proto> <public-ip> <pubport> <ingress-if>|stats <n> [--json]|monitor <n> [--json]|optimizer <action> <n>|diagnostics <n>|fix-forwarding|update|uninstall]";;
 esac
