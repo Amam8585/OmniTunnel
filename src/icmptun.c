@@ -553,12 +553,35 @@ static void timer_heap_sift_down(int i) {
     }
 }
 
+static void flow_flush(flow_entry_t *f);
+
+/* Compaction guarantees that stale deadlines cannot exhaust the timer heap.
+   At most one valid deadline per live flow is copied into the new heap.
+   We intentionally do not rely on a non-existent periodic full-table sweep. */
+static void timer_heap_rebuild(void) {
+    timer_heap_size = 0;
+    for (unsigned bucket = 0; bucket < flow_bucket_count; bucket++) {
+        for (int way = 0; way < FLOW_TABLE_WAYS; way++) {
+            flow_entry_t *entry = &flow_table[bucket].slots[way];
+            if (!entry->valid || !entry->timer_deadline || !entry->pending) continue;
+            if (timer_heap_size >= timer_heap_capacity) {
+                /* With 4x slot capacity this is unreachable, but don't stall
+                   delivery if future size/config changes violate that invariant. */
+                flow_flush(entry);
+                continue;
+            }
+            int i = timer_heap_size++;
+            timer_heap[i].deadline = entry->timer_deadline;
+            timer_heap[i].flow = entry;
+            timer_heap[i].generation = entry->generation;
+            timer_heap_sift_up(i);
+        }
+    }
+}
 static void timer_heap_push(flow_entry_t *f) {
     if (timer_heap_size >= timer_heap_capacity) {
-        /* Shouldn't happen (bounded by flow table size), but never
-           overflow the array - the deadline still fires via the flow's
-           own timer_deadline check during periodic flush sweeps if this
-           ever gets hit; drop the heap-acceleration for this one event. */
+        timer_heap_rebuild();
+        /* Rebuild already inserted this flow and its newest deadline. */
         return;
     }
     timer_heap[timer_heap_size].deadline = f->timer_deadline;
