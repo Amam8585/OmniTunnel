@@ -86,6 +86,27 @@ git clone https://github.com/Free-Guy-IR/OmniTunnel
 cd OmniTunnel && sudo ./install.sh && omnitunnel
 ```
 
+### Near-zero-config: a working tunnel in one more command
+
+You do not have to be an expert. On a fresh Iran box run the one-liner above,
+then bring a tunnel up with a single command — the only thing you supply is the
+**transport and the foreign IP**:
+
+```bash
+omnitunnel add-auto ackless <foreign-ip>        # far side set up for you over SSH
+```
+
+If your ISP blocks outbound SSH to the foreign, use the manual path instead —
+still just transport + foreign IP, plus pasting two lines on the far side:
+
+```bash
+omnitunnel add-manual ackless <foreign-ip>      # prints two lines to paste abroad
+```
+
+Either way the manager auto-generates the pre-shared key and allocates the
+subnet, port, tun device and MTU, so no other input is needed. The instance name
+is derived automatically (`ackless`, then `ackless1`, …) when you omit it.
+
 ---
 
 ## First run: benchmark & pick the best
@@ -119,10 +140,14 @@ route — an Iran server to a foreign box:
     reverse-mux  █████         233M     FAIL     0%     83
     hysteria     ████          198M     FAIL     0%     83
     tcp          █             69.6M    99.5M    0%     81
+    stripe       <<<BENCH_STRIPE_BAR>>> <<<BENCH_STRIPE_DOWN>>> <<<BENCH_STRIPE_UP>>> <<<BENCH_STRIPE_LOSS>>> <<<BENCH_STRIPE_PING>>>
+    ackless      <<<BENCH_ACKLESS_BAR>>> <<<BENCH_ACKLESS_DOWN>>> <<<BENCH_ACKLESS_UP>>> <<<BENCH_ACKLESS_LOSS>>> <<<BENCH_ACKLESS_PING>>>
 ```
 
 Measured 10 September 2026, one Iran relay to one foreign box, every transport
-built and torn down in sequence by `omnitunnel bench` itself.
+built and torn down in sequence by `omnitunnel bench` itself. The `stripe` and
+`ackless` rows carry keyed `<<<BENCH_*>>>` placeholders filled from a real
+`omnitunnel bench` run on a byte-/packet-capped Iran→foreign path before release.
 
 The bar is scaled to the fastest tunnel; **→** marks the outright winner and
 **stealth pick** marks the fastest *fully obfuscated* transport. Read the two
@@ -185,8 +210,10 @@ punish.
 
 These are a **local-netns functional proof only** — they show the transport
 sustains throughput without hitting a cap, not a real-link figure. Real-path
-numbers on a genuinely byte-capped route are still to be measured; `stripe` is
-not yet part of the headline `omnitunnel bench` comparison above.
+numbers on a genuinely byte-capped route are still to be measured. `stripe` and
+`ackless` now appear as rows in the headline `omnitunnel bench` comparison above;
+their numbers are filled from a real `omnitunnel bench` run (the `<<<BENCH_*>>>`
+placeholders ship only until that measurement lands).
 
 **Known limitation.** On a real Iran→foreign path the `stripe` carrier
 establishes cleanly but a sustained inner bulk-TCP transfer does not hold up,
@@ -267,7 +294,9 @@ or use the **Port forwarding** menu.
 
 ```bash
 omnitunnel add                       # interactive add wizard
-omnitunnel add-auto <type> <name> <foreign_ip> [nconn] [shape] [my_ip]
+omnitunnel add-auto <type> [name] <foreign_ip> [nconn] [shape] [my_ip]
+omnitunnel add-manual <type> [name] <foreign_ip> [nconn] [shape] [my_ip]
+omnitunnel server-token <token>      # paste on the foreign for the manual path
 omnitunnel list
 omnitunnel status  <instance>
 omnitunnel remove  <instance>        # removes ONLY that instance (both-side safe)
@@ -337,6 +366,56 @@ retired. They are **hard-capped at 8656 bytes** (the on-wire ceiling of 8760 B
 minus the 104-byte frame header); any larger value is clamped down to 8656, so
 no single connection ever outlives a ~8760 B per-5-tuple byte cap.
 
+### Creating an `ackless` tunnel
+
+`ackless` is the transport for a path that **caps packets-per-5-tuple** rather
+than bytes. It carries a single flow of `flags=0` raw-TCP segments that bear
+data only — no SYN/ACK/retransmit chatter to burn the packet budget — and
+recovers loss itself with an app-level ARQ (selective NACK/ACK). Where `stripe`
+spreads a flow over short-lived connections to dodge a per-5-tuple **byte** cap,
+`ackless` keeps **one** flow and strips the packet overhead to dodge a per-5-tuple
+**packet** cap.
+
+Bring it up like any other transport — the only input is the foreign IP; the
+name is auto-derived and the key/subnet/port/device/MTU are allocated for you:
+
+```bash
+omnitunnel add                               # interactive wizard, pick ackless
+omnitunnel add-auto ackless <foreign-ip>     # name auto-derived; far side over SSH
+omnitunnel add-manual ackless <foreign-ip>   # no SSH; prints two lines to paste abroad
+```
+
+The manual path prints the two lines to run on the foreign box:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/Free-Guy-IR/OmniTunnel/main/install.sh)
+omnitunnel server-token <token>
+```
+
+Like `stripe`, `ackless` runs on its **own static engine** (`omniackless`, a
+separate Go binary in [`bin/`](bin/)), so it can also be driven directly:
+
+```bash
+omniackless -L <local-ip> -R <peer-ip> -A <local-tun-ip> -P <peer-tun-ip> \
+            -p 49000 -T tsackless0 -M 1400 -k <key> [-s]
+```
+
+Flags:
+
+| flag | meaning | default |
+|------|---------|---------|
+| `-L` | local source/bind IP | — |
+| `-R` | peer IP the client dials | — |
+| `-A` | this box's tun address | — |
+| `-P` | peer's tun address | — |
+| `-k` | pre-shared key authenticating the carrier (the manager generates and provisions it) | — |
+| `-p` | base port | `49000` |
+| `-T` | tun device name | `tsackless0` |
+| `-M` | tun MTU | `1400` |
+| `-s` | run as the server (listener) side; the client omits it | off |
+| `-F` / `-Fmin` / `-Fmax` | active / min / max concurrent flows | `2` / `1` / `6` |
+| `-auto` | auto-scale the flow count | `true` |
+
 ---
 
 ## Updating & removing
@@ -387,6 +466,14 @@ tun devices and iptables chains, the core binaries, all state under
   of short-lived TCP connections (base port `-p`, `-C` ports wide), each retired
   before it reaches the per-5-tuple byte cap. Like the C core it needs no shared
   libraries and cross-compiles trivially.
+- **Bundled `omniackless` engine** — the `ackless` transport is powered by its
+  own self-contained static Go binary ([`src/omniackless`](src/omniackless)),
+  shipped in [`bin/`](bin/) for both CPUs as `omniackless-amd64` /
+  `omniackless-arm64`. It owns a `tsackless*` tun device and carries one flow of
+  `flags=0` raw-TCP segments with an app-level ARQ, self-managing its raw sockets
+  and the `nft` rules that suppress the kernel's RST/ACK for that flow (set up on
+  start, torn down on exit). Like the C core it needs no shared libraries and
+  cross-compiles trivially.
 - Prebuilt for **amd64** and **arm64** under [`bin/`](bin/), also attached to
   each release.
 - **`omnitunnel.sh`** — the English TUI manager: benchmark, instance

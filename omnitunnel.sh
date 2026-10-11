@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.9.7"
+VERSION="2.9.8"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -245,6 +245,8 @@ port_base() { case "$1" in udp|fou|vxlan) echo 28820;; stripe) echo 40000;; ackl
 type_is_hysteria() { [[ "$1" == hysteria ]]; }
 type_is_stripe() { [[ "$1" == stripe ]]; }
 type_is_ackless() { [[ "$1" == ackless ]]; }
+looks_like_host() { [[ "$1" == *.* || "$1" == *:* ]]; }
+auto_name() { local base="$1" i=1 n; n="$base"; while inst_exists "$n"; do n="$base$i"; i=$((i+1)); done; echo "$n"; }
 
 # ------------------------------------------------------------ instance i/o ----
 inst_path() { echo "$INST_DIR/$1"; }
@@ -1371,8 +1373,14 @@ cmd_add_auto() {
     elif type_is_stripe "$1"; then ensure_omnistripe
     elif type_is_ackless "$1"; then ensure_omniackless
     elif ! type_is_kernel "$1"; then ensure_binary; fi
-    local t="$1" kn="$2" fhost="$3" nc="${4:-16}" shape="${5:-none}" mylip="${6:-$(default_local_ip)}"
-    [[ -n "$t" && -n "$kn" && -n "$fhost" ]] || die "usage: add-auto <type> <name> <foreign_ip> [nconn] [shape] [my_ip]"
+    local t="$1"; shift
+    local kn fhost
+    if [[ $# -ge 2 ]] && looks_like_host "$2"; then kn="$1"; fhost="$2"; shift 2
+    elif [[ $# -ge 1 ]] && looks_like_host "$1"; then kn="$(auto_name "$t")"; fhost="$1"; shift
+    elif [[ $# -ge 2 ]]; then kn="$1"; fhost="$2"; shift 2
+    else die "usage: add-auto <type> [name] <foreign_ip> [nconn] [shape] [my_ip]"; fi
+    local nc="${1:-16}" shape="${2:-none}" mylip="${3:-$(default_local_ip)}"
+    [[ -n "$t" && -n "$kn" && -n "$fhost" ]] || die "usage: add-auto <type> [name] <foreign_ip> [nconn] [shape] [my_ip]"
     inst_exists "$kn" && die "instance $kn exists"
     [[ -n "${OMNITUN_PEER_PASS:-}" || -n "${OMNITUN_PEER_PROXY:-}" ]] && save_peer "$fhost" "${OMNITUN_PEER_USER:-root}" "${OMNITUN_PEER_PASS:-}" "${OMNITUN_PEER_PROXY:-}"
     guard_peer_downgrade "$fhost"
@@ -1415,8 +1423,14 @@ cmd_add_manual() {
     elif type_is_stripe "$1"; then ensure_omnistripe
     elif type_is_ackless "$1"; then ensure_omniackless
     elif ! type_is_kernel "$1"; then ensure_binary; fi
-    local t="$1" kn="$2" fhost="$3" nc="${4:-16}" shape="${5:-none}" mylip="${6:-$(default_local_ip)}" want_port="${7:-}"
-    [[ -n "$t" && -n "$kn" && -n "$fhost" ]] || die "usage: add-manual <type> <name> <foreign_ip> [nconn] [shape] [my_ip] [foreign_port]"
+    local t="$1"; shift
+    local kn fhost
+    if [[ $# -ge 2 ]] && looks_like_host "$2"; then kn="$1"; fhost="$2"; shift 2
+    elif [[ $# -ge 1 ]] && looks_like_host "$1"; then kn="$(auto_name "$t")"; fhost="$1"; shift
+    elif [[ $# -ge 2 ]]; then kn="$1"; fhost="$2"; shift 2
+    else die "usage: add-manual <type> [name] <foreign_ip> [nconn] [shape] [my_ip] [foreign_port]"; fi
+    local nc="${1:-16}" shape="${2:-none}" mylip="${3:-$(default_local_ip)}" want_port="${4:-}"
+    [[ -n "$t" && -n "$kn" && -n "$fhost" ]] || die "usage: add-manual <type> [name] <foreign_ip> [nconn] [shape] [my_ip] [foreign_port]"
     inst_exists "$kn" && die "instance $kn exists"
     # icmp: this end's emitted ICMP type (OMNITUN_ICMP_MODE) and the foreign end's
     # (OMNITUN_ICMP_MODE_PEER), for paths that drop one echo type in one direction.
@@ -1485,7 +1499,7 @@ wizard_add() {
     read -erp "SOCKS5 proxy to reach the foreign, if the direct path is DPI-blocked (host:port, blank = direct): " fpx; fpx="${fpx:-${OMNITUN_PEER_PROXY:-}}"
     { [[ -n "$fp" || -n "$fpx" ]]; } && save_peer "$fhost" "$fu" "$fp" "$fpx"
     guard_peer_downgrade "$fhost"
-    read -erp "Instance name [main]: " kn; kn="${kn:-main}"; inst_exists "$kn" && { warn "instance exists"; return; }
+    local dn; dn="$(auto_name "$t")"; read -erp "Instance name [$dn]: " kn; kn="${kn:-$dn}"; inst_exists "$kn" && { warn "instance exists"; return; }
     local nc=16 shape=none
     if [[ "$t" == mux ]]; then
         read -erp "Parallel links N [16]: " nc; nc="${nc:-16}"
@@ -1531,7 +1545,7 @@ wizard_add_manual() {
     local mylip; mylip="$(default_local_ip)"
     read -erp "This box public IP [$mylip]: " x; mylip="${x:-$mylip}"
     read -erp "Far (foreign) server IP: " fhost; [[ -z "$fhost" ]] && { warn "need a foreign IP"; return; }
-    read -erp "Instance name [main]: " kn; kn="${kn:-main}"; inst_exists "$kn" && { warn "instance exists"; return; }
+    local dn; dn="$(auto_name "$t")"; read -erp "Instance name [$dn]: " kn; kn="${kn:-$dn}"; inst_exists "$kn" && { warn "instance exists"; return; }
     local nc=16 shape=none
     if [[ "$t" == mux ]]; then
         read -erp "Parallel links N [16]: " nc; nc="${nc:-16}"
@@ -1629,6 +1643,11 @@ bench_run() {
     # hysteria engine for the far side too (so its bench server can come up)
     local hbin; hbin="$(hy_local_bin "$parch" || true)"
     [[ -n "$hbin" ]] && { peer_scp "$fhost" "$hbin" "/opt/omnitunnel/bin/hysteria-$parch"; peer_ssh "$fhost" "chmod +x /opt/omnitunnel/bin/hysteria-$parch; install -m0755 /opt/omnitunnel/bin/hysteria-$parch /usr/local/bin/hysteria" >/dev/null 2>&1 || true; }
+    local sbb abb
+    sbb="$(omnistripe_local_bin "$parch" || true)"
+    [[ -n "$sbb" ]] && { peer_scp "$fhost" "$sbb" "/opt/omnitunnel/bin/omnistripe-$parch"; peer_ssh "$fhost" "chmod +x /opt/omnitunnel/bin/omnistripe-$parch; install -m0755 /opt/omnitunnel/bin/omnistripe-$parch /usr/local/bin/omnistripe" >/dev/null 2>&1 || true; }
+    abb="$(omniackless_local_bin "$parch" || true)"
+    [[ -n "$abb" ]] && { peer_scp "$fhost" "$abb" "/opt/omnitunnel/bin/omniackless-$parch"; peer_ssh "$fhost" "chmod +x /opt/omnitunnel/bin/omniackless-$parch; install -m0755 /opt/omnitunnel/bin/omniackless-$parch /usr/local/bin/omniackless" >/dev/null 2>&1 || true; }
     # bring up (and verify) the iperf3 measurement server on the foreign
     info "Starting measurement server on $fhost ..."
     if ! bench_ensure_iperf "$fhost"; then
@@ -2111,7 +2130,7 @@ bench_table() {
         IFS='|' read -r t dl ul ls pg <<< "$r"; v="$(_mbit "$dl")"
         sorted+=("$(printf '%012.3f|%s' "$v" "$r")")
         if _gt "$v" "$max"; then max="$v"; fi
-        case "$t" in udp|tcp|mux|ws|hysteria|fou|icmp|reverse-mux) if _gt "$v" "$sv"; then sv="$v"; stealth="$t"; fi;; esac
+        case "$t" in udp|tcp|mux|ws|hysteria|fou|icmp|reverse-mux|stripe|ackless) if _gt "$v" "$sv"; then sv="$v"; stealth="$t"; fi;; esac
     done
     local OIFS="$IFS"; IFS=$'\n'; sorted=($(printf '%s\n' "${sorted[@]}" | sort -r)); IFS="$OIFS"
     echo
