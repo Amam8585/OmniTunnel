@@ -1937,31 +1937,27 @@ cmd_bench_clean() {
 # re-pushing the files the same way you first installed it.
 cmd_update() {
     need_root
-    command -v curl >/dev/null 2>&1 || { warn "curl is required to update"; return 1; }
-    info "Checking GitHub for a newer OmniTunnel (current v$VERSION)..."
-    local tmp; tmp="$(mktemp)"
-    # cache-bust the raw CDN so a stale edge can't hand back the old install.sh
-    # (which would then fetch an old manager and report "already up to date")
-    if ! curl -fsSL -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' \
-              "$RAW_BASE/install.sh?cb=$(date +%s)-${RANDOM}${RANDOM}" -o "$tmp" 2>/dev/null; then
-        rm -f "$tmp"
-        warn "Could not reach GitHub from this box."
-        warn "If it has no direct internet egress, update it by re-pushing the files"
-        warn "(run the installer on a box that can reach GitHub, or copy them over)."
-        return 1
+    command -v curl >/dev/null 2>&1 || { warn "curl is required to check releases"; return 1; }
+    command -v python3 >/dev/null 2>&1 || { warn "python3 is required to validate release metadata"; return 1; }
+    info "Installed manager: v$VERSION"
+    if [[ -x "$TSUITE_BIN" ]]; then
+        info "Installed core: $("$TSUITE_BIN" version 2>/dev/null | head -n 1 || echo unknown)"
     fi
-    local rc=0
-    # Reject legacy third-party installers that silently restart running units.
-    # This marker is a compatibility guard, NOT a cryptographic signature.
-    if ! grep -q '^# OmniTunnel Direct safe installer:' "$tmp"; then
-        rm -f "$tmp"
-        warn "Refusing legacy/unknown installer: only verified stage-only updaters are allowed."
+    local api="https://api.github.com/repos/Amam8585/OmniTunnel/releases/latest"
+    local json tag sha tmp
+    json="$(curl --connect-timeout 8 --max-time 20 -fsSL -H 'Accept: application/vnd.github+json' "$api")" || {
+        warn "No verified GitHub release could be retrieved. Experimental main is not a stable update."
         return 1
-    fi
-    OMNITUN_REF="${OMNITUN_REF:-main}" bash "$tmp" --update || rc=$?
-    rm -f "$tmp"
-    [[ $rc -eq 0 ]] || { warn "update failed (exit $rc)"; return 1; }
-    info "Update staged, pinned and checksummed; activate via reviewed install.sh --apply after validation. No running service restarted."
+    }
+    tag="$(printf '%s' "$json" | python3 -c 'import json,sys; r=json.load(sys.stdin); print(r.get("tag_name","") if not r.get("draft") and not r.get("prerelease") else "")' 2>/dev/null)" || return 1
+    [[ "$tag" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([.-][a-zA-Z0-9.]+)?$ ]] || {
+        warn "Latest release has no acceptable version tag; refusing automatic update."
+        return 1
+    }
+    info "Latest published stable release: $tag"
+    info "Review its release notes: https://github.com/Amam8585/OmniTunnel/releases/tag/$tag"
+    warn "No binaries or running services have been changed."
+    warn "To stage an update, pin a reviewed commit and verified archive SHA256 via the existing installer --prepare."
     return 0
 }
 
