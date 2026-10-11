@@ -16,6 +16,33 @@ path="/run/omnitunnel/icmp-$dev.json"
 exec python3 - "$path" "$mode" "$format" "$inst" <<'PY'
 import json, os, sys, time
 path, mode, fmt, inst = sys.argv[1:]
+def resource_snapshot():
+    """Read-only process RSS and CPU from /proc, resolved through the owned unit."""
+    global last_proc
+    try:
+        import subprocess
+        run = subprocess.run(["systemctl", "show", "-P", "MainPID", "omnitun-" + inst + ".service"],
+                             capture_output=True, text=True, timeout=1.0)
+        pid = int(run.stdout.strip())
+        if pid < 1:
+            return {}
+        with open("/proc/" + str(pid) + "/stat", encoding="utf-8") as handle:
+            tail = handle.read().rsplit(") ", 1)[1].split()
+        ticks = int(tail[11]) + int(tail[12])
+        with open("/proc/" + str(pid) + "/status", encoding="utf-8") as handle:
+            rss = next((int(line.split()[1]) * 1024 for line in handle if line.startswith("VmRSS:")), 0)
+        now = time.monotonic()
+        res = {"pid":pid, "rss_bytes":rss}
+        if last_proc and last_proc[0] == pid:
+            elapsed = max(0.001, now - last_proc[2])
+            res["cpu_percent_one_core"] = round(100 * max(0, ticks - last_proc[1]) /
+                                                os.sysconf("SC_CLK_TCK") / elapsed, 1)
+        last_proc = (pid, ticks, now)
+        return res
+    except (OSError, ValueError, IndexError, StopIteration, Exception):
+        return {}
+last_proc = None
+
 def sample():
     with open(path, encoding="utf-8") as handle:
         obj = json.load(handle)
@@ -25,8 +52,10 @@ def sample():
 def fmt_rate(n, duration):
     return f"{max(0.,n/duration):,.1f}"
 def show(cur, last=None, interval=1.0):
+    resources = resource_snapshot()
     if fmt == "--json":
         obj = dict(cur)
+        obj["resources"] = resources
         obj["instance"] = inst
         if last is not None:
             obj["rates"] = {k + "_per_second": max(0.,(cur.get(k,0)-last.get(k,0))/interval)
@@ -34,6 +63,9 @@ def show(cur, last=None, interval=1.0):
                                       "icmp_tx_packets","queue_drops","send_errors","recv_errors","rx_bytes","tx_bytes")}
         print(json.dumps(obj, separators=(",",":")), flush=True)
         return
+    if resources:
+        print(f"  PID={resources.get('pid')} RSS={resources.get('rss_bytes', 0)/1048576:.1f} MiB "
+              f"CPU={resources.get('cpu_percent_one_core', 'n/a')}% one core", flush=True)
     print(f"Direct ICMP {inst} | flow {cur.get('active_flows',0):,}/{cur.get('flow_capacity',0):,}"
           f" | send queue {cur.get('queue_length',0):,} (peak {cur.get('queue_peak',0):,})"
           f" | internal queue drops {cur.get('queue_drops',0):,}", flush=True)
