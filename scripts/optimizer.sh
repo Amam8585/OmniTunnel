@@ -41,7 +41,9 @@ stats="/run/omnitunnel/icmp-$dev.json"
 status() {
     echo "Device: $dev | Direct protocol: $type | current TUN txqueuelen: $cur"
     echo "Kernel: $(uname -r); CPU cores: $(nproc); RAM: $(awk '/MemTotal:/{printf "%.0f MiB",$2/1024}' /proc/meminfo)"
-    ip -s link show dev "$dev"\n    echo "Interface details and MTU:"; ip -d link show dev "$dev" || true
+    ip -s link show dev "$dev"
+    echo "Interface details and MTU:"
+    ip -d link show dev "$dev" || true
     if command -v tc >/dev/null; then tc qdisc show dev "$dev"; fi
     if [[ -r /proc/sys/net/netfilter/nf_conntrack_max ]]; then
         echo "Conntrack: $(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo n/a)/$(cat /proc/sys/net/netfilter/nf_conntrack_max)"
