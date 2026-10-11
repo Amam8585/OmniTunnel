@@ -261,45 +261,101 @@ PY
     mv -f "$STAGES/current.new" "$STAGES/current"
     log "Validated, staged: $stage"
 }
+validate_stage() {
+    local stage="$1" n
+    [[ "$stage" == "$STAGES/release-"* && -d "$stage" && ! -L "$stage" ]] || die "invalid stage"
+    [[ -r "$stage/build-info.json" ]] || die "missing build metadata"
+    for n in omnitun hysteria omnistripe omniackless; do
+        [[ -x "$stage/bin/$n-$ARCH" ]] || die "missing staged engine $n"
+    done
+    bash -n "$stage/omnitunnel.sh" || die "invalid staged manager"
+    for n in monitor.sh optimizer.sh diagnostics.sh; do
+        [[ -r "$stage/scripts/$n" ]] && bash -n "$stage/scripts/$n" ||
+            die "invalid staged tool $n"
+    done
+    python3 - "$stage" <<'PY' || die "staged SHA256 verification failed"
+import hashlib,json,pathlib,sys
+root=pathlib.Path(sys.argv[1])
+meta=json.loads((root/"build-info.json").read_text())
+assert isinstance(meta.get("artifacts"),dict) and len(meta["artifacts"])>=7
+for key, expected in meta["artifacts"].items():
+    f=root/key
+    assert f.is_file() and not f.is_symlink(),key
+    assert f.resolve().is_relative_to(root.resolve()),key
+    assert hashlib.sha256(f.read_bytes()).hexdigest()==expected,key
+print("Stage artifact SHA256 checks passed:",len(meta["artifacts"]))
+PY
+    "$stage/bin/omnitun-$ARCH" version | grep -q '^omnitun ' ||
+        die "staged engine version failed"
+}
+prevent_downgrade() {
+    ((DOWNGRADE_OK)) && return 0
+    [[ -r "$PREFIX/build-info.json" ]] || return 0
+    local old new status
+    old="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("commit",""))' "$PREFIX/build-info.json")"
+    new="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("commit",""))' "$1/build-info.json")"
+    [[ "$old" == "$new" ]] && return 0
+    [[ "$old" =~ ^[a-fA-F0-9]{40}$ && "$new" =~ ^[a-fA-F0-9]{40}$ ]] ||
+        die "unknown update lineage; --allow-downgrade requires manual verification"
+    status="$(curl -fsSL "https://api.github.com/repos/$REPO/compare/$old...$new" |
+        python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])')" ||
+        die "cannot confirm commit ancestry"
+    [[ "$status" == ahead || "$status" == identical ]] ||
+        die "older/unrelated commit candidate ($status) refused"
+}
 apply() {
     [[ -f "$STAGES/current" ]] || die "run --prepare first"
-    local stage active n
+    local stage active n prev
     stage="$(cat "$STAGES/current")"
-    [[ "$stage" == "$STAGES/release-"* && -d "$stage" ]] || die "invalid release pointer"
-    [[ -x "$stage/bin/omnitun-$ARCH" ]] || die "compiled core missing"
+    validate_stage "$stage"
+    prevent_downgrade "$stage"
     active="$(active_units)"
     [[ -z "$active" || $ACTIVE_OK -eq 1 ]] ||
-        die "active tunnels: $active. Stage left untouched; use --apply --allow-active for a planned activation"
-    [[ ! -e /usr/local/bin/omnitunnel || -L /usr/local/bin/omnitunnel ]] ||
-        die "omnitunnel command is not a symlink; refusing overwrite"
-    ((DRY==0)) || { log "dry run: would activate $stage without restarts"; return; }
+        die "active tunnels detected: $active. --allow-active required; NO restarts performed"
+    [[ ! -e "$LINK" || -L "$LINK" ]] || die "refusing to overwrite unowned $LINK"
+    ((DRY==0)) || { log "dry-run: stage checks passed; no writes"; return 0; }
+    mkdir -p "$PREFIX" "$BIN_DIR"
     snapshot
-    mkdir -p "$PREFIX/bin"
-    for n in omnitun hysteria omnistripe omniackless; do
-        install -m 0755 "$stage/bin/$n-$ARCH" "/usr/local/bin/$n.new.$$"
-        mv -f "/usr/local/bin/$n.new.$$" "/usr/local/bin/$n"
-        install -m 0755 "$stage/bin/$n-$ARCH" "$PREFIX/bin/$n-$ARCH"
-    done
-    # Install support tools and documentation without replacing any running service.
-    mkdir -p "$PREFIX/scripts" "$PREFIX/docs"
-    for n in monitor.sh optimizer.sh diagnostics.sh; do
-        install -m 0755 "$stage/scripts/$n" "$PREFIX/scripts/$n.new.${BASHPID}"
-        mv -f "$PREFIX/scripts/$n.new.${BASHPID}" "$PREFIX/scripts/$n"
-    done
-    if [[ -d "$stage/docs" ]]; then cp -a "$stage/docs/." "$PREFIX/docs/"; fi
-    for n in README.md LICENSE CHANGELOG.md; do
-        [[ ! -f "$stage/$n" ]] || cp -a "$stage/$n" "$PREFIX/$n"
-    done
-    install -m 0755 "$stage/omnitunnel.sh" "$PREFIX/omnitunnel.sh.new.${BASHPID}"
-    mv -f "$PREFIX/omnitunnel.sh.new.$$" "$PREFIX/omnitunnel.sh"
-    ln -sfn "$PREFIX/omnitunnel.sh" /usr/local/bin/omnitunnel
-    /usr/local/bin/omnitun version || die "installed core check failed; use --rollback"
-    bash -n "$PREFIX/omnitunnel.sh" || die "installed manager syntax invalid; use --rollback"
-    log "Activated programs. Existing tunnels, units, routes, firewall were NOT touched or restarted."
-    log "Create a tunnel with: sudo omnitunnel"
+    prev="$(cat "$BACKUPS/.latest")"
+    # Checked actions; each rename is atomic within one filesystem.
+    # Multi-file replacement cannot be globally atomic; rollback on failure.
+    if (
+        for n in omnitun hysteria omnistripe omniackless; do
+            install -m 0755 "$stage/bin/$n-$ARCH" "$BIN_DIR/$n.new.${BASHPID}" || exit 1
+            mv -f "$BIN_DIR/$n.new.${BASHPID}" "$BIN_DIR/$n" || exit 1
+        done
+        mkdir -p "$PREFIX/scripts" "$PREFIX/docs" "$PREFIX/bin" || exit 1
+        for n in monitor.sh optimizer.sh diagnostics.sh; do
+            install -m 0755 "$stage/scripts/$n" "$PREFIX/scripts/$n.new.${BASHPID}" || exit 1
+            mv -f "$PREFIX/scripts/$n.new.${BASHPID}" "$PREFIX/scripts/$n" || exit 1
+        done
+        cp -a "$stage/docs/." "$PREFIX/docs/" || exit 1
+        cp -a "$stage/bin/." "$PREFIX/bin/" || exit 1
+        for n in README.md LICENSE CHANGELOG.md; do
+            [[ ! -f "$stage/$n" ]] || cp -a "$stage/$n" "$PREFIX/$n" || exit 1
+        done
+        install -m 0755 "$stage/omnitunnel.sh" "$PREFIX/omnitunnel.sh.new.${BASHPID}" || exit 1
+        mv -f "$PREFIX/omnitunnel.sh.new.${BASHPID}" "$PREFIX/omnitunnel.sh" || exit 1
+        cp -a "$stage/build-info.json" "$PREFIX/build-info.json.new.${BASHPID}" || exit 1
+        mv -f "$PREFIX/build-info.json.new.${BASHPID}" "$PREFIX/build-info.json" || exit 1
+        ln -sfn "$PREFIX/omnitunnel.sh" "$LINK" || exit 1
+        [[ "$PREFIX" == /opt/omnitunnel || "${OMNITUN_TEST_FAIL_AFTER:-}" != after-copy ]] || exit 79
+        "$BIN_DIR/omnitun" version | grep -q '^omnitun ' || exit 1
+        bash -n "$PREFIX/omnitunnel.sh" || exit 1
+        cmp -s "$PREFIX/omnitunnel.sh" "$stage/omnitunnel.sh" || exit 1
+        cmp -s "$PREFIX/build-info.json" "$stage/build-info.json" || exit 1
+    ); then
+        log "Build installed and verified; running services NOT restarted"
+    else
+        log "Apply error. Restoring exact previous program inventory"
+        rollback_snapshot "$prev" || die "CRITICAL rollback failed: $prev"
+        die "Apply failed; snapshot restored"
+    fi
+    log "Build metadata: $(cat "$PREFIX/build-info.json")"
+    log "Active units after applying:"; active_units
 }
 if [[ "$ACTION" == check ]]; then
-    log "Core: $(/usr/local/bin/omnitun version 2>/dev/null || echo not-installed)"
+    log "Core: $("$BIN_DIR/omnitun" version 2>/dev/null || echo not-installed)"
     log "Active units:"; active_units
     [[ -c /dev/net/tun ]] && log "TUN present" || log "TUN missing"
     exit 0
@@ -316,11 +372,11 @@ case "$ACTION" in
         [[ $PURGE -eq 0 || $YES -eq 1 ]] || die "--purge-config requires --yes"
         ((DRY)) && exit 0
         snapshot
-        [[ -L /usr/local/bin/omnitunnel && "$(readlink /usr/local/bin/omnitunnel)" == "$PREFIX/omnitunnel.sh" ]] &&
-            rm -f /usr/local/bin/omnitunnel
+        [[ -L "$LINK" && "$(readlink "$LINK")" == "$PREFIX/omnitunnel.sh" ]] &&
+            rm -f "$LINK"
         rm -rf "$PREFIX/scripts" "$PREFIX/docs"
-        rm -f "$PREFIX/omnitunnel.sh" /usr/local/bin/omnitun \
-            /usr/local/bin/hysteria /usr/local/bin/omnistripe /usr/local/bin/omniackless
+        rm -f "$PREFIX/omnitunnel.sh" "$BIN_DIR/omnitun" \
+            "$BIN_DIR/hysteria" "$BIN_DIR/omnistripe" "$BIN_DIR/omniackless"
         ((PURGE==0)) || rm -rf /etc/omnitunnel
         log "Program files removed; unrelated network rules/services untouched";;
     prepare)
