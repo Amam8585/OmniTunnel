@@ -40,17 +40,18 @@ def resource_snapshot():
         with open("/proc/" + str(pid) + "/stat", encoding="utf-8") as handle:
             tail = handle.read().rsplit(") ", 1)[1].split()
         ticks = int(tail[11]) + int(tail[12])
+        start_ticks = int(tail[19])
         with open("/proc/" + str(pid) + "/status", encoding="utf-8") as handle:
             rss = next((int(line.split()[1]) * 1024 for line in handle if line.startswith("VmRSS:")), 0)
         now = time.monotonic()
         res = {"pid":pid, "rss_bytes":rss}
-        if last_proc and last_proc[0] == pid:
+        if last_proc and last_proc[0] == pid and last_proc[3] == start_ticks:
             elapsed = max(0.001, now - last_proc[2])
             res["cpu_percent_one_core"] = round(100 * max(0, ticks - last_proc[1]) /
                                                 os.sysconf("SC_CLK_TCK") / elapsed, 1)
-        last_proc = (pid, ticks, now)
+        last_proc = (pid, ticks, now, start_ticks)
         return res
-    except (OSError, ValueError, IndexError, StopIteration, Exception):
+    except (OSError, ValueError, IndexError, StopIteration):
         return {}
 last_proc = None
 
@@ -78,27 +79,44 @@ def show(cur, last=None, interval=1.0):
     global last_kernel
     kernel = kernel_snapshot()
     resources = resource_snapshot()
+    age_sec = max(0.,time.monotonic() - float(cur.get("timestamp_ms",0))/1000.)
+    stale = age_sec > 5
+    reset = last is not None and any(
+        isinstance(cur.get(k), (int,float)) and isinstance(last.get(k), (int,float))
+        and cur[k] < last[k]
+        for k in ("rx_bytes","tx_bytes","queue_drops","icmp_rx_packets","icmp_tx_packets")
+    )
     if fmt == "--json":
         obj = dict(cur)
         obj["resources"] = resources
         obj["instance"] = inst
         obj["kernel_interface_counters"] = kernel
         obj["application_goodput_mbps"] = None
+        obj["process_sample_stale"] = stale
+        obj["sample_age_seconds"] = round(age_sec,2)
+        obj["counter_reset_detected"] = bool(reset)
+        obj["tunnel_reachable"] = None
         obj["latency_p95_ms"] = None
         obj["latency_p99_ms"] = None
         if last is not None:
-            obj["rates"] = {k + "_per_second": max(0.,(cur.get(k,0)-last.get(k,0))/interval)
-                            for k in ("tun_rx_packets","tun_tx_packets","icmp_rx_packets",
-                                      "icmp_tx_packets","queue_drops","send_errors","recv_errors","rx_bytes","tx_bytes")}
+            tracked = ("tun_rx_packets","tun_tx_packets","icmp_rx_packets","icmp_tx_packets",
+                       "queue_drops","tun_queue_drops","tun_oversized","queue_pauses",
+                       "flow_evictions","send_errors","recv_errors","rx_bytes","tx_bytes")
+            obj["rates"] = {k + "_per_second":
+                ((cur[k]-last[k])/interval if k in cur and k in last and
+                 cur[k]>=last[k] and not stale and not reset else None)
+                for k in tracked}
         if last_kernel is not None:
             obj["kernel_rates_per_second"]={
-                key:max(0,(current-last_kernel[key])/max(interval,0.001))
+                key:((current-last_kernel[key])/max(interval,0.001) if current>=last_kernel[key] and not stale else None)
                 for key,current in kernel.items()
                 if current is not None and last_kernel.get(key) is not None}
         last_kernel = kernel
         print(json.dumps(obj, separators=(",",":")), flush=True)
         return
     print("  Kernel TUN counters:",kernel, flush=True)
+    if stale: print("  WARNING: stale user-space snapshot: process could be stopped or stuck",flush=True)
+    if reset: print("  WARNING: counters reset or process restarted; rate delta invalid",flush=True)
     print("  Application goodput, P95/P99 latency: NOT MEASURED", flush=True)
     if resources:
         print(f"  PID={resources.get('pid')} RSS={resources.get('rss_bytes', 0)/1048576:.1f} MiB "
@@ -117,7 +135,8 @@ def show(cur, last=None, interval=1.0):
     if last:
         print(f"  rate: rx {fmt_rate(cur.get('tun_rx_packets',0)-last.get('tun_rx_packets',0),interval)} pps"
               f" | tx {fmt_rate(cur.get('icmp_tx_packets',0)-last.get('icmp_tx_packets',0),interval)} pps"
-              f" | goodput proxy {(cur.get('rx_bytes',0)-last.get('rx_bytes',0))*8/interval/1e6:.2f} Mbps",
+              f" | decap inner bitrate (NOT app goodput): {(cur.get('rx_bytes',0)-last.get('rx_bytes',0))*8/interval/1e6:.2f} Mbps" if not reset else
+              " | counters reset: bitrate unavailable",
               flush=True)
 try:
     prev = sample()
