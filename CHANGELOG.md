@@ -7,7 +7,7 @@
   fault injection and tests for automatic/manual rollback.
 - ICMP: detect oversized/GSO frames with 64KiB TUN reads, bound epoll TUN
   intake during ICMP backpressure, count queue pauses and lookup probes.
-- WebSocket: validate Sec-WebSocket-Accept, RFC masks/lengths/FIN, serialized
+- Crypto: remove deterministic fallback for AEAD nonces; fail closed on kernel RNG failure and add mock regression. Use batched CSPRNG WebSocket masks.\n- WebSocket: validate Sec-WebSocket-Accept, RFC masks/lengths/FIN, serialized
   Pong, opt-in legacy server compatibility. Fragmentation unsupported.
 - Forwarding: pre-build private DNAT/SNAT/FORWARD generations; attach new
   chains before retiring old, with SNAT scoped by conntrack original tuple.
