@@ -3,13 +3,16 @@
 set -Eeuo pipefail
 umask 022
 REPO="${OMNITUN_REPOSITORY:-Amam8585/OmniTunnel}"
-REF="${OMNITUN_REF:-refactor/direct-only-icmp-performance}"
+REF="${OMNITUN_REF:-main}"
+EXPECTED_ARCHIVE_SHA="${OMNITUN_ARCHIVE_SHA256:-}"
 SOURCE="${OMNITUN_SOURCE_DIR:-}"
-PREFIX=/opt/omnitunnel
-STATE=/var/lib/omnitunnel
+PREFIX="${OMNITUN_PREFIX:-/opt/omnitunnel}"
+STATE="${OMNITUN_STATE_DIR:-/var/lib/omnitunnel}"
+BIN_DIR="${OMNITUN_BIN_DIR:-/usr/local/bin}"
+LINK="$BIN_DIR/omnitunnel"
 STAGES=$STATE/staged
 BACKUPS=$STATE/backups
-ACTION=install; YES=0; ACTIVE_OK=0; DRY=0; PURGE=0
+ACTION=install; YES=0; ACTIVE_OK=0; DRY=0; PURGE=0; DOWNGRADE_OK=0
 log() { printf '[omnitunnel] %s\n' "$*"; }
 die() { log "ERROR: $*" >&2; exit 1; }
 usage() { cat <<'EOF'
@@ -17,6 +20,7 @@ Usage: sudo bash install.sh [--prepare|--apply|--update|--check|--backup|--rollb
        [--allow-active] [--dry-run] [--yes] [--purge-config]
 --update/--prepare: compile and stage only. --apply: activate, never restart services.
 --allow-active: explicitly allow replacing on-disk binaries while tunnels run.
+--allow-downgrade: explicitly permit older/unrelated Git commit lineage
 Env: OMNITUN_REF, OMNITUN_REPOSITORY, OMNITUN_SOURCE_DIR
 This development branch defaults to the branch ref, not main.
 EOF
@@ -31,6 +35,7 @@ while (($#)); do
         --uninstall) ACTION=uninstall;;
         --dry-run) DRY=1;;
         --allow-active) ACTIVE_OK=1;;
+        --allow-downgrade) DOWNGRADE_OK=1;;
         --purge-config) PURGE=1;;
         -y|--yes) YES=1;;
         -h|--help) usage; exit 0;;
@@ -52,15 +57,36 @@ case "$ID:$VERSION_ID" in
 esac
 log "System: $ID $VERSION_ID $ARCH"
 active_units() {
-    command -v systemctl >/dev/null || return 0
-    systemctl list-units --type=service --state=active --no-legend --no-pager 2>/dev/null |
-        awk '$1 ~ /^(omnitun-|icmptun)[^ ]*\.service$/ {print $1}' || true
+    local unit exec_line
+    if command -v systemctl >/dev/null 2>&1; then
+        while IFS= read -r unit; do
+            [[ -n "$unit" ]] || continue
+            exec_line="$(systemctl show --property=ExecStart --value "$unit" 2>/dev/null || true)"
+            # Detect names AND binaries: legacy omni-icmp79/ic79-direct, custom
+            # systemd names with ExecStart omnitun or icmptun, and shared installs.
+            if [[ "$unit" =~ ^(omnitun-|icmptun|omni-icmp|ic[0-9]+-direct) ]] ||
+               [[ "$exec_line" =~ (omnitun|icmptun|/opt/omnitunnel/|/usr/local/bin/omni) ]]; then
+                printf '%s\n' "$unit"
+            fi
+        done < <(systemctl list-units --all --type=service --state=active --no-legend --no-pager 2>/dev/null | awk '$1 ~ /\.service$/ {print $1}')
+    fi
+    # Units may use a custom name or the process can be launched outside systemd.
+    # Inspect actual executable paths, not shell process arguments.
+    local proc exe
+    for proc in /proc/[0-9]*/exe; do
+        [[ -L "$proc" ]] || continue
+        exe="$(readlink "$proc" 2>/dev/null || true)"
+        case "$exe" in
+            "$BIN_DIR/omnitun"|"$BIN_DIR/icmptun"|"$PREFIX/"*|/usr/local/bin/omnitun|/usr/local/bin/icmptun)
+                printf 'PID:%s [%s]\n' "${proc#/proc/}" "$exe";;
+        esac
+    done
 }
 bin_changed() { [[ -n "$1" && "$1" != "$2" ]]; }
 root() { [[ $EUID -eq 0 ]] || die "run as root"; }
 deps() {
     local missing=0 c
-    for c in gcc curl tar gzip ip iptables python3 ssh sshpass openssl nc; do
+    for c in gcc curl tar gzip ip iptables python3 ssh sshpass openssl nc sha256sum; do
         command -v "$c" >/dev/null 2>&1 || missing=1
     done
     printf '#include <stdio.h>\nint main(void){return 0;}\n' |
@@ -82,15 +108,21 @@ check_tun() {
 }
 snapshot() {
     mkdir -p "$BACKUPS"
-    local dir="$BACKUPS/$(date -u +%Y%m%dT%H%M%SZ)-$$" n src
+    local dir="$BACKUPS/$(date -u +%Y%m%dT%H%M%SZ)-$" n src
+    mkdir -p "$PREFIX"
     mkdir -p "$dir"
     for n in omnitunnel.sh omnitun hysteria omnistripe omniackless; do
-        src="/usr/local/bin/$n"
+        src="$BIN_DIR/$n"
         [[ "$n" == omnitunnel.sh ]] && src="$PREFIX/omnitunnel.sh"
         [[ ! -f "$src" ]] || cp -a "$src" "$dir/$n"
     done
     [[ ! -d "$PREFIX/scripts" ]] || cp -a "$PREFIX/scripts" "$dir/scripts"
     [[ ! -d "$PREFIX/docs" ]] || cp -a "$PREFIX/docs" "$dir/docs"
+    [[ ! -d "$PREFIX/bin" ]] || cp -a "$PREFIX/bin" "$dir/bin"
+    for n in README.md LICENSE CHANGELOG.md build-info.json; do
+        [[ ! -f "$PREFIX/$n" ]] || cp -a "$PREFIX/$n" "$dir/$n"
+    done
+    [[ ! -L "$LINK" ]] || cp -a --no-dereference "$LINK" "$dir/link"
     printf '%s\n' "$dir" > "$BACKUPS/.latest.new"
     mv -f "$BACKUPS/.latest.new" "$BACKUPS/.latest"
     log "Backup saved: $dir"
@@ -101,23 +133,29 @@ rollback() {
     dir="$(cat "$BACKUPS/.latest")"
     [[ "$dir" == "$BACKUPS/"* && -d "$dir" ]] || die "invalid snapshot path"
     for n in omnitunnel.sh omnitun hysteria omnistripe omniackless; do
-        [[ "$n" == omnitunnel.sh ]] && dst="$PREFIX/omnitunnel.sh" || dst="/usr/local/bin/$n"
+        [[ "$n" == omnitunnel.sh ]] && dst="$PREFIX/omnitunnel.sh" || dst="$BIN_DIR/$n"
         if [[ -f "$dir/$n" ]]; then
             install -m 0755 "$dir/$n" "$dst.new.$$"
             mv -f "$dst.new.$$" "$dst"
         fi
     done
-    for n in scripts docs; do
+    for n in scripts docs bin; do
         if [[ -d "$dir/$n" ]]; then
             rm -rf "$PREFIX/$n"
             cp -a "$dir/$n" "$PREFIX/$n"
         fi
     done
+    for n in README.md LICENSE CHANGELOG.md build-info.json; do
+        if [[ -f "$dir/$n" ]]; then cp -a "$dir/$n" "$PREFIX/$n"; fi
+    done
+    if [[ -L "$dir/link" ]]; then
+        ln -sfn "$(readlink "$dir/link")" "$LINK"
+    fi
     log "Restored saved files; NO service restart was performed"
 }
 prepare() {
     mkdir -p "$STAGES"
-    local work stage archive n
+    local work stage archive n commit="" archive_sha=""
     work="$(mktemp -d "$STAGES/.build.XXXXXX")"
     mkdir -p "$work/source" "$work/release/bin"
     if [[ -z "$SOURCE" && -f "$(dirname "${BASH_SOURCE[0]}")/src/main.c" ]]; then
@@ -126,14 +164,32 @@ prepare() {
     if [[ -n "$SOURCE" ]]; then
         [[ -f "$SOURCE/src/main.c" ]] || die "invalid source dir $SOURCE"
         cp -a "$SOURCE/." "$work/source/"
+        if [[ -n "${OMNITUN_SOURCE_COMMIT:-}" ]]; then
+            commit="$OMNITUN_SOURCE_COMMIT"
+        elif command -v git >/dev/null && [[ -d "$SOURCE/.git" ]]; then
+            commit="$(git -C "$SOURCE" rev-parse HEAD 2>/dev/null || true)"
+        fi
     else
         archive="$work/repo.tar.gz"
+        # Resolve mutable branch/tag to one immutable commit BEFORE downloading.
+        # If GitHub cannot verify the commit, fail closed rather than mixing versions.
+        commit="$(curl -fsSL --retry 2 "https://api.github.com/repos/$REPO/commits/$REF" |
+                  python3 -c 'import json,sys; print(json.load(sys.stdin)["sha"])')" ||
+            die "unable to resolve source revision"
+        [[ "$commit" =~ ^[a-fA-F0-9]{40}$ ]] || die "GitHub returned invalid revision"
         curl -fSL --retry 3 --connect-timeout 15 \
-            "https://codeload.github.com/$REPO/tar.gz/$REF" -o "$archive" ||
+            "https://codeload.github.com/$REPO/tar.gz/$commit" -o "$archive" ||
             die "source download failed"
+        archive_sha="$(sha256sum "$archive" | awk '{print $1}')"
+        if [[ -n "$EXPECTED_ARCHIVE_SHA" && "$archive_sha" != "$EXPECTED_ARCHIVE_SHA" ]]; then
+            die "archive SHA256 mismatch"
+        fi
         tar -xzf "$archive" -C "$work/source" --strip-components=1 ||
             die "archive extraction failed"
     fi
+    [[ -z "$commit" || "$commit" =~ ^[a-fA-F0-9]{40}$ ]] || die "invalid commit"
+    [[ -z "$EXPECTED_ARCHIVE_SHA" || -n "$archive_sha" ]] ||
+        die "archive SHA validation requires remote archive source"
     local src="$work/source" out="$work/release"
     bash -n "$src/omnitunnel.sh" || die "invalid manager script"
     local files=(main.c obsctun.c obsctcp.c obscmux.c obscws.c icmptun.c monocypher.c) args=()
@@ -163,7 +219,23 @@ prepare() {
         [[ -s "$src/bin/$n-$ARCH" ]] || die "missing Direct binary $n-$ARCH"
         install -m 0755 "$src/bin/$n-$ARCH" "$out/bin/$n-$ARCH"
     done
-    stage="$STAGES/release-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+    local source_sha binary_sha options compiler
+    source_sha="$(cd "$src" && find src -type f -print0 | LC_ALL=C sort -z |
+                xargs -0 sha256sum | sha256sum | awk '{print $1}')"
+    binary_sha="$(sha256sum "$out/bin/omnitun-$ARCH" | awk '{print $1}')"
+    compiler="$(gcc --version | head -1)"
+    options="-O2 -Wall -Wextra -fstack-protector-strong -D_FORTIFY_SOURCE=2 -pthread"
+    OMNI_COMMIT="$commit" OMNI_ARCHIVE_SHA="$archive_sha" OMNI_SOURCE_SHA="$source_sha" \
+    OMNI_BINARY_SHA="$binary_sha" OMNI_COMPILER="$compiler" OMNI_OPTIONS="$options" \
+    OMNI_VERSION="$("$out/bin/omnitun-$ARCH" version)" python3 - "$out/build-info.json" <<'PY'
+import json, os, sys
+keys = {"commit":"OMNI_COMMIT","archive_sha256":"OMNI_ARCHIVE_SHA",
+        "source_sha256":"OMNI_SOURCE_SHA", "binary_sha256":"OMNI_BINARY_SHA",
+        "compiler":"OMNI_COMPILER","build_flags":"OMNI_OPTIONS","version":"OMNI_VERSION"}
+with open(sys.argv[1], "w", encoding="utf-8") as stream:
+    json.dump({k:os.environ[e] for k,e in keys.items()}, stream, sort_keys=True, indent=2)
+PY
+    stage="$STAGES/release-$(date -u +%Y%m%dT%H%M%SZ)-$"
     mv "$out" "$stage"; rm -rf "$work"
     printf '%s\n' "$stage" > "$STAGES/current.new"
     mv -f "$STAGES/current.new" "$STAGES/current"
