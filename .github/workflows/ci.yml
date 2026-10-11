@@ -142,6 +142,10 @@ jobs:
       - name: Runtime optimizer paths and rollback using fake iproute2
         run: |
           sudo bash tests/optimizer_runtime_test.sh
+      - name: ICMP synthetic flow table benchmark (NOT end-to-end)
+        run: |
+          gcc -O2 -Wall -Wextra -o /tmp/icmptun-microbench tests/icmptun_microbench.c
+          /tmp/icmptun-microbench
       - name: Real installer integration in isolated prefix
         run: |
           sudo apt-get update -qq
