@@ -38,7 +38,7 @@ HYSTERIA_BIN="${OMNITUN_HYSTERIA_BIN:-/usr/local/bin/hysteria}"
 HY_MASQ_HOST="www.bing.com"
 # where the shipped per-arch binaries live (install.sh drops them here)
 ASSET_DIR="${OMNITUN_ASSETS:-/opt/omnitunnel}"
-RAW_BASE="https://raw.githubusercontent.com/Amam8585/OmniTunnel/main"
+RAW_BASE="https://raw.githubusercontent.com/Amam8585/OmniTunnel/${OMNITUN_REF:-main}"
 
 # shellcheck disable=SC2034
 C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'; C_ITAL=$'\033[3m'
@@ -1968,9 +1968,12 @@ menu_main() {
         nitem 5 "Status of everything"
         nitem 6 "Update OmniTunnel"
         nitem 7 "Remove OmniTunnel"                     "$C_BRED$C_BOLD"
+        nitem 8 "Network optimizer (dry-run by default)"
+        nitem 9 "Direct ICMP performance stats"
+        nitem 10 "Direct tunnel diagnostics"
         nitem 0 "Exit"
         rule_green
-        printf '  %bEnter your choice [0-7]:%b ' "$C_BGRN" "$C_RESET"
+        printf '  %bEnter your choice [0-10]:%b ' "$C_BGRN" "$C_RESET"
         read -r c || exit 0
         case "$c" in
             1) bench_run; pause;;
@@ -1982,6 +1985,9 @@ menu_main() {
                [[ "$a5" == 0 ]] && printf '  %b%s no tunnels%b\n' "$C_GREY" "$G_DOT_OFF" "$C_RESET"; pause;;
             6) cmd_update; pause;;
             7) cmd_uninstall; pause;;
+            8) if pick_instance; then bash "$ASSET_DIR/scripts/optimizer.sh" recommend "$PICK" balanced; fi; pause;;
+            9) if pick_instance; then bash "$ASSET_DIR/scripts/monitor.sh" stats "$PICK"; fi; pause;;
+            10) if pick_instance; then bash "$ASSET_DIR/scripts/diagnostics.sh" "$PICK"; fi; pause;;
             0) exit 0;;
         esac
     done
@@ -2009,6 +2015,10 @@ case "${1:-menu}" in
     _remove)          need_root; inst_remove "${2:?instance}";;
     pf-add)           pf_add "${2:?}" "${3:?}" "${4:?}";;
     pf-del)           pf_del "${2:?}" "${3:?}";;
+    stats)            bash "$ASSET_DIR/scripts/monitor.sh" stats "${2:?instance}" "${3:-}";;
+    monitor)          bash "$ASSET_DIR/scripts/monitor.sh" monitor "${2:?instance}" "${3:-}";;
+    optimizer)        shift; bash "$ASSET_DIR/scripts/optimizer.sh" "$@";;
+    diagnostics)      bash "$ASSET_DIR/scripts/diagnostics.sh" "${2:?instance}";;
     _postup)          cmd_postup "${2:?}";;
     _prefwd)          cmd_prefwd;;
     _peercreate)      shift; cmd_peercreate "$@";;
@@ -2032,5 +2042,5 @@ case "${1:-menu}" in
     update|upgrade)   need_root; cmd_update;;
     uninstall|purge)  need_root; cmd_uninstall;;
     version|-v|--version) echo "tunnelctl $VERSION (core: $($TSUITE_BIN version 2>/dev/null || echo n/a))";;
-    *) echo "usage: $0 [menu|bench|add|list|status <n>|enable <n>|remove <n>|pf-add <n> <proto> <port>|pf-del <n> <port>|fix-forwarding|update|uninstall]";;
+    *) echo "usage: $0 [menu|bench|add|list|status <n>|enable <n>|remove <n>|pf-add <n> <proto> <port>|pf-del <n> <port>|stats <n> [--json]|monitor <n> [--json]|optimizer <action> <n>|diagnostics <n>|fix-forwarding|update|uninstall]";;
 esac
