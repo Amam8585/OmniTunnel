@@ -38,6 +38,8 @@
 #include <errno.h>
 #include <signal.h>
 #include <pthread.h>
+#include <poll.h>
+#include <stdatomic.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <netinet/in.h>
@@ -56,7 +58,7 @@ static int tun_fd, udp_fd;
 static struct sockaddr_in peer_addr;
 static char *tun_name = "obsc0";
 static int mtu = 1400;
-static volatile int running = 1;
+static volatile sig_atomic_t running = 1;
 
 static void die(const char *m) { perror(m); exit(1); }
 
@@ -132,12 +134,20 @@ static int tun_configure(const char *dev, struct in_addr lt, struct in_addr pt) 
     return 0;
 }
 
+/* Loss counters distinguish authenticated/userland drops from kernel RX/TX.
+   Counters are sampled atomically; packet content is never logged. */
+static _Atomic uint64_t udp_send_errors, udp_rx_errors, udp_tun_write_errors;
+static _Atomic uint64_t udp_auth_fail, udp_send_ok, udp_rx_ok;
 /* tun -> encrypt -> udp */
 static void *uplink(void *arg) {
     (void)arg;
     unsigned char in[MAX_INNER];
     unsigned char out[MAX_PKT];
     while (running) {
+        struct pollfd pfd = { .fd = tun_fd, .events = POLLIN };
+        int ready = poll(&pfd, 1, 250);
+        if (ready == 0 || (ready < 0 && errno == EINTR)) continue;
+        if (ready < 0) { usleep(1000); continue; }
         ssize_t n = read(tun_fd, in, sizeof(in));
         if (n <= 0) {
             /* Never let a transient error kill the thread. read(tun) can
@@ -153,8 +163,9 @@ static void *uplink(void *arg) {
             in, (unsigned long long)n,
             NULL, 0, NULL, nonce, key);
         ssize_t olen = NONCE_LEN + (ssize_t)clen;
-        if (send(udp_fd, out, olen, 0) < 0 && errno != EAGAIN && errno != ENOBUFS)
-            /* transient send errors are ignored - inner TCP retransmits */ ;
+        ssize_t sent = send(udp_fd, out, olen, MSG_DONTWAIT);
+        if (sent == olen) atomic_fetch_add_explicit(&udp_send_ok, 1, memory_order_relaxed);
+        else atomic_fetch_add_explicit(&udp_send_errors, 1, memory_order_relaxed);
     }
     return NULL;
 }
@@ -165,7 +176,11 @@ static void *downlink(void *arg) {
     unsigned char in[MAX_PKT];
     unsigned char out[MAX_INNER + TAG_LEN];
     while (running) {
-        ssize_t n = recv(udp_fd, in, sizeof(in), 0);
+        struct pollfd pfd = { .fd = udp_fd, .events = POLLIN };
+        int ready = poll(&pfd, 1, 250);
+        if (ready == 0 || (ready < 0 && errno == EINTR)) continue;
+        if (ready < 0) { atomic_fetch_add_explicit(&udp_rx_errors, 1, memory_order_relaxed); usleep(1000); continue; }
+        ssize_t n = recv(udp_fd, in, sizeof(in), MSG_DONTWAIT);
         if (n <= 0) {
             /* On a connected UDP socket, recv() surfaces ICMP errors from
                the peer (e.g. ECONNREFUSED / port-unreachable while the peer
@@ -173,20 +188,27 @@ static void *downlink(void *arg) {
                NOT tear the tunnel down. Earlier this break killed the whole
                receive path the moment the peer wasn't ready first. */
             if (errno == EINTR || errno == EAGAIN) continue;
+            atomic_fetch_add_explicit(&udp_rx_errors, 1, memory_order_relaxed);
             usleep(1000); continue;
         }
-        if (n < (ssize_t)(NONCE_LEN + TAG_LEN)) continue;
+        if (n < (ssize_t)(NONCE_LEN + TAG_LEN)) {
+            atomic_fetch_add_explicit(&udp_rx_errors, 1, memory_order_relaxed);
+            continue;
+        }
         unsigned char *nonce = in;
         unsigned long long mlen = 0;
         if (aead_dec(
                 out, &mlen, NULL,
                 in + NONCE_LEN, (unsigned long long)(n - NONCE_LEN),
-                NULL, 0, nonce, key) != 0)
-            continue;                       /* forged/corrupt - drop silently */
+                NULL, 0, nonce, key) != 0) {
+            atomic_fetch_add_explicit(&udp_auth_fail, 1, memory_order_relaxed);
+            continue;
+        }
         int ilen = inner_ip_len(out, mlen);
         if (ilen < 0) continue;
-        if (write(tun_fd, out, ilen) < 0 && errno != EAGAIN)
-            /* TUN write error - drop, inner stack recovers */ ;
+        ssize_t written = write(tun_fd, out, ilen);
+        if (written == ilen) atomic_fetch_add_explicit(&udp_rx_ok, 1, memory_order_relaxed);
+        else atomic_fetch_add_explicit(&udp_tun_write_errors, 1, memory_order_relaxed);
     }
     return NULL;
 }
@@ -258,10 +280,23 @@ int tun_main_udp(int argc, char **argv) {
       fprintf(stderr,"wire: 12B nonce + ChaCha20-Poly1305, no header/handshake/seq\n"); }
 
     pthread_t up, down;
-    pthread_create(&up, NULL, uplink, NULL);
-    pthread_create(&down, NULL, downlink, NULL);
+    if (pthread_create(&up, NULL, uplink, NULL) != 0) {
+        perror("UDP uplink thread"); close(udp_fd); close(tun_fd); return 1;
+    }
+    if (pthread_create(&down, NULL, downlink, NULL) != 0) {
+        perror("UDP downlink thread");
+        running = 0; pthread_join(up, NULL);
+        close(udp_fd); close(tun_fd); return 1;
+    }
     pthread_join(up, NULL);
     pthread_join(down, NULL);
+    fprintf(stderr, "udp counters: tx=%llu rx=%llu send_errors=%llu recv_errors=%llu auth_fail=%llu tun_write_errors=%llu\n",
+            (unsigned long long)atomic_load(&udp_send_ok),
+            (unsigned long long)atomic_load(&udp_rx_ok),
+            (unsigned long long)atomic_load(&udp_send_errors),
+            (unsigned long long)atomic_load(&udp_rx_errors),
+            (unsigned long long)atomic_load(&udp_auth_fail),
+            (unsigned long long)atomic_load(&udp_tun_write_errors));
     close(udp_fd); close(tun_fd);
     return 0;
 }
