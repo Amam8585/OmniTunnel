@@ -367,7 +367,7 @@ static void emit_stats(uint64_t uptime_ms) {
       "\"alloc_failures\":%llu,\"flow_capacity\":%u,"
       "\"tun_oversized\":%llu,\"queue_pressure\":%llu,\"queue_pauses\":%llu,"
       "\"tun_read_paused\":%d,\"flow_lookup_calls\":%llu,\"flow_lookup_probes\":%llu,"
-      "\"flow_table_bytes\":%llu,\"timer_heap_bytes\":%llu}\n",
+      "\"flow_table_bytes\":%llu}\n",
       (unsigned long long)uptime_ms, (unsigned long long)metrics.tun_rx,
       (unsigned long long)metrics.tun_tx, (unsigned long long)metrics.icmp_rx,
       (unsigned long long)metrics.icmp_tx, (unsigned long long)metrics.rx_bytes,
@@ -387,8 +387,7 @@ static void emit_stats(uint64_t uptime_ms) {
       tun_read_paused,
       (unsigned long long)metrics.flow_lookup_calls,
       (unsigned long long)metrics.flow_lookup_probes,
-      (unsigned long long)((size_t)flow_bucket_count * sizeof(*flow_table)),
-      (unsigned long long)((size_t)timer_heap_capacity * sizeof(*timer_heap)));
+      (unsigned long long)((size_t)flow_bucket_count * sizeof(*flow_table)));
     if (fclose(f) == 0) rename(tmp, stats_path);
     else unlink(tmp);
 }
