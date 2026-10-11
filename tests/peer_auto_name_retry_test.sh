@@ -15,28 +15,32 @@ extract() {
     }' "$SCRIPT"
 }
 
-eval "$(extract "peer_free_auto_name auto_name inst_exists inst_conf")"
+eval "$(extract "peer_reserve_auto_name peer_remote_state auto_name inst_exists inst_conf")"
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
 
-INST_DIR="$(mktemp -d)"
-trap 'rm -rf "$INST_DIR"' EXIT
+D="$(mktemp -d)"
+trap 'rm -rf "$D"' EXIT
+INST_DIR="$D/local"; mkdir -p "$INST_DIR"
+FAKE_ROOT="$D/foreign"; mkdir -p "$FAKE_ROOT/inst"
 
-FGN=" ackless2 "
-peer_ssh() { printf '%s\n' $FGN; }
-peer_has_inst() { case " $FGN " in *" $2 "*) return 0;; *) return 1;; esac; }
+peer_ssh() { shift; local cmd="$*"; cmd="${cmd//\/etc\/omnitunnel/$FAKE_ROOT}"; eval "$cmd"; }
 die() { echo "DIE: $*" >&2; exit 9; }
 
-mkdir -p "$INST_DIR/ackless" "$INST_DIR/ackless1"
-: > "$INST_DIR/ackless/instance.conf"
-: > "$INST_DIR/ackless1/instance.conf"
-
-PEER_AUTO_NAME=""
-peer_free_auto_name ackless 203.0.113.9 ""
-[[ "$PEER_AUTO_NAME" == "ackless3" ]] || fail "cross-host auto-name: with local {ackless,ackless1} and the foreign holding {ackless2}, a stale empty snapshot must refresh the foreign listing and retry to ackless3; got '$PEER_AUTO_NAME'"
+N=6
+RES="$D/res"; : > "$RES"
+for i in $(seq 1 "$N"); do ( peer_reserve_auto_name ackless 203.0.113.9 "" && echo "$PEER_AUTO_NAME" >> "$RES" ) & done
+wait
+got=$(grep -c . "$RES"); [[ "$got" -eq "$N" ]] || fail "(a) atomic reservation: expected $N successful reservations, got $got"
+distinct=$(sort -u "$RES" | grep -c .); [[ "$distinct" -eq "$N" ]] || fail "(a) atomic reservation: names not distinct ($distinct unique of $N) - a name was double-provisioned"
+fcount=$(ls -1 "$FAKE_ROOT/inst" | grep -c '^ackless'); [[ "$fcount" -eq "$N" ]] || fail "(a) foreign holds $fcount ackless* reservations, expected $N"
 
 rc=0
-( peer_has_inst() { return 0; }; peer_ssh() { printf ''; }; peer_free_auto_name ackless 203.0.113.9 "" ) >/dev/null 2>&1 || rc=$?
-[[ "$rc" -ne 0 ]] || fail "bounded retry: a foreign that keeps colliding must fail loudly after the retry bound, not loop forever (rc=$rc)"
+( peer_ssh() { return 255; }; peer_reserve_auto_name ackless 203.0.113.9 "" ) >/dev/null 2>&1 || rc=$?
+[[ "$rc" -ne 0 ]] || fail "(b) an SSH/transport error (exit 255) must fail closed (die), never provision on an unverified name (rc=$rc)"
 
-echo "PASSED - cross-host auto-name refreshes the foreign listing and retries past local {ackless,ackless1} + foreign {ackless2} to ackless3, and fails loudly after a bounded number of retries"
+rc=0
+( peer_ssh() { printf ''; }; peer_reserve_auto_name ackless 203.0.113.9 "" ) >/dev/null 2>&1 || rc=$?
+[[ "$rc" -ne 0 ]] || fail "(b) an inconclusive remote check (empty output) must fail closed, never treat the name as free (rc=$rc)"
+
+echo "PASSED - $N concurrent reservers take $N DISTINCT names via the atomic foreign mkdir (no name double-provisioned); an SSH error or inconclusive remote check fails closed instead of provisioning on an unverified name"

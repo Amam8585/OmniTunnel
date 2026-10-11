@@ -1373,17 +1373,31 @@ add_parse() {
     return 0
 }
 
-peer_has_inst() { peer_ssh "$1" "test -e /etc/omnitunnel/inst/'$2'/instance.conf" >/dev/null 2>&1; }
-peer_free_auto_name() {
-    local t="$1" fhost="$2" fnames="$3" kn _try=0
+_release_peer_reservation() {
+    [[ -n "${RESV_HOST:-}" && -n "${RESV_NAME:-}" ]] || return 0
+    peer_ssh "$RESV_HOST" "rmdir /etc/omnitunnel/inst/'$RESV_NAME' 2>/dev/null" >/dev/null 2>&1 || true
+}
+peer_remote_state() {
+    peer_ssh "$1" "mkdir -p /etc/omnitunnel/inst 2>/dev/null; mkdir /etc/omnitunnel/inst/'$2' 2>/dev/null && echo OMNIRESV || { [ -e /etc/omnitunnel/inst/'$2' ] && echo OMNITAKEN || echo OMNIFAIL; }" 2>/dev/null | tr -dc 'A-Z'
+}
+peer_reserve_auto_name() {
+    local t="$1" fhost="$2" fnames="$3" kn st tries=0 errs=0
     kn="$(auto_name "$t" "$fnames")"
-    while peer_has_inst "$fhost" "$kn"; do
-        _try=$((_try+1))
-        [[ "$_try" -ge 8 ]] && die "could not reserve a free auto-name on the foreign $fhost after $_try tries; pass an explicit name or retry"
-        fnames=$(peer_ssh "$fhost" "ls /etc/omnitunnel/inst 2>/dev/null" 2>/dev/null | tr '\r\n' '  ' || true)
-        kn="$(auto_name "$t" "$fnames")"
+    while :; do
+        st="$(peer_remote_state "$fhost" "$kn")"
+        case "$st" in
+            OMNIRESV) PEER_AUTO_NAME="$kn"; RESV_HOST="$fhost"; RESV_NAME="$kn"; return 0;;
+            OMNITAKEN)
+                tries=$((tries+1))
+                [[ "$tries" -ge 8 ]] && die "could not reserve a free auto-name on the foreign $fhost after $tries tries; pass an explicit name or retry"
+                fnames=$(peer_ssh "$fhost" "ls /etc/omnitunnel/inst 2>/dev/null" 2>/dev/null | tr '\r\n' '  ' || true)
+                kn="$(auto_name "$t" "$fnames")";;
+            *)
+                errs=$((errs+1))
+                [[ "$errs" -ge 5 ]] && die "cannot verify instance names on the foreign $fhost (SSH/transport error or inconclusive remote check); refusing to provision on an unverified name"
+                sleep 1;;
+        esac
     done
-    PEER_AUTO_NAME="$kn"
 }
 
 # Non-interactive add for scripting/automation.
@@ -1422,11 +1436,17 @@ cmd_add_auto() {
     mkdir -p "$INST_DIR" 2>/dev/null || true
     exec {afd}>"$INST_DIR/.alloc.lock" || die "cannot open allocation lock $INST_DIR/.alloc.lock"
     flock "$afd" || die "cannot acquire allocation lock"
-    if [[ -n "$auto_kn" ]]; then peer_free_auto_name "$t" "$fhost" "$fnames"; kn="$PEER_AUTO_NAME"; else inst_exists "$kn" && die "instance $kn exists"; fi
+    if [[ -n "$auto_kn" ]]; then
+        RESV_HOST=""; RESV_NAME=""; trap '_release_peer_reservation' EXIT
+        peer_reserve_auto_name "$t" "$fhost" "$fnames"; kn="$PEER_AUTO_NAME"
+    else
+        inst_exists "$kn" && die "instance $kn exists"
+    fi
     sub=$(alloc_subnet "$fsub"); ta="10.201.$sub.1"; pa="10.201.$sub.2"
     port=$(alloc_port "$(( $(port_base "$t") + sub ))" "$(printf '%s\n' "$fport" | remote_port_ranges)" "$t"); key=$(gen_key); type_uses_key "$t" || key=""
     provision_peer "$fhost" "$kn" "$t" "$fhost" "$mylip" "$port" "$key" "$pa" "$ta" "$shape" "$nc" "$pmode"
     create_inst "$kn" "$t" client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" "$shape" "$nc" "$imode"
+    [[ -n "$auto_kn" ]] && { RESV_NAME=""; trap - EXIT; }
     flock -u "$afd"; exec {afd}>&-
     inst_enable "$kn"; ok "instance '$kn' ($t) up: $mylip -> $fhost  (subnet 10.201.$sub.0/24, port/key $port)"
 }
