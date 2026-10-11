@@ -244,6 +244,17 @@ keys = {"commit":"OMNI_COMMIT","archive_sha256":"OMNI_ARCHIVE_SHA",
 with open(sys.argv[1], "w", encoding="utf-8") as stream:
     json.dump({k:os.environ[e] for k,e in keys.items()}, stream, sort_keys=True, indent=2)
 PY
+    # Include a deterministic per-artifact inventory (SHA256 is corruption
+    # detection; pin the reviewed commit / verify provenance separately).
+    python3 - "$out" <<'PY'
+import hashlib, json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+manifest = root/"build-info.json"
+metadata = json.loads(manifest.read_text())
+metadata["artifacts"] = {str(f.relative_to(root)): hashlib.sha256(f.read_bytes()).hexdigest()
+                        for f in sorted(root.rglob("*")) if f.is_file() and f != manifest}
+manifest.write_text(json.dumps(metadata,sort_keys=True,indent=2))
+PY
     stage="$STAGES/release-$(date -u +%Y%m%dT%H%M%SZ)-${BASHPID}"
     mv "$out" "$stage"; rm -rf "$work"
     printf '%s\n' "$stage" > "$STAGES/current.new"
