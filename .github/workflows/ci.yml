@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, phase3/direct-reliability-validation]
+    branches: [main, 'phase4/**']
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -42,7 +42,6 @@ jobs:
       - name: Offline allocation microbench and CPU/RSS profiling
         run: |
           go test -run '^
-
   binaries:
     name: committed binaries current (${{ matrix.module }})
     runs-on: ubuntu-latest
@@ -160,9 +159,8 @@ jobs:
         run: |
           for t in tests/*.sh; do
             if [ "$t" != tests/installer_integration_test.sh ]; then bash "$t"; fi
-          done
- -bench 'Benchmark(ReadFrame|TCPChecksum|DirectFlowHash)
-
+          done -bench 'Benchmark(ReadFrame|TCPChecksum|DirectFlowHash)' -benchmem -count=2 ./...
+          go test -run '^
   binaries:
     name: committed binaries current (${{ matrix.module }})
     runs-on: ubuntu-latest
@@ -250,6 +248,11 @@ jobs:
           gcc -O1 -g -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer \
             -o /tmp/icmptun-core-tests tests/icmptun_core_test.c
           ASAN_OPTIONS=detect_leaks=1 /tmp/icmptun-core-tests
+      - name: Fail-closed AEAD nonce source regression
+        run: |
+          gcc -O1 -g -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer \
+            -o /tmp/secure-nonce-test tests/secure_nonce_test.c
+          ASAN_OPTIONS=detect_leaks=1 /tmp/secure-nonce-test
       - name: WebSocket RFC6455 sanitizer integration
         run: |
           gcc -O1 -g -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer \
@@ -262,6 +265,10 @@ jobs:
       - name: Runtime optimizer paths and rollback using fake iproute2
         run: |
           sudo bash tests/optimizer_runtime_test.sh
+      - name: ICMP synthetic flow table benchmark (NOT end-to-end)
+        run: |
+          gcc -O2 -Wall -Wextra -o /tmp/icmptun-microbench tests/icmptun_microbench.c
+          /tmp/icmptun-microbench
       - name: Real installer integration in isolated prefix
         run: |
           sudo apt-get update -qq
@@ -271,12 +278,7 @@ jobs:
         run: |
           for t in tests/*.sh; do
             if [ "$t" != tests/installer_integration_test.sh ]; then bash "$t"; fi
-          done
- \
-            -benchmem -benchtime=150ms -count=1 -cpuprofile=/tmp/omnitunnel-go-cpu.pprof \
-            -memprofile=/tmp/omnitunnel-go-mem.pprof ./...
-          test -s /tmp/omnitunnel-go-cpu.pprof
-          test -s /tmp/omnitunnel-go-mem.pprof
+          done -bench 'Benchmark(ReadFrame|TCPChecksum|DirectFlowHash)' -benchtime=1s -cpuprofile=/tmp/omnitunnel-go-cpu.pprof -memprofile=/tmp/omnitunnel-go-mem.pprof ./...
 
   binaries:
     name: committed binaries current (${{ matrix.module }})
@@ -365,6 +367,11 @@ jobs:
           gcc -O1 -g -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer \
             -o /tmp/icmptun-core-tests tests/icmptun_core_test.c
           ASAN_OPTIONS=detect_leaks=1 /tmp/icmptun-core-tests
+      - name: Fail-closed AEAD nonce source regression
+        run: |
+          gcc -O1 -g -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer \
+            -o /tmp/secure-nonce-test tests/secure_nonce_test.c
+          ASAN_OPTIONS=detect_leaks=1 /tmp/secure-nonce-test
       - name: WebSocket RFC6455 sanitizer integration
         run: |
           gcc -O1 -g -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer \
@@ -377,6 +384,10 @@ jobs:
       - name: Runtime optimizer paths and rollback using fake iproute2
         run: |
           sudo bash tests/optimizer_runtime_test.sh
+      - name: ICMP synthetic flow table benchmark (NOT end-to-end)
+        run: |
+          gcc -O2 -Wall -Wextra -o /tmp/icmptun-microbench tests/icmptun_microbench.c
+          /tmp/icmptun-microbench
       - name: Real installer integration in isolated prefix
         run: |
           sudo apt-get update -qq
