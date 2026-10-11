@@ -71,6 +71,20 @@ int main(void) {
     assert(f->pending == 0);
     assert(f->rx_next_seq == 601);
 
+    /* 16-bit sequence wrap with an out-of-order zero followed by 65535. */
+    f->rx_next_seq = 65534;
+    flow_rx_packet(f, inner, 40, 0);
+    assert(f->pending == 1);
+    flow_rx_packet(f, inner, 40, 65534);
+    assert(f->pending == 1 && f->rx_next_seq == 65535);
+    flow_rx_packet(f, inner, 40, 65535);
+    assert(f->pending == 0 && f->rx_next_seq == 1);
+    /* Repeated churn never leaves ownership in an evicted reorder slot. */
+    flow_rx_packet(f, inner, 40, 3);
+    assert(f->pending == 1);
+    flow_evict(f);
+    assert(f->pending == 0 && !f->valid);
+
     mtu = 1320;
     local_ident = 0x4d54;
     remote_ident = local_ident; /* local offline round trip only */
@@ -78,6 +92,7 @@ int main(void) {
     peer_addr.sin_family = AF_INET;
     peer_addr.sin_addr = peer_ip;
     out_pkt_t out;
+    assert(encapsulate(inner, 1321, 77, &out) != 0);
     assert(encapsulate(inner, 40, 77, &out) == 0);
     assert(out.len == 64); /* Echo header 8 + minimum padded payload 56 */
     unsigned char raw[MAX_PKT] = {0}, decoded[MAX_INNER];
@@ -119,6 +134,6 @@ int main(void) {
     free(timer_heap);
     free(tun_pending);
     close(tun_fd);
-    puts("PASS: flow hashing, lookup, eviction, pending counter, timer exhaustion, wire framing and source checks");
+    puts("PASS: flow hashing, lookup, eviction, pending counter, wraparound, churn/eviction, saturation, oversize and wire integrity");
     return 0;
 }
