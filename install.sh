@@ -22,7 +22,7 @@ Usage: sudo bash install.sh [--prepare|--apply|--update|--check|--backup|--rollb
 --allow-active: explicitly allow replacing on-disk binaries while tunnels run.
 --allow-downgrade: explicitly permit older/unrelated Git commit lineage
 Env: OMNITUN_REF, OMNITUN_REPOSITORY, OMNITUN_SOURCE_DIR
-This development branch defaults to the branch ref, not main.
+Default remote source: main, resolved to an immutable commit at prepare time.
 EOF
 }
 while (($#)); do
@@ -219,6 +219,12 @@ prepare() {
         bash -n "$src/scripts/$n" || die "script syntax failed: $n"
         install -m 0755 "$src/scripts/$n" "$out/scripts/$n"
     done
+    [[ -f "$src/scripts/monitor_legacy.py" ]] || die "missing legacy metrics helper"
+    python3 - "$src/scripts/monitor_legacy.py" <<'PY' || die "legacy monitor has Python syntax errors"
+import ast,sys
+ast.parse(open(sys.argv[1], encoding="utf-8").read())
+PY
+    install -m 0644 "$src/scripts/monitor_legacy.py" "$out/scripts/monitor_legacy.py"
     if [[ -d "$src/docs" ]]; then cp -a "$src/docs/." "$out/docs/"; fi
     [[ ! -f "$src/README.md" ]] || cp -a "$src/README.md" "$out/README.md"
     [[ ! -f "$src/LICENSE" ]] || cp -a "$src/LICENSE" "$out/LICENSE"
@@ -329,6 +335,7 @@ apply() {
             install -m 0755 "$stage/scripts/$n" "$PREFIX/scripts/$n.new.${BASHPID}" || exit 1
             mv -f "$PREFIX/scripts/$n.new.${BASHPID}" "$PREFIX/scripts/$n" || exit 1
         done
+        cp -a "$stage/scripts/monitor_legacy.py" "$PREFIX/scripts/monitor_legacy.py" || exit 1
         cp -a "$stage/docs/." "$PREFIX/docs/" || exit 1
         cp -a "$stage/bin/." "$PREFIX/bin/" || exit 1
         for n in README.md LICENSE CHANGELOG.md; do
