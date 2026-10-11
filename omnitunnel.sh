@@ -20,7 +20,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="2.9.8"
+VERSION="2.9.9"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -1659,12 +1659,28 @@ bench_run() {
     command -v iperf3 >/dev/null || { warn "installing iperf3..."; apt-get install -y iperf3 >/dev/null 2>&1 || yum install -y iperf3 >/dev/null 2>&1 || true; }
 
     # deploy core + iperf3 server on the far side
+    if ! peer_ssh "$fhost" true >/dev/null 2>&1; then
+        echo
+        warn "Couldn't reach the foreign $fhost over SSH (port 22)."
+        echo "  From an Iran box, SSH to a foreign IP is often DPI-blocked, or no SSH key/password is set up here."
+        echo "  Fix it one of these ways, then re-run:"
+        echo "    (a) set up an SSH key to the foreign,"
+        echo "    (b) enter the foreign SSH password at the prompt,"
+        echo "    (c) fill the SOCKS5-proxy prompt to tunnel SSH past the block, or"
+        echo "    (d) use menu option 2 'Benchmark - manual (no SSH)', which needs NO SSH to the foreign."
+        return 1
+    fi
     local parch; parch=$(peer_ssh "$fhost" "uname -m" 2>/dev/null | tr -d '\r')
-    case "$parch" in x86_64|amd64) parch=amd64;; aarch64|arm64) parch=arm64;; *) die "peer CPU $parch unsupported";; esac
+    case "$parch" in
+        x86_64|amd64) parch=amd64;;
+        aarch64|arm64) parch=arm64;;
+        "") warn "Couldn't read the foreign $fhost CPU type over SSH - the connection dropped."; echo "  Re-run after fixing SSH reachability, or use menu option 2 'Benchmark - manual (no SSH)'."; return 1;;
+        *) warn "the foreign $fhost reports an unsupported CPU: $parch"; return 1;;
+    esac
     local pbin=""; for d in "$ASSET_DIR/bin" "$SCRIPT_DIR/bin"; do [[ -f "$d/omnitun-$parch" ]] && { pbin="$d/omnitun-$parch"; break; }; done
-    [[ -n "$pbin" ]] || die "no omnitun-$parch binary to send to $fhost (looked in $ASSET_DIR/bin and $SCRIPT_DIR/bin)"
+    [[ -n "$pbin" ]] || { warn "no omnitun-$parch binary to send to $fhost (looked in $ASSET_DIR/bin and $SCRIPT_DIR/bin)"; return 1; }
     info "Deploying suite to $fhost ($parch)..."
-    peer_ssh "$fhost" "mkdir -p /opt/omnitunnel/bin" || die "cannot reach $fhost"
+    peer_ssh "$fhost" "mkdir -p /opt/omnitunnel/bin" || { warn "lost SSH to $fhost while deploying; aborting the benchmark"; return 1; }
     peer_scp "$fhost" "$pbin" "/opt/omnitunnel/bin/omnitun-$parch"
     peer_scp "$fhost" "$SCRIPT_PATH" "/opt/omnitunnel/omnitunnel.sh"
     peer_ssh "$fhost" "chmod +x /opt/omnitunnel/omnitunnel.sh; install -m0755 /opt/omnitunnel/bin/omnitun-$parch /usr/local/bin/omnitun" >/dev/null 2>&1 || true
@@ -1685,7 +1701,8 @@ bench_run() {
         echo "  the test). Fix it one of these ways, then run the benchmark again:"
         echo "    - let it auto-install: make sure the foreign box can reach its apt/yum mirrors"
         echo "    - or install it by hand on the foreign:  ${C_CYAN}apt install -y iperf3${C_RESET}  (or ${C_CYAN}yum install -y iperf3${C_RESET})"
-        die "measurement server unavailable on $fhost"
+        warn "measurement server unavailable on $fhost"
+        return 1
     fi
     bench_ensure_httpfile "$fhost" || true   # best-effort curl fallback server
     sleep 1
@@ -1812,7 +1829,7 @@ bench_run() {
     local tarr=(); read -r -a tarr <<< "$ALL_TYPES"
     ch="$(pick_num "$ch" "${#tarr[@]}")" || { warn "no transport numbered $ch"; return; }
     keep="${tarr[$((ch-1))]}"
-    read -erp "Name for the kept instance [main]: " kn; kn="${kn:-main}"; inst_exists "$kn" && die "instance $kn exists"
+    read -erp "Name for the kept instance [main]: " kn; kn="${kn:-main}"; inst_exists "$kn" && { warn "instance $kn exists"; return 1; }
     local nc=16 shape=none
     [[ "$keep" == mux ]] && { read -erp "mux links N [16]: " nc; nc="${nc:-16}"; read -erp "download shaper (e.g. 90mbit / none) [none]: " shape; shape="${shape:-none}"; }
     [[ "$keep" == hysteria ]] && { read -erp "Brutal-CC target bandwidth mbps [$hy_target]: " shape; shape="${shape:-$hy_target}"; }
@@ -1820,7 +1837,7 @@ bench_run() {
     fsub=$(peer_ssh "$fhost" "grep -hoE 'TUN_ADDR=10\\.201\\.[0-9]+' /etc/omnitunnel/inst/*/instance.conf 2>/dev/null | grep -oE '[0-9]+\$'" 2>/dev/null | tr '\r\n' '  ' || true)
     fport=$(peer_port_triples "$fhost")
     fnames=$(peer_ssh "$fhost" "ls /etc/omnitunnel/inst 2>/dev/null" 2>/dev/null | tr '\r\n' '  ' || true)
-    case " $fnames " in *" $kn "*) die "the foreign already has an instance named '$kn' - choose a different name";; esac
+    case " $fnames " in *" $kn "*) warn "the foreign already has an instance named '$kn' - choose a different name"; return 1;; esac
     local sub port key ta pa; sub=$(alloc_subnet "$fsub"); ta="10.201.$sub.1"; pa="10.201.$sub.2"; port=$(alloc_port "$(( $(port_base "$keep") + sub ))" "$(printf '%s\n' "$fport" | remote_port_ranges)" "$keep"); key=$(gen_key); type_uses_key "$keep" || key=""
     provision_peer "$fhost" "$kn" "$keep" "$fhost" "$mylip" "$port" "$key" "$pa" "$ta" "$shape" "$nc"
     create_inst "$kn" "$keep" client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" "$shape" "$nc"
@@ -2278,7 +2295,7 @@ menu_main() {
         printf '  %bEnter your choice [0-7]:%b ' "$C_BGRN" "$C_RESET"
         read -r c || exit 0
         case "$c" in
-            1) bench_run; pause;;
+            1) bench_run || true; pause;;
             2) local fh mip; read -erp "Foreign server IP: " fh; mip="$(default_local_ip)"; read -erp "This box public IP [$mip]: " x; mip="${x:-$mip}"; [[ -n "$fh" ]] && cmd_bench_manual "$fh" "$mip"; pause;;
             3) menu_instances;;
             4) menu_pf;;
