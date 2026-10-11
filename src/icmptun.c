@@ -32,6 +32,7 @@
 #include <linux/if_tun.h>
 #include <stdint.h>
 #include <time.h>
+#include <sys/stat.h>
 
 #define DEFAULT_MTU    1400
 #define DEFAULT_IDENT  0x4D54      /* "MT" - MyTunnel */
@@ -220,12 +221,13 @@ static int decapsulate(const unsigned char *buf, int len,
  * loop a single epoll_wait() timeout - the minimum across every flow
  * currently waiting on a missing packet - without scanning the table.
  */
-#define FLOW_TABLE_BUCKETS  256   /* power of two */
 #define FLOW_TABLE_WAYS     4
-#define FLOW_TABLE_SIZE     (FLOW_TABLE_BUCKETS * FLOW_TABLE_WAYS)
-#define REORDER_WINDOW      256   /* power of two - per-flow reorder window */
-#define REORDER_TIMEOUT_MS  45    /* max wait for a missing packet in one flow */
-#define TIMER_HEAP_CAP      (FLOW_TABLE_SIZE * 4)
+#define DEFAULT_FLOW_SLOTS  1024  /* unchanged default; use -F for testing higher counts */
+#define MAX_FLOW_SLOTS      65536
+#define REORDER_WINDOW      256   /* power of two, unchanged wire semantics */
+#define REORDER_TIMEOUT_MS  45
+#define IO_BATCH            128
+#define TX_BATCH            256
 
 #define FLOW_KEY_FRAG  0x01
 #define FLOW_ROLE_TX   1
@@ -263,7 +265,48 @@ typedef struct {
     flow_entry_t slots[FLOW_TABLE_WAYS];
 } flow_bucket_t;
 
-static flow_bucket_t flow_table[FLOW_TABLE_BUCKETS];
+static flow_bucket_t *flow_table;
+static unsigned flow_bucket_count = DEFAULT_FLOW_SLOTS / FLOW_TABLE_WAYS;
+static unsigned flow_slots = DEFAULT_FLOW_SLOTS;
+static uint32_t loop_clock_ms;
+static struct {
+    uint64_t tun_rx, tun_tx, icmp_rx, icmp_tx, rx_bytes, tx_bytes;
+    uint64_t queue_full, queue_peak, send_errors, recv_errors, tun_errors;
+    uint64_t invalid_packets, flow_evictions, flow_collisions, active_flows;
+    uint64_t reordered, reorder_timeouts, alloc_failures;
+} metrics;
+static char stats_path[128];
+static void emit_stats(uint64_t uptime_ms) {
+    static uint64_t last_report;
+    if (uptime_ms - last_report < 1000) return;
+    last_report = uptime_ms;
+    if (!stats_path[0]) return;
+    char tmp[160];
+    snprintf(tmp, sizeof(tmp), "%s.tmp.%ld", stats_path, (long)getpid());
+    FILE *f = fopen(tmp, "w");
+    if (!f) return;
+    fprintf(f,
+      "{\"timestamp_ms\":%llu,\"tun_rx_packets\":%llu,\"tun_tx_packets\":%llu,"
+      "\"icmp_rx_packets\":%llu,\"icmp_tx_packets\":%llu,\"rx_bytes\":%llu,\"tx_bytes\":%llu,"
+      "\"queue_drops\":%llu,\"queue_length\":%d,\"queue_peak\":%llu,"
+      "\"send_errors\":%llu,\"recv_errors\":%llu,\"tun_errors\":%llu,"
+      "\"invalid_packets\":%llu,\"active_flows\":%llu,\"flow_evictions\":%llu,"
+      "\"flow_collisions\":%llu,\"reorder_events\":%llu,\"reorder_timeouts\":%llu,"
+      "\"alloc_failures\":%llu,\"flow_capacity\":%u}\n",
+      (unsigned long long)uptime_ms, (unsigned long long)metrics.tun_rx,
+      (unsigned long long)metrics.tun_tx, (unsigned long long)metrics.icmp_rx,
+      (unsigned long long)metrics.icmp_tx, (unsigned long long)metrics.rx_bytes,
+      (unsigned long long)metrics.tx_bytes, (unsigned long long)metrics.queue_full,
+      sq_count, (unsigned long long)metrics.queue_peak,
+      (unsigned long long)metrics.send_errors, (unsigned long long)metrics.recv_errors,
+      (unsigned long long)metrics.tun_errors, (unsigned long long)metrics.invalid_packets,
+      (unsigned long long)metrics.active_flows, (unsigned long long)metrics.flow_evictions,
+      (unsigned long long)metrics.flow_collisions, (unsigned long long)metrics.reordered,
+      (unsigned long long)metrics.reorder_timeouts, (unsigned long long)metrics.alloc_failures,
+      flow_slots);
+    if (fclose(f) == 0) rename(tmp, stats_path);
+    else unlink(tmp);
+}
 
 typedef struct {
     uint32_t deadline;
@@ -271,7 +314,23 @@ typedef struct {
     uint16_t generation;
 } timer_event_t;
 
-static timer_event_t timer_heap[TIMER_HEAP_CAP];
+static timer_event_t *timer_heap;
+static int timer_heap_capacity;
+static int flow_init(unsigned requested_slots) {
+    if (requested_slots < DEFAULT_FLOW_SLOTS || requested_slots > MAX_FLOW_SLOTS ||
+        requested_slots % FLOW_TABLE_WAYS ||
+        (requested_slots & (requested_slots - 1))) return -1;
+    flow_slots = requested_slots;
+    flow_bucket_count = requested_slots / FLOW_TABLE_WAYS;
+    flow_table = calloc(flow_bucket_count, sizeof(*flow_table));
+    timer_heap_capacity = (int)requested_slots * 4;
+    timer_heap = calloc((size_t)timer_heap_capacity, sizeof(*timer_heap));
+    if (!flow_table || !timer_heap) {
+        free(flow_table); free(timer_heap); flow_table = NULL; timer_heap = NULL;
+        return -1;
+    }
+    return 0;
+}
 static int timer_heap_size = 0;
 
 static uint64_t now_ms(void) {
@@ -342,11 +401,11 @@ static inline int flow_key_eq(const flow_key_t *a, const flow_key_t *b) {
 }
 
 static flow_entry_t *flow_table_lookup(const flow_key_t *key, uint32_t hash) {
-    flow_bucket_t *b = &flow_table[hash & (FLOW_TABLE_BUCKETS - 1)];
+    flow_bucket_t *b = &flow_table[hash & (flow_bucket_count - 1)];
     for (int i = 0; i < FLOW_TABLE_WAYS; i++) {
         flow_entry_t *f = &b->slots[i];
         if (f->valid && flow_key_eq(&f->key, key)) {
-            f->last_seen_ms = (uint32_t)now_ms();
+            f->last_seen_ms = loop_clock_ms;
             return f;
         }
     }
@@ -355,6 +414,8 @@ static flow_entry_t *flow_table_lookup(const flow_key_t *key, uint32_t hash) {
 
 static void flow_evict(flow_entry_t *f) {
     if (!f->valid) return;
+    metrics.flow_evictions++;
+    metrics.active_flows--;
     f->generation++;
     f->valid = 0;
     f->timer_deadline = 0;
@@ -364,7 +425,7 @@ static void flow_evict(flow_entry_t *f) {
 }
 
 static flow_entry_t *flow_table_insert(const flow_key_t *key, uint32_t hash, uint8_t role) {
-    flow_bucket_t *b = &flow_table[hash & (FLOW_TABLE_BUCKETS - 1)];
+    flow_bucket_t *b = &flow_table[hash & (flow_bucket_count - 1)];
     flow_entry_t *victim = NULL;
 
     /* prefer an empty slot, then the LRU slot with no pending timer */
@@ -383,11 +444,13 @@ static flow_entry_t *flow_table_insert(const flow_key_t *key, uint32_t hash, uin
     }
 
     if (victim->valid) flow_evict(victim);
+    metrics.active_flows++;
+    if (b->slots[0].valid && victim != &b->slots[0]) metrics.flow_collisions++;
 
     victim->key = *key;
     victim->valid = 1;
     victim->role = role;
-    victim->last_seen_ms = (uint32_t)now_ms();
+    victim->last_seen_ms = loop_clock_ms;
     victim->rx_next_seq = 0;
     victim->tx_next_seq = 0;
     victim->timer_deadline = 0;
@@ -426,7 +489,7 @@ static void timer_heap_sift_down(int i) {
 }
 
 static void timer_heap_push(flow_entry_t *f) {
-    if (timer_heap_size >= TIMER_HEAP_CAP) {
+    if (timer_heap_size >= timer_heap_capacity) {
         /* Shouldn't happen (bounded by flow table size), but never
            overflow the array - the deadline still fires via the flow's
            own timer_deadline check during periodic flush sweeps if this
@@ -458,6 +521,7 @@ static uint32_t timer_heap_min_deadline(void) {
 }
 
 static void flow_flush(flow_entry_t *f) {
+    metrics.reorder_timeouts++;
     uint16_t start = f->rx_next_seq;
     uint16_t max_delivered = f->rx_next_seq;
     int any = 0;
@@ -521,6 +585,7 @@ static void flow_rx_packet(flow_entry_t *f, unsigned char *inner, uint16_t inner
         }
         if (!reorder_gap_pending(f)) f->timer_deadline = 0;
     } else if (delta < REORDER_WINDOW) {
+        metrics.reordered++;
         int idx = seq & (REORDER_WINDOW - 1);
         if (f->rbuf[idx].pkt && f->rbuf[idx].seq == seq) { free(inner); return; } /* duplicate */
         if (f->rbuf[idx].pkt) free(f->rbuf[idx].pkt); /* stale leftover, shouldn't happen */
@@ -529,7 +594,7 @@ static void flow_rx_packet(flow_entry_t *f, unsigned char *inner, uint16_t inner
         f->rbuf[idx].seq = seq;
         DBG("DBG reorder: buffered seq=%u (expected %u)\n", seq, expected);
         if (f->timer_deadline == 0) {
-            f->timer_deadline = (uint32_t)now_ms() + REORDER_TIMEOUT_MS;
+            f->timer_deadline = loop_clock_ms + REORDER_TIMEOUT_MS;
             timer_heap_push(f);
         }
     } else {
@@ -553,24 +618,41 @@ static void flow_rx_packet(flow_entry_t *f, unsigned char *inner, uint16_t inner
 static int flow_epoll_timeout(void) {
     uint32_t now = (uint32_t)now_ms();
     uint32_t deadline = timer_heap_min_deadline();
+    if (sq_count && !send_blocked) return 0;
     if (!deadline) return 1000;
     return deadline > now ? (int)(deadline - now) : 0;
 }
 
+static int send_blocked;
+static void send_set_writable(int enabled) {
+    if (send_blocked == enabled) return;
+    struct epoll_event ev = { .events = EPOLLIN | (enabled ? EPOLLOUT : 0) };
+    ev.data.fd = icmp_fd;
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, icmp_fd, &ev) == 0)
+        send_blocked = enabled;
+}
 static void send_flush(void) {
-    while (sq_count) {
+    int budget = TX_BATCH;
+    while (sq_count && budget-- > 0) {
         out_pkt_t *pkt = &send_queue[sq_head];
         ssize_t n = sendto(icmp_fd, pkt->data, pkt->len, MSG_DONTWAIT,
                            (struct sockaddr*)&pkt->dest, sizeof(pkt->dest));
         if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) return;
-            fprintf(stderr, "sendto failed (len=%zd): %s\n", pkt->len, strerror(errno));
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                send_set_writable(1);
+                return;
+            }
+            metrics.send_errors++;
+            DBG("DBG sendto failed: %s\n", strerror(errno));
         } else {
-            DBG("DBG sendto ok, sent %zd bytes to %s\n", n, inet_ntoa(pkt->dest.sin_addr));
+            metrics.icmp_tx++;
+            metrics.tx_bytes += (uint64_t)n;
         }
         sq_head = next_idx(sq_head);
         sq_count--;
     }
+    send_set_writable(0);
 }
 
 static int tun_create(const char *dev, int mtu_) {
@@ -665,7 +747,7 @@ static void int_handler(int sig) { (void)sig; running = 0; }
 static void usage(const char *arg0) {
     fprintf(stderr,
         "Usage: %s -L <local-real-ip> -R <peer-real-ip> -A <local-tun-ip> -P <peer-tun-ip>\n"
-        "          [-M mtu] [-I ident-hex] [-T tun-name] [-s] [-v]\n"
+        "          [-M mtu] [-I ident-hex] [-T tun-name] [-F flow-slots] [-s] [-v]\n"
         "  -L  this server's real public IP (mandatory)\n"
         "  -R  the OTHER server's real public IP (mandatory)\n"
         "  -A  this end's point-to-point tunnel IP, e.g. 10.99.0.1 (mandatory)\n"
@@ -694,7 +776,7 @@ int tun_main_icmp(int argc, char **argv) {
     unsigned tmp;
     struct in_addr tun_local_ip, tun_peer_ip;
 
-    while ((opt = getopt(argc, argv, "L:R:A:P:M:I:T:r:svh")) != -1) {
+    while ((opt = getopt(argc, argv, "L:R:A:P:M:I:T:r:F:svh")) != -1) {
         switch (opt) {
         case 'L':
             if (!inet_aton(optarg, &local_ip)) usage(argv[0]);
@@ -717,6 +799,15 @@ int tun_main_icmp(int argc, char **argv) {
             ident = (uint16_t)tmp; break;
         case 'T':
             tun_name = optarg; break;
+        case 'F': {
+            char *end = NULL;
+            unsigned long requested = strtoul(optarg, &end, 10);
+            if (!optarg[0] || !end || *end || requested > MAX_FLOW_SLOTS ||
+                requested < DEFAULT_FLOW_SLOTS || (requested & (requested - 1)))
+                usage(argv[0]);
+            flow_slots = (unsigned)requested;
+            break;
+        }
         case 's':
             is_server = 1; break;
         case 'r':
@@ -742,6 +833,16 @@ int tun_main_icmp(int argc, char **argv) {
 
     send_queue = calloc(QUEUE_SIZE, sizeof(out_pkt_t));
     if (!send_queue) { perror("calloc"); return 1; }
+
+    if (flow_init(flow_slots) < 0) {
+        fprintf(stderr, "flow table allocation failed for %u slots\n", flow_slots);
+        return 1;
+    }
+    /* One atomic JSON snapshot per second; no packet payloads are logged. */
+    if (strspn(tun_name, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") == strlen(tun_name)) {
+        if (mkdir("/run/omnitunnel", 0700) == 0 || errno == EEXIST)
+            snprintf(stats_path, sizeof(stats_path), "/run/omnitunnel/icmp-%s.json", tun_name);
+    }
 
     char local_str[16];
     strncpy(local_str, inet_ntoa(local_ip), sizeof(local_str) - 1);
@@ -775,9 +876,13 @@ int tun_main_icmp(int argc, char **argv) {
     memset(&ev, 0, sizeof(ev));
     ev.events = EPOLLIN;
     ev.data.fd = tun_fd;
-    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, tun_fd, &ev);
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, tun_fd, &ev) < 0) {
+        perror("epoll_ctl tun"); return 1;
+    }
     ev.data.fd = icmp_fd;
-    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, icmp_fd, &ev);
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, icmp_fd, &ev) < 0) {
+        perror("epoll_ctl icmp"); return 1;
+    }
 
     signal(SIGINT, int_handler);
     signal(SIGTERM, int_handler);
@@ -794,22 +899,25 @@ int tun_main_icmp(int argc, char **argv) {
     struct sockaddr_in from;
     socklen_t fromlen;
 
+    loop_clock_ms = (uint32_t)now_ms();
     while (running) {
+        loop_clock_ms = (uint32_t)now_ms();
         struct epoll_event events[2];
         int nfds = epoll_wait(epoll_fd, events, 2, flow_epoll_timeout());
         if (nfds < 0) { if (errno == EINTR) continue; break; }
 
         for (int i = 0; i < nfds; i++) {
             if (events[i].data.fd == tun_fd) {
-                while (1) {
+                for (int batch = 0; batch < IO_BATCH; ++batch) {
                     ssize_t n = read(tun_fd, inner, sizeof(inner));
                     if (n < 0) {
-                        if (errno != EAGAIN) fprintf(stderr, "tun read error: %s\n", strerror(errno));
+                        if (errno != EAGAIN) { metrics.tun_errors++; DBG("tun read error: %s\n", strerror(errno)); }
                         break;
                     }
                     if (n == 0) break;
+                    metrics.tun_rx++;
                     DBG("DBG tun_read n=%zd\n", n);
-                    if (sq_count >= QUEUE_SIZE) { fprintf(stderr, "queue full, dropping packet\n"); continue; }
+                    if (sq_count >= QUEUE_SIZE) { metrics.queue_full++; continue; }
 
                     flow_key_t key;
                     uint16_t seq = 0;
@@ -826,21 +934,25 @@ int tun_main_icmp(int argc, char **argv) {
                     if (encapsulate(inner, (int)n, seq, slot) == 0) {
                         sq_tail = next_idx(sq_tail);
                         sq_count++;
+                        if ((uint64_t)sq_count > metrics.queue_peak) metrics.queue_peak = (uint64_t)sq_count;
                         DBG("DBG queued for send, sq_count=%d dest=%s\n", sq_count, inet_ntoa(slot->dest.sin_addr));
                     } else {
                         DBG("DBG encapsulate failed\n");
                     }
                 }
+                send_flush(); /* bound queueing delay: do not wait for unlimited TUN drain */
             } else if (events[i].data.fd == icmp_fd) {
-                while (1) {
+                if (events[i].events & EPOLLOUT) send_flush();
+                for (int batch = 0; batch < IO_BATCH && (events[i].events & EPOLLIN); ++batch) {
                     fromlen = sizeof(from);
                     ssize_t n = recvfrom(icmp_fd, rawbuf, sizeof(rawbuf),
                                          MSG_DONTWAIT,
                                          (struct sockaddr*)&from, &fromlen);
                     if (n < 0) {
-                        if (errno != EAGAIN) fprintf(stderr, "icmp recv error: %s\n", strerror(errno));
+                        if (errno != EAGAIN) { metrics.recv_errors++; DBG("icmp recv error: %s\n", strerror(errno)); }
                         break;
                     }
+                    metrics.icmp_rx++;
                     DBG("DBG icmp_recv n=%zd from=%s\n", n, inet_ntoa(from.sin_addr));
                     int inlen;
                     uint16_t seq;
@@ -860,9 +972,12 @@ int tun_main_icmp(int argc, char **argv) {
                         unsigned char *copy = malloc(inlen);
                         if (copy) {
                             memcpy(copy, inner, inlen);
+                            metrics.tun_tx++;
+                            metrics.rx_bytes += (uint64_t)inlen;
                             flow_rx_packet(f, copy, (uint16_t)inlen, seq);
-                        }
+                        } else metrics.alloc_failures++;
                     } else {
+                        metrics.invalid_packets++;
                         DBG("DBG decapsulate rejected packet\n");
                     }
                 }
@@ -870,10 +985,14 @@ int tun_main_icmp(int argc, char **argv) {
         }
         timer_heap_process_expired((uint32_t)now_ms());
         send_flush();
+        emit_stats(now_ms());
     }
 
     fprintf(stderr, "shutting down\n");
     close(tun_fd); close(icmp_fd); close(epoll_fd);
     free(send_queue);
+    free(flow_table);
+    free(timer_heap);
+    if (stats_path[0]) unlink(stats_path);
     return 0;
 }
