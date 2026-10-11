@@ -357,6 +357,10 @@ apply() {
         cp -a "$stage/build-info.json" "$PREFIX/build-info.json.new.${BASHPID}" || exit 1
         mv -f "$PREFIX/build-info.json.new.${BASHPID}" "$PREFIX/build-info.json" || exit 1
         ln -sfn "$PREFIX/omnitunnel.sh" "$LINK" || exit 1
+        if [[ "$PREFIX" != /opt/omnitunnel && "${OMNITUN_TEST_FAIL_AFTER:-}" == partial-write ]]; then
+            printf 'partial simulated FS write\n' >> "$PREFIX/omnitunnel.sh"
+            exit 79
+        fi
         [[ "$PREFIX" == /opt/omnitunnel || "${OMNITUN_TEST_FAIL_AFTER:-}" != after-copy ]] || exit 79
         "$BIN_DIR/omnitun" version | grep -q '^omnitun ' || exit 1
         bash -n "$PREFIX/omnitunnel.sh" || exit 1
