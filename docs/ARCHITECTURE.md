@@ -1,6 +1,6 @@
 # OmniTunnel Direct: baseline architecture and dependency map
 
-Baseline reviewed: `main` tree `0588e3b86c25cd647f3f1055739c5a4626ec3ba8`. Changes isolated to `refactor/direct-only-icmp-performance`; the original deployed binary and network were **not inspected or modified**.
+Original Phase 1 baseline: `0588e3b86c25cd647f3f1055739c5a4626ec3ba8`. Phase 3 baseline: `6dc2800afe2c2887a08c5c935a93c39087396649`; branch `phase3/direct-reliability-validation`. Production servers were not accessed.
 
 ## Architecture / ownership
 
@@ -55,3 +55,27 @@ No ICMP wire format change was intentional. New `-F` is local-only. Base ICMP id
 Unlike keyed UDP/TCP transports, **Direct ICMP does not authenticate or encrypt inner packets**. Source IP and ICMP identifier checks are not cryptographic authentication. An opt-in negotiated secure mode remains future work.
 
 TUN write buffering and scheduler fairness are nontrivial protocol-path changes; lab two-peer interoperability, error-injection and load benchmarking are still required before considering production rollout.
+
+## Phase 3 — experimental design notes
+
+Direct ICMP now uses a 64KiB scratch read of the TUN interface. If Linux
+returns an oversized or offloaded/GSO inner packet, it is explicitly dropped
+and counted rather than silently truncated by the old 1500-byte read buffer.
+No global NIC offloads are changed. The ICMP event loop pauses TUN EPOLLIN
+when the send queue is beyond its high watermark and raw socket backpressure
+is observed; it resumes after draining below a lower threshold. This is
+a bounded-memory candidate, not a demonstrated goodput/latency improvement.
+
+Direct WS clients verify the per-key HTTP Upgrade Accept digest, with an
+explicit legacy compatibility override for old fixed-digest servers. Data
+frames remain AEAD protected. RFC fragmentation is not implemented.
+
+The per-instance port-forwarding path now creates shadow iptables chains,
+populates them before adding hooks, and retires old hooks only when the new
+generation is visible. SNAT is scoped by conntrack original destination.
+The hook transition spans NAT and FILTER and is **not** a single atomic
+cross-table transaction; crash recovery and concurrent external firewall
+changes still need privileged lab tests.
+
+See docs/PHASE3_VALIDATION.md for the verification ledger. No throughput,
+P95/P99 latency, CPU scalability or zero-outage claim has been established.
