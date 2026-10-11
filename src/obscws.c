@@ -459,6 +459,9 @@ static void run_link(int idx, int fd) {
     downlink_once(fd);                 /* blocks until the link breaks */
     c->fd = -2; /* reservation: do not reuse slot while old writer drains */
     pthread_cond_signal(&c->qcond);
+    /* Wake a writer blocked in a socket write before waiting to join.
+       The owned link has already been marked draining (fd = -2). */
+    shutdown(fd, SHUT_RDWR);
     pthread_join(wt, NULL);
     close(fd);
     c->fd = -1;
