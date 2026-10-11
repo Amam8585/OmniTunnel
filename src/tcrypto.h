@@ -9,21 +9,40 @@
 #include <stddef.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <errno.h>
+#include <sys/random.h>
 #include "monocypher.h"
 
 #define NONCE_LEN 24
 #define TAG_LEN   16
 #define KEY_LEN   32
 
+/* The nonce source must NEVER fall back to predictable bytes. Losing
+ * entropy is a fatal process error, not an acceptable "best effort" mode.
+ * getrandom(2) is available on supported Ubuntu/Debian kernels; /dev/urandom
+ * is only a secondary kernel CSPRNG source for transient syscall failures.
+ * This changes no on-wire framing or cipher operation. */
 static inline void ts_random(void *buf, size_t n) {
     unsigned char *b = (unsigned char *)buf;
-    int fd = open("/dev/urandom", O_RDONLY);
-    size_t g = 0;
+    size_t got = 0;
+    while (got < n) {
+        ssize_t r = getrandom(b + got, n - got, 0);
+        if (r > 0) { got += (size_t)r; continue; }
+        if (r < 0 && errno == EINTR) continue;
+        break;
+    }
+    if (got == n) return;
+    int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
     if (fd >= 0) {
-        while (g < n) { ssize_t r = read(fd, b + g, n - g); if (r <= 0) break; g += (size_t)r; }
+        while (got < n) {
+            ssize_t r = read(fd, b + got, n - got);
+            if (r > 0) { got += (size_t)r; continue; }
+            if (r < 0 && errno == EINTR) continue;
+            break;
+        }
         close(fd);
     }
-    for (; g < n; g++) b[g] = (unsigned char)(g * 1103515245u + 12345u);
+    if (got != n) _exit(70);
 }
 
 /* Drop-in replacements with the SAME signatures as libsodium's
