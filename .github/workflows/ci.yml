@@ -96,8 +96,8 @@ jobs:
           done
 
   direct-c:
-    name: Direct C core and sanitizer tests (${{ matrix.os })
-    runs-on: ${{ matrix.os }
+    name: Direct C core and sanitizer tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
