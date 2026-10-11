@@ -1,5 +1,25 @@
 # Changelog
 
+## Phase 3 — experimental (2026-10-12; NOT PRODUCTION READY)
+
+- Corrected optimizer literal newline and added mock-ip runtime tests.
+- Installer: exclusive state lock, unknown-commit downgrade guard, multi-point
+  fault injection and tests for automatic/manual rollback.
+- ICMP: detect oversized/GSO frames with 64KiB TUN reads, bound epoll TUN
+  intake during ICMP backpressure, count queue pauses and lookup probes.
+- WebSocket: validate Sec-WebSocket-Accept, RFC masks/lengths/FIN, serialized
+  Pong, opt-in legacy server compatibility. Fragmentation unsupported.
+- Forwarding: pre-build private DNAT/SNAT/FORWARD generations; attach new
+  chains before retiring old, with SNAT scoped by conntrack original tuple.
+  Not an atomic cross-table nftables transaction, NOT live-tested.
+- Monitoring: expose stale snapshots, counter resets and unknown goodput.
+- New offline C/Go microbenchmark and Python CI jobs; performance NOT measured.
+- No production servers, routes or active tunnel processes touched.
+
+**Blockers:** GitHub Actions runs total=0, no validated C/Go builds, installer
+integration, netfilter namespace test, two-peer compatibility or high-load A/B
+benchmark. Pull Request remains draft; no production-ready claim.
+
 ## Unreleased — experimental Direct-only branch (2026-10-11)
 
 - Documented baseline main commit and Direct/Reverse dependency map.
