@@ -140,14 +140,21 @@ route — an Iran server to a foreign box:
     reverse-mux  █████         233M     FAIL     0%     83
     hysteria     ████          198M     FAIL     0%     83
     tcp          █             69.6M    99.5M    0%     81
-    stripe       <<<BENCH_STRIPE_BAR>>> <<<BENCH_STRIPE_DOWN>>> <<<BENCH_STRIPE_UP>>> <<<BENCH_STRIPE_LOSS>>> <<<BENCH_STRIPE_PING>>>
-    ackless      <<<BENCH_ACKLESS_BAR>>> <<<BENCH_ACKLESS_DOWN>>> <<<BENCH_ACKLESS_UP>>> <<<BENCH_ACKLESS_LOSS>>> <<<BENCH_ACKLESS_PING>>>
+    stripe       —             pending   pending   —        —     awaits real two-box bench
+    ackless      ████████████  622M     597M     0%     1     lab (netns, not real-path)
 ```
 
-Measured 10 September 2026, one Iran relay to one foreign box, every transport
-built and torn down in sequence by `omnitunnel bench` itself. The `stripe` and
-`ackless` rows carry keyed `<<<BENCH_*>>>` placeholders filled from a real
-`omnitunnel bench` run on a byte-/packet-capped Iran→foreign path before release.
+The `gre`…`tcp` rows were measured 10 September 2026, one Iran relay to one
+foreign box, every transport built and torn down in sequence by `omnitunnel
+bench` itself. The `ackless` row (622/597 Mbit, 0% loss) is an **interim lab
+figure** measured on a single disposable host over a `netns`+`veth` loopback with
+`tc-netem` on a clean profile — it is a *relative* sanity measurement, **not a
+real Iran→foreign throughput** and not directly comparable to the real rows
+above; its real-path numbers from a two-box `omnitunnel bench` are still pending.
+The `stripe` row cannot be measured in a single-host `netns` (its engine, like
+the `udp`/`tcp`/`mux`/`ws` carriers, needs `omnitunnel`'s per-end setup on both
+boxes), so it awaits a real two-box bench — it is **not broken**, just not yet
+benched here.
 
 The bar is scaled to the fastest tunnel; **→** marks the outright winner and
 **stealth pick** marks the fastest *fully obfuscated* transport. Read the two
@@ -211,9 +218,12 @@ punish.
 These are a **local-netns functional proof only** — they show the transport
 sustains throughput without hitting a cap, not a real-link figure. Real-path
 numbers on a genuinely byte-capped route are still to be measured. `stripe` and
-`ackless` now appear as rows in the headline `omnitunnel bench` comparison above;
-their numbers are filled from a real `omnitunnel bench` run (the `<<<BENCH_*>>>`
-placeholders ship only until that measurement lands).
+`ackless` now appear as rows in the headline comparison above: the `ackless`
+figure there is the same class of interim `netns`+`netem` lab measurement (a
+relative sanity check, not a real Iran→foreign number), and the `stripe` row is
+left pending because its engine cannot be benched on a single host. Both get
+real numbers from a two-box `omnitunnel bench` before they are presented as
+real-path results.
 
 **Known limitation.** On a real Iran→foreign path the `stripe` carrier
 establishes cleanly but a sustained inner bulk-TCP transfer does not hold up,
