@@ -82,7 +82,7 @@ int main(void) {
     assert(out.len == 64); /* Echo header 8 + minimum padded payload 56 */
     unsigned char raw[MAX_PKT] = {0}, decoded[MAX_INNER];
     struct iphdr *outer = (struct iphdr*)raw;
-    outer->version = 4; outer->ihl = 5;
+    outer->version = 4; outer->ihl = 5; outer->protocol = IPPROTO_ICMP;
     memcpy(raw + 20, out.data, (size_t)out.len);
     struct sockaddr_in from = {.sin_family = AF_INET, .sin_addr = peer_ip};
     int decoded_len = 0; uint16_t seq = 0;
@@ -90,6 +90,10 @@ int main(void) {
     assert(decoded_len == 40 && seq == 77 && memcmp(decoded, inner, 40) == 0);
     from.sin_addr.s_addr = inet_addr("192.0.2.10");
     assert(decapsulate(raw, (int)out.len + 20, decoded, &decoded_len, &seq, &from) != 0);
+    from.sin_addr = peer_ip;
+    raw[20 + 8 + 3] ^= 0x10; /* tamper with inner payload; wrong ICMP checksum */
+    assert(decapsulate(raw, (int)out.len + 20, decoded, &decoded_len, &seq, &from) != 0);
+    raw[20 + 8 + 3] ^= 0x10;
 
     /* Trigger an in-bucket four-way collision and eviction, without any IP traffic. */
     flow_key_t candidates[5];
