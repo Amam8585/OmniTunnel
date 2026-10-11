@@ -235,7 +235,7 @@ keys = {"commit":"OMNI_COMMIT","archive_sha256":"OMNI_ARCHIVE_SHA",
 with open(sys.argv[1], "w", encoding="utf-8") as stream:
     json.dump({k:os.environ[e] for k,e in keys.items()}, stream, sort_keys=True, indent=2)
 PY
-    stage="$STAGES/release-$(date -u +%Y%m%dT%H%M%SZ)-$"
+    stage="$STAGES/release-$(date -u +%Y%m%dT%H%M%SZ)-${BASHPID}"
     mv "$out" "$stage"; rm -rf "$work"
     printf '%s\n' "$stage" > "$STAGES/current.new"
     mv -f "$STAGES/current.new" "$STAGES/current"
@@ -263,14 +263,14 @@ apply() {
     # Install support tools and documentation without replacing any running service.
     mkdir -p "$PREFIX/scripts" "$PREFIX/docs"
     for n in monitor.sh optimizer.sh diagnostics.sh; do
-        install -m 0755 "$stage/scripts/$n" "$PREFIX/scripts/$n.new.$"
-        mv -f "$PREFIX/scripts/$n.new.$" "$PREFIX/scripts/$n"
+        install -m 0755 "$stage/scripts/$n" "$PREFIX/scripts/$n.new.${BASHPID}"
+        mv -f "$PREFIX/scripts/$n.new.${BASHPID}" "$PREFIX/scripts/$n"
     done
     if [[ -d "$stage/docs" ]]; then cp -a "$stage/docs/." "$PREFIX/docs/"; fi
     for n in README.md LICENSE CHANGELOG.md; do
         [[ ! -f "$stage/$n" ]] || cp -a "$stage/$n" "$PREFIX/$n"
     done
-    install -m 0755 "$stage/omnitunnel.sh" "$PREFIX/omnitunnel.sh.new.$"
+    install -m 0755 "$stage/omnitunnel.sh" "$PREFIX/omnitunnel.sh.new.${BASHPID}"
     mv -f "$PREFIX/omnitunnel.sh.new.$$" "$PREFIX/omnitunnel.sh"
     ln -sfn "$PREFIX/omnitunnel.sh" /usr/local/bin/omnitunnel
     /usr/local/bin/omnitun version || die "installed core check failed; use --rollback"
