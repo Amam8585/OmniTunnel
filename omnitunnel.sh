@@ -2268,7 +2268,7 @@ menu_instances() {
         read -r c || exit 0
         case "$c" in
             1) wizard_add_manual; pause;;
-            2) wizard_add_manual; pause;;
+            2) wizard_add; pause;;
             3) if pick_instance; then remove_instance_fully "$PICK"; fi; pause;;
             4) if pick_instance; then inst_enable "$PICK"; fi; pause;;
             5) if pick_instance; then journalctl -u "$(svc_name "$PICK")" -n 40 --no-pager 2>/dev/null || true; fi; pause;;
