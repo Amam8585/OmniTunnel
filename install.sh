@@ -106,52 +106,61 @@ check_tun() {
     command -v modprobe >/dev/null && modprobe tun 2>/dev/null || true
     [[ -c /dev/net/tun ]] || die "TUN unavailable: enable /dev/net/tun in host/kernel"
 }
+# Snapshots record absence as well as presence, including new installs.
 snapshot() {
-    mkdir -p "$BACKUPS"
-    local dir="$BACKUPS/$(date -u +%Y%m%dT%H%M%SZ)-$" n src
-    mkdir -p "$PREFIX"
+    mkdir -p "$BACKUPS" "$PREFIX"
+    local dir="$BACKUPS/$(date -u +%Y%m%dT%H%M%SZ)-${BASHPID}" n src
     mkdir -p "$dir"
+    : > "$dir/.inventory"
     for n in omnitunnel.sh omnitun hysteria omnistripe omniackless; do
         src="$BIN_DIR/$n"
         [[ "$n" == omnitunnel.sh ]] && src="$PREFIX/omnitunnel.sh"
-        [[ ! -f "$src" ]] || cp -a "$src" "$dir/$n"
+        if [[ -f "$src" ]]; then cp -a "$src" "$dir/$n"
+        else printf 'ABSENT:%s\n' "$n" >> "$dir/.inventory"; fi
     done
-    [[ ! -d "$PREFIX/scripts" ]] || cp -a "$PREFIX/scripts" "$dir/scripts"
-    [[ ! -d "$PREFIX/docs" ]] || cp -a "$PREFIX/docs" "$dir/docs"
-    [[ ! -d "$PREFIX/bin" ]] || cp -a "$PREFIX/bin" "$dir/bin"
+    for n in scripts docs bin; do
+        if [[ -d "$PREFIX/$n" ]]; then cp -a "$PREFIX/$n" "$dir/$n"
+        else printf 'ABSENT:%s\n' "$n" >> "$dir/.inventory"; fi
+    done
     for n in README.md LICENSE CHANGELOG.md build-info.json; do
-        [[ ! -f "$PREFIX/$n" ]] || cp -a "$PREFIX/$n" "$dir/$n"
+        if [[ -f "$PREFIX/$n" ]]; then cp -a "$PREFIX/$n" "$dir/$n"
+        else printf 'ABSENT:%s\n' "$n" >> "$dir/.inventory"; fi
     done
-    [[ ! -L "$LINK" ]] || cp -a --no-dereference "$LINK" "$dir/link"
+    if [[ -L "$LINK" ]]; then cp -a --no-dereference "$LINK" "$dir/link"
+    else printf 'ABSENT:link\n' >> "$dir/.inventory"; fi
     printf '%s\n' "$dir" > "$BACKUPS/.latest.new"
     mv -f "$BACKUPS/.latest.new" "$BACKUPS/.latest"
-    log "Backup saved: $dir"
+    log "Snapshot: $dir"
 }
-rollback() {
-    [[ -f "$BACKUPS/.latest" ]] || die "no snapshot"
-    local dir n dst
-    dir="$(cat "$BACKUPS/.latest")"
-    [[ "$dir" == "$BACKUPS/"* && -d "$dir" ]] || die "invalid snapshot path"
+rollback_snapshot() {
+    local dir="$1" n dest
+    [[ "$dir" == "$BACKUPS/"* && -d "$dir" && -f "$dir/.inventory" ]] ||
+        die "invalid snapshot/inventory"
+    mkdir -p "$BIN_DIR" "$PREFIX"
     for n in omnitunnel.sh omnitun hysteria omnistripe omniackless; do
-        [[ "$n" == omnitunnel.sh ]] && dst="$PREFIX/omnitunnel.sh" || dst="$BIN_DIR/$n"
+        dest="$BIN_DIR/$n"
+        [[ "$n" == omnitunnel.sh ]] && dest="$PREFIX/omnitunnel.sh"
         if [[ -f "$dir/$n" ]]; then
-            install -m 0755 "$dir/$n" "$dst.new.$$"
-            mv -f "$dst.new.$$" "$dst"
-        fi
+            install -m 0755 "$dir/$n" "$dest.revert.${BASHPID}"
+            mv -f "$dest.revert.${BASHPID}" "$dest"
+        elif grep -qx "ABSENT:$n" "$dir/.inventory"; then rm -f "$dest"; fi
     done
     for n in scripts docs bin; do
         if [[ -d "$dir/$n" ]]; then
-            rm -rf "$PREFIX/$n"
-            cp -a "$dir/$n" "$PREFIX/$n"
-        fi
+            rm -rf "$PREFIX/$n"; cp -a "$dir/$n" "$PREFIX/$n"
+        elif grep -qx "ABSENT:$n" "$dir/.inventory"; then rm -rf "$PREFIX/$n"; fi
     done
     for n in README.md LICENSE CHANGELOG.md build-info.json; do
-        if [[ -f "$dir/$n" ]]; then cp -a "$dir/$n" "$PREFIX/$n"; fi
+        if [[ -f "$dir/$n" ]]; then cp -a "$dir/$n" "$PREFIX/$n"
+        elif grep -qx "ABSENT:$n" "$dir/.inventory"; then rm -f "$PREFIX/$n"; fi
     done
-    if [[ -L "$dir/link" ]]; then
-        ln -sfn "$(readlink "$dir/link")" "$LINK"
-    fi
-    log "Restored saved files; NO service restart was performed"
+    if [[ -L "$dir/link" ]]; then ln -sfn "$(readlink "$dir/link")" "$LINK"
+    elif grep -qx 'ABSENT:link' "$dir/.inventory"; then rm -f "$LINK"; fi
+    log "Snapshot restored: $dir; no running services restarted."
+}
+rollback() {
+    [[ -f "$BACKUPS/.latest" ]] || die "no snapshot"
+    rollback_snapshot "$(cat "$BACKUPS/.latest")"
 }
 prepare() {
     mkdir -p "$STAGES"
