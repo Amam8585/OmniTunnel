@@ -281,7 +281,7 @@ static struct {
     uint64_t queue_full, queue_peak, tun_queue_drops, tun_queue_peak, send_errors, recv_errors, tun_errors;
     uint64_t invalid_packets, flow_evictions, flow_collisions, active_flows;
     uint64_t reordered, reorder_timeouts, alloc_failures, tun_oversized, queue_pressure;
-    uint64_t flow_lookup_calls, flow_lookup_probes;
+    uint64_t flow_lookup_calls, flow_lookup_probes, queue_pauses;
 } metrics;
 static char stats_path[128];
 /* Preserve inner-packet delivery order if nonblocking TUN writes hit EAGAIN.
@@ -292,10 +292,22 @@ typedef struct {
 } tun_pending_t;
 static tun_pending_t *tun_pending;
 static unsigned tun_head, tun_tail, tun_count;
-static int tun_blocked, send_blocked;
+static int tun_blocked, send_blocked, tun_read_paused;
+static void tun_set_readable(int enabled) {
+    int pause = !enabled;
+    if (tun_read_paused == pause) return;
+    struct epoll_event ev = {
+        .events = (enabled ? EPOLLIN : 0) | (tun_blocked ? EPOLLOUT : 0)
+    };
+    ev.data.fd = tun_fd;
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, tun_fd, &ev) == 0)
+        tun_read_paused = pause;
+    else
+        metrics.tun_errors++;
+}
 static void tun_set_writable(int enabled) {
     if (tun_blocked == enabled) return;
-    struct epoll_event ev = { .events = EPOLLIN | (enabled ? EPOLLOUT : 0) };
+    struct epoll_event ev = { .events = (tun_read_paused ? 0 : EPOLLIN) | (enabled ? EPOLLOUT : 0) };
     ev.data.fd = tun_fd;
     if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, tun_fd, &ev) == 0)
         tun_blocked = enabled;
@@ -760,6 +772,8 @@ static void send_flush(void) {
         sq_count--;
     }
     send_set_writable(0);
+    if (tun_read_paused && sq_count <= QUEUE_HIGH_WATER / 2)
+        tun_set_readable(1);
 }
 
 static int tun_create(const char *dev, int mtu_) {
@@ -1019,7 +1033,12 @@ int tun_main_icmp(int argc, char **argv) {
         for (int i = 0; i < nfds; i++) {
             if (events[i].data.fd == tun_fd) {
                 if (events[i].events & EPOLLOUT) tun_drain();
-                for (int batch = 0; batch < IO_BATCH; ++batch) {
+                for (int batch = 0; batch < IO_BATCH && (events[i].events & EPOLLIN) && !tun_read_paused; ++batch) {
+                    if (sq_count >= QUEUE_HIGH_WATER && send_blocked) {
+                        metrics.queue_pauses++;
+                        tun_set_readable(0);
+                        break;
+                    }
                     ssize_t n = read(tun_fd, tun_raw, sizeof(tun_raw));
                     if (n < 0) {
                         if (errno != EAGAIN) { metrics.tun_errors++; DBG("tun read error: %s\n", strerror(errno)); }
@@ -1037,7 +1056,7 @@ int tun_main_icmp(int argc, char **argv) {
                     }
                     if (sq_count >= QUEUE_SIZE) {
                         metrics.queue_full++;
-                        if (send_blocked) break; /* epoll wait for EPOLLOUT */
+                        if (send_blocked) { metrics.queue_pauses++; tun_set_readable(0); break; }
                         continue;
                     }
 
@@ -1060,6 +1079,11 @@ int tun_main_icmp(int argc, char **argv) {
                         DBG("DBG queued for send, sq_count=%d dest=%s\n", sq_count, inet_ntoa(slot->dest.sin_addr));
                     } else {
                         metrics.tun_oversized++;
+                    }
+                    if (sq_count >= QUEUE_HIGH_WATER && send_blocked) {
+                        metrics.queue_pauses++;
+                        tun_set_readable(0);
+                        break;
                     }
                 }
                 send_flush(); /* bound queueing delay: do not wait for unlimited TUN drain */
