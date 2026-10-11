@@ -1257,7 +1257,20 @@ cmd_server_token() {
     # die "already exists" on every retry - so the foreign could never be set up.
     # Replace it, then verify the unit actually came up and roll back if it did
     # not, so the token stays retryable.
-    inst_exists "$name" && { warn "instance '$name' already exists - replacing it"; inst_remove "$name" >/dev/null 2>&1 || true; }
+    # Never destroy or restart an existing instance just because an old token
+    # was pasted again. An exact active match is idempotent; any mismatch is
+    # rejected until the operator schedules a deliberate migration.
+    if inst_exists "$name"; then
+        load_inst "$name"
+        if [[ "$TYPE" == "$t" && "$ROLE" == server && "$LOCAL_IP" == "$fhost" &&
+              "$PEER_IP" == "$mylip" && "$PORT" == "$port" && "$KEY" == "$key" &&
+              "$TUN_ADDR" == "$pta" && "$PEER_ADDR" == "$ppa" ]] &&
+              inst_running "$name"; then
+            ok "peer instance '$name' already active (no restart)"
+            return 0
+        fi
+        die "peer instance '$name' exists but differs or is stopped; not replacing or restarting users automatically"
+    fi
     create_inst "$name" "$t" server "$fhost" "$mylip" "$port" "$key" "$pta" "$ppa" "$shape" "$nc" "$pmode"
     inst_enable "$name"
     if ! inst_running "$name"; then
