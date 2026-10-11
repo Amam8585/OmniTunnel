@@ -78,7 +78,8 @@ active_units() {
         exe="$(readlink "$proc" 2>/dev/null || true)"
         case "$exe" in
             "$BIN_DIR/omnitun"|"$BIN_DIR/icmptun"|"$PREFIX/"*|/usr/local/bin/omnitun|/usr/local/bin/icmptun)
-                printf 'PID:%s [%s]\n' "${proc#/proc/}" "$exe";;
+                local pid="${proc#/proc/}"
+                printf 'PID:%s [%s]\n' "${pid%/exe}" "$exe";;
         esac
     done
 }
