@@ -91,6 +91,8 @@ int main(void) {
     assert(ws_accept("dGhlIHNhbXBsZSBub25jZQ==",accept)==0);
     assert(strcmp(accept,"s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")==0);
     assert(ws_accept("not-24-bytes",accept)!=0);
+    assert(ws_has_token("HTTP/1.1 101 Switching Protocols\r\nConnection: keep-alive, UpGrAdE\r\n\r\n","Connection","Upgrade"));
+    assert(!ws_has_token("HTTP/1.1 101 Switching Protocols\r\nConnection: NotUpgrade\r\n\r\n","Connection","Upgrade"));
     test_upgrade();
     test_frames();
     puts("PASS: RFC6455 Accept verification, client/server handshake, masked frames, fragmentation rejection, 64-bit validation and Pong");
