@@ -148,10 +148,14 @@ static int decapsulate(const unsigned char *buf, int len,
        IHL field rather than assuming a fixed 20 bytes. */
     if (len < (int)sizeof(struct iphdr)) return -1;
     const struct iphdr *iph = (const struct iphdr*)buf;
+    if (iph->version != 4 || iph->protocol != IPPROTO_ICMP) return -1;
     int ip_hlen = iph->ihl * 4;
     if (ip_hlen < 20 || len < ip_hlen + (int)sizeof(struct icmphdr)) return -1;
     buf += ip_hlen;
     len -= ip_hlen;
+    /* Reject ICMP frames with a corrupt checksum rather than trusting the
+       raw socket to enforce it. No wire header bytes or cipher are changed. */
+    if (cksum(buf, len) != 0) return -1;
     const struct icmphdr *icmp = (const struct icmphdr*)buf;
     /* Client expects genuine Echo Reply (type 0) from the server, tagged
        with the server's own id; server expects genuine Echo Request
@@ -1090,6 +1094,15 @@ int tun_main_icmp(int argc, char **argv) {
     close(tun_fd); close(icmp_fd); close(epoll_fd);
     free(send_queue);
     free(tun_pending);
+    /* Reclaim any outstanding out-of-order packet buffers before freeing
+       the flow table (important for sanitizer/long-lived subprocess tests). */
+    for (unsigned bucket = 0; bucket < flow_bucket_count; bucket++) {
+        for (int way = 0; way < FLOW_TABLE_WAYS; way++) {
+            flow_entry_t *entry = &flow_table[bucket].slots[way];
+            for (int slot = 0; slot < REORDER_WINDOW; slot++)
+                free(entry->rbuf[slot].pkt);
+        }
+    }
     free(flow_table);
     free(timer_heap);
     if (stats_path[0]) unlink(stats_path);
