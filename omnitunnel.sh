@@ -36,18 +36,9 @@ BINLINK="/usr/local/bin/omnitunnel"   # the 'omnitunnel' command (symlink to thi
 # HTTP/3, with salamander obfs + website masquerade).
 HYSTERIA_BIN="${OMNITUN_HYSTERIA_BIN:-/usr/local/bin/hysteria}"
 HY_MASQ_HOST="www.bing.com"
-# chisel (Go, jpillora/chisel) is the single-flow reverse MUX used to collapse
-# many relay->foreign user connections into ONE tunnelled flow (see the mux
-# section). A policed/lossy path shreds many parallel flows on upload but carries
-# one sustained flow fast+stable, so muxing recovers the full rate. Shipped static
-# alongside the core; pulled via raw like the rest.
-CHISEL_BIN="${OMNITUN_CHISEL_BIN:-/usr/local/bin/chisel}"
-CHISEL_VER="1.10.1"
-OMNISTRIPE_BIN="${OMNITUN_STRIPE_BIN:-/usr/local/bin/omnistripe}"
-OMNIACKLESS_BIN="${OMNITUN_ACKLESS_BIN:-/usr/local/bin/omniackless}"
 # where the shipped per-arch binaries live (install.sh drops them here)
 ASSET_DIR="${OMNITUN_ASSETS:-/opt/omnitunnel}"
-RAW_BASE="https://raw.githubusercontent.com/Free-Guy-IR/OmniTunnel/main"
+RAW_BASE="https://raw.githubusercontent.com/Amam8585/OmniTunnel/main"
 
 # shellcheck disable=SC2034
 C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'; C_ITAL=$'\033[3m'
@@ -149,27 +140,6 @@ ensure_hysteria() {
 }
 
 # locate this box's chisel binary (shipped in bin/, or downloadable)
-chisel_local_bin() {
-    local a="$1" d
-    for d in "$ASSET_DIR/bin" "$SCRIPT_DIR/bin"; do [[ -f "$d/chisel-$a" ]] && { echo "$d/chisel-$a"; return 0; }; done
-    return 1
-}
-# make sure /usr/local/bin/chisel exists for this CPU (ship-first, download-fallback)
-ensure_chisel() {
-    [[ -x "$CHISEL_BIN" ]] && return 0
-    local a; a="$(arch_tag)"; [[ "$a" == unknown ]] && die "unsupported CPU: $(uname -m)"
-    local cand; cand="$(chisel_local_bin "$a" || true)"
-    if [[ -z "$cand" ]]; then
-        info "  fetching chisel mux core for $a ..."
-        mkdir -p "$ASSET_DIR/bin"
-        curl -fsSL "https://github.com/jpillora/chisel/releases/download/v$CHISEL_VER/chisel_${CHISEL_VER}_linux_$a.gz" \
-            | gzip -d > "$ASSET_DIR/bin/chisel-$a" 2>/dev/null \
-            || die "could not obtain chisel-$a (no shipped copy and download failed)"
-        chmod +x "$ASSET_DIR/bin/chisel-$a"; cand="$ASSET_DIR/bin/chisel-$a"
-    fi
-    install -m 0755 "$cand" "$CHISEL_BIN"
-}
-
 omnistripe_local_bin() {
     local a="$1" d
     for d in "$ASSET_DIR/bin" "$SCRIPT_DIR/bin"; do [[ -f "$d/omnistripe-$a" ]] && { echo "$d/omnistripe-$a"; return 0; }; done
@@ -209,7 +179,7 @@ ensure_omniackless() {
 }
 
 # ------------------------------------------------------------ type registry ---
-ALL_TYPES="gre icmp udp mux ws hysteria tcp fou vxlan reverse-mux stripe ackless"
+ALL_TYPES="gre icmp udp mux ws hysteria tcp fou vxlan stripe ackless"
 type_desc() {
     case "$1" in
         gre)      echo "IP-over-GRE  (kernel; often unpoliced & full line-rate)";;
@@ -221,16 +191,12 @@ type_desc() {
         tcp)      echo "single TCP AEAD  (looks like one HTTPS connection)";;
         fou)      echo "GRE-in-UDP  (kernel; GRE hidden inside plain UDP on its port)";;
         vxlan)    echo "VXLAN L2-over-UDP  (kernel; Ethernet inside UDP)";;
-        reverse-mux) echo "ICMP-reply + single-flow MUX  (Iran->foreign relay: beats policed multi-flow UPLOAD)";;
         stripe)   echo "connection-striping TCP  (shards one flow across fresh short-lived conns; beats per-5-tuple byte caps)";;
         ackless)  echo "ACK-less TCP carrier  (single flow of flags=0 raw TCP; dodges per-5-tuple packet caps)";;
         *) echo "";;
     esac
 }
-# gre/icmp/fou/vxlan are kernel/plaintext carriers - no PSK; reverse-mux rides icmp (no PSK either)
-type_uses_key() { [[ "$1" != icmp && "$1" != gre && "$1" != fou && "$1" != vxlan && "$1" != reverse-mux ]]; }
-# reverse-mux is icmp(reply)-under-the-hood + a chisel single-flow MUX layer
-type_is_revmux() { [[ "$1" == reverse-mux ]]; }
+type_uses_key() { [[ "$1" != icmp && "$1" != gre && "$1" != fou && "$1" != vxlan ]]; }
 # native kernel tunnels - no compiled core binary involved
 type_is_kernel() { [[ "$1" == gre || "$1" == fou || "$1" == vxlan ]]; }
 # Starting port for auto-allocation. udp/fou/vxlan carry REAL UDP, so keep them
@@ -371,9 +337,7 @@ load_inst() {
 # create NAME TYPE ROLE LOCAL PEER PORT KEY TUN_ADDR PEER_ADDR [SHAPE] [NCONN]
 create_inst() {
     local n="$1" t="$2" role="$3" lip="$4" pip="$5" port="$6" key="$7" ta="$8" pa="$9" shape="${10:-none}" nc="${11:-16}" imode="${12:-}" pcount="${13:-400}"
-    # reverse-mux IS icmp with the reply-type forced (its whole point is the
-    # reply-gated dodge), so default its ICMP_MODE to reply if unset.
-    [[ "$t" == reverse-mux && -z "$imode" ]] && imode=reply
+    case "$t" in gre|icmp|udp|mux|ws|hysteria|tcp|fou|vxlan|stripe|ackless) :;; *) die "unsupported Direct type: $t";; esac
     validate_inst_name "$n"
     local dev="ts-$n"; [[ ${#dev} -gt 15 ]] && dev="ts$(printf '%s' "$n" | cksum | tr -dc '0-9' | cut -c1-8)"
     mkdir -p "$(inst_path "$n")"; : > "$(inst_pf "$n")"
@@ -433,9 +397,6 @@ build_execstart() {
         mux)  echo "$TSUITE_BIN mux -L $LOCAL_IP -R $PEER_IP -A $TUN_ADDR -P $PEER_ADDR -p $PORT -k $KEY$sflag -N $NCONN -T $DEV -M $MTU";;
         ws)   echo "$TSUITE_BIN ws -L $LOCAL_IP -R $PEER_IP -A $TUN_ADDR -P $PEER_ADDR -p $PORT -k $KEY$sflag -N $NCONN -T $DEV -M $MTU";;
         icmp) echo "$TSUITE_BIN icmp -L $LOCAL_IP -R $PEER_IP -A $TUN_ADDR -P $PEER_ADDR -I 4d54 -T $DEV -M $MTU$sflag${ICMP_MODE:+ -r $ICMP_MODE}";;
-        # reverse-mux rides the icmp engine with the reply type forced; the chisel
-        # MUX layer lives in separate units (mux-add / mux-token), not here.
-        reverse-mux) echo "$TSUITE_BIN icmp -L $LOCAL_IP -R $PEER_IP -A $TUN_ADDR -P $PEER_ADDR -I 4d54 -T $DEV -M $MTU$sflag -r ${ICMP_MODE:-reply}";;
         stripe) echo "$OMNISTRIPE_BIN -L $LOCAL_IP -R $PEER_IP -A $TUN_ADDR -P $PEER_ADDR -k $KEY -p $PORT -C ${PCOUNT:-400} -N $NCONN -T $DEV -M $MTU$sflag";;
         ackless) echo "$OMNIACKLESS_BIN -L $LOCAL_IP -R $PEER_IP -A $TUN_ADDR -P $PEER_ADDR -k $KEY -p $PORT -T $DEV -M $MTU$sflag";;
     esac
@@ -603,7 +564,7 @@ Wants=$(svc_name "$1")
 [Service]
 Type=simple
 ExecStart=/usr/bin/env python3 $HY_RELAY 0.0.0.0 $port 127.0.0.1 $socksport 127.0.0.1 $port
-Restart=always
+Restart=on-failure
 RestartSec=2
 
 [Install]
@@ -697,8 +658,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart=$HYSTERIA_BIN $mode -c $(inst_path "$1")/hy.yaml
-Restart=always
-RestartSec=3
+Restart=on-failure
+RestartSec=8
 LimitNOFILE=1048576
 
 [Install]
@@ -739,8 +700,8 @@ ExecStartPre=-/sbin/ip link del $DEV
 ExecStartPre=-$SCRIPT_PATH _prefwd
 ExecStart=$(build_execstart)
 ExecStartPost=$SCRIPT_PATH _postup $1
-Restart=always
-RestartSec=3
+Restart=on-failure
+RestartSec=8
 TimeoutStopSec=5
 LimitNOFILE=1048576
 
@@ -901,177 +862,6 @@ pf_flush_chain() {
     iptables -t nat -D POSTROUTING -o "$DEV" -j MASQUERADE 2>/dev/null || true
 }
 
-# ------------------------------------------------------------- mux (chisel) ---
-# A "muxed" forward funnels ALL of a relay's user connections for a public port
-# into ONE persistent flow (a chisel reverse tunnel) over the instance's tun link,
-# then out to a destination reachable from the foreign. Why: a policed/lossy
-# relay->foreign path shreds many parallel connections on upload (they collapse to
-# a few Mbit) but carries a single sustained flow fast+stable (near line-rate), so
-# collapsing everything into one flow recovers the full rate. The RELAY (this box)
-# runs the chisel SERVER bound to its OWN tun IP (reachable only over the tunnel,
-# never public); the FOREIGN runs the chisel CLIENT that opens one reverse listener
-# per mapping ON THE RELAY and forwards each to its <dest>. All forwards on an
-# instance share one server + one client = one flow.
-mux_conf() { echo "$INST_DIR/$1/mux.conf"; }        # lines: <pub_port>:<dest_host>:<dest_port>
-mux_svc()  { echo "omnitun-$1-mux.service"; }
-# deterministic control port from the instance subnet (10.201.<X>.y -> 9000+X);
-# bound to the tun IP so it is reachable only through the tunnel, never publicly.
-mux_ctrl_port() { load_inst "$1"; local x; x=$(echo "$TUN_ADDR" | grep -oE '10\.201\.[0-9]+' | grep -oE '[0-9]+$' || true); [[ "$x" =~ ^[0-9]+$ ]] || x=0; echo $(( 9000 + x )); }
-# base64 token carrying the relay tun IP + ctrl port + the full mapping set, for
-# the no-SSH path (paste on the foreign). Rebuilt from mux.conf each call.
-mux_token() {
-    load_inst "$1"; local ctrl; ctrl="$(mux_ctrl_port "$1")"
-    { printf 'MUX1|%s|%s|%s\n' "$1" "$TUN_ADDR" "$ctrl"; cat "$(mux_conf "$1")" 2>/dev/null; } | base64 | tr -d '\n'
-}
-# (re)write + (re)start the relay-side chisel SERVER for an instance; bounce it
-# only when its command actually changed (mappings live on the client, so adding
-# one never bounces the server). Torn down when no mappings remain.
-mux_relay_reconcile() {
-    load_inst "$1"; local mc u; mc="$(mux_conf "$1")"; u="$(mux_svc "$1")"
-    if [[ ! -s "$mc" ]]; then
-        systemctl disable --now "$u" >/dev/null 2>&1 || true
-        rm -f "/etc/systemd/system/$u"; systemctl reset-failed "$u" 2>/dev/null || true
-        systemctl daemon-reload 2>/dev/null || true; return 0
-    fi
-    ensure_chisel
-    local ctrl; ctrl="$(mux_ctrl_port "$1")"
-    local new="/etc/systemd/system/$u.new"
-    cat > "$new" <<EOF
-[Unit]
-Description=OmniTunnel chisel mux server $1 (relay)
-After=network-online.target $(svc_name "$1")
-Wants=$(svc_name "$1")
-
-[Service]
-Type=simple
-ExecStart=$CHISEL_BIN server --reverse --host $TUN_ADDR --port $ctrl
-Restart=always
-RestartSec=3
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    if ! cmp -s "$new" "/etc/systemd/system/$u" 2>/dev/null; then
-        mv "$new" "/etc/systemd/system/$u"; systemctl daemon-reload
-        systemctl enable "$u" >/dev/null 2>&1 || true
-        systemctl restart "$u" >/dev/null 2>&1 || true
-    else
-        rm -f "$new"
-        systemctl is-active --quiet "$u" || { systemctl enable "$u" >/dev/null 2>&1 || true; systemctl start "$u" >/dev/null 2>&1 || true; }
-    fi
-    return 0
-}
-# foreign side: (re)write + (re)start the chisel CLIENT dialing the relay tun IP,
-# one reverse listener per mapping forwarding to its <dest>. Rebuilt wholesale from
-# the mapping set (idempotent).
-mux_client_apply() {
-    local inst="$1" relay_ip="$2" ctrl="$3"; shift 3
-    ensure_chisel
-    local args=() m ph dh dp
-    for m in "$@"; do
-        IFS=: read -r ph dh dp <<< "$m"
-        [[ "$ph" =~ ^[0-9]+$ && -n "$dh" && "$dp" =~ ^[0-9]+$ ]] || continue
-        args+=("R:0.0.0.0:$ph:$dh:$dp")
-    done
-    [[ ${#args[@]} -gt 0 ]] || die "no valid mux mappings"
-    local u; u="$(mux_svc "$inst")"
-    cat > "/etc/systemd/system/$u" <<EOF
-[Unit]
-Description=OmniTunnel chisel mux client $inst (foreign)
-After=network-online.target $(svc_name "$inst")
-Wants=$(svc_name "$inst")
-
-[Service]
-Type=simple
-ExecStart=$CHISEL_BIN client --keepalive 25s http://$relay_ip:$ctrl ${args[*]}
-Restart=always
-RestartSec=3
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    systemctl daemon-reload; systemctl enable "$u" >/dev/null 2>&1 || true
-    systemctl restart "$u" >/dev/null 2>&1 || true
-}
-# tear down the mux service (either side) for an instance
-mux_remove() {
-    local u; u="$(mux_svc "$1")"
-    [[ -e "/etc/systemd/system/$u" ]] || return 0
-    systemctl disable --now "$u" >/dev/null 2>&1 || true
-    rm -f "/etc/systemd/system/$u"; systemctl reset-failed "$u" 2>/dev/null || true
-    systemctl daemon-reload 2>/dev/null || true
-}
-# push the current mapping set to the foreign: auto over SSH if we can log in,
-# else print the token to paste there.
-_mux_push_foreign() {
-    local inst="$1" fhost="$2" tok; tok="$(mux_token "$inst")"
-    _peer_creds "$fhost"
-    if [[ -n "${PEER_PASS:-}" ]] && peer_ssh "$fhost" true >/dev/null 2>&1; then
-        if peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh mux-token $tok" >/dev/null 2>&1; then
-            ok "foreign ($fhost) mux client updated automatically"; return 0
-        fi
-        warn "auto-config over SSH failed - finish it on the foreign by hand:"
-    fi
-    echo "${C_BOLD}Run this on the FOREIGN ($fhost) to (re)apply the mux:${C_RESET}"
-    echo "  ${C_CYAN}omnitunnel mux-token $tok${C_RESET}"
-}
-# mux-add <inst> <public_port> <dest_host> <dest_port>
-cmd_mux_add() {
-    need_root; local inst="$1" pub="$2" dh="$3" dp="$4"
-    inst_exists "$inst" || die "no such instance: $inst"
-    pub="$(norm_port "$pub")" || die "public port must be 1-65535"
-    dp="$(norm_port "$dp")" || die "destination port must be 1-65535"
-    [[ -n "$dh" ]] || die "usage: mux-add <inst> <public_port> <dest_host> <dest_port>"
-    load_inst "$inst"
-    [[ "$ROLE" == server ]] && die "run mux-add on the RELAY (client) side of '$inst', not the foreign"
-    local mc t rc; mc="$(mux_conf "$inst")"
-    [[ ! -e "$mc" || -f "$mc" ]] || die "$mc is not a regular file"
-    t="$(mktemp "$mc.XXXXXX" 2>/dev/null)" || die "cannot create a temp file next to $mc"
-    rc=0
-    if [[ -f "$mc" ]]; then grep -v "^0*$pub:" "$mc" > "$t" 2>/dev/null || rc=$?; fi
-    [[ "$rc" -le 1 ]] || { rm -f "$t"; die "could not read $mc (grep exit $rc) - nothing changed"; }
-    printf '%s:%s:%s\n' "$pub" "$dh" "$dp" >> "$t" || { rm -f "$t"; die "could not write $t - nothing changed"; }
-    mv "$t" "$mc" || { rm -f "$t"; die "could not replace $mc - nothing changed"; }
-    mux_relay_reconcile "$inst"
-    ok "relay: public $pub muxed over '$inst' -> foreign $dh:$dp (one flow)"
-    _mux_push_foreign "$inst" "$PEER_IP"
-}
-# mux-del <inst> <public_port>
-cmd_mux_del() {
-    need_root; local inst="$1" pub="$2"
-    inst_exists "$inst" || die "no such instance: $inst"
-    pub="$(norm_port "$pub")" || die "usage: mux-del <inst> <public_port>"
-    load_inst "$inst"
-    local mc; mc="$(mux_conf "$inst")"
-    rewrite_without "$mc" "^0*$pub:" || die "could not rewrite $mc - nothing removed"
-    mux_relay_reconcile "$inst"
-    ok "removed muxed forward $pub from '$inst'"
-    if [[ -s "$mc" ]]; then _mux_push_foreign "$inst" "$PEER_IP"
-    else
-        _peer_creds "$PEER_IP"
-        if [[ -n "${PEER_PASS:-}" ]] && peer_ssh "$PEER_IP" true >/dev/null 2>&1; then
-            peer_ssh "$PEER_IP" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh mux-off '$inst'" >/dev/null 2>&1 || true
-        else echo "  No mappings left. On the FOREIGN run: ${C_CYAN}omnitunnel mux-off $inst${C_RESET}"; fi
-    fi
-}
-# mux-token <token>   (run on the FOREIGN) — bring up / refresh the chisel mux client
-cmd_mux_token() {
-    need_root
-    local dec; dec=$(printf '%s' "$1" | base64 -d 2>/dev/null) || die "invalid mux token"
-    local head; head=$(printf '%s\n' "$dec" | head -1)
-    case "$head" in MUX1\|*) :;; *) die "invalid mux token";; esac
-    local _tag inst relay_ip ctrl; IFS='|' read -r _tag inst relay_ip ctrl <<< "$head"
-    [[ -n "$inst" && -n "$relay_ip" && -n "$ctrl" ]] || die "invalid mux token"
-    local maps=() ln
-    while IFS= read -r ln; do case "$ln" in MUX1\|*|'') :;; *) maps+=("$ln");; esac; done <<< "$dec"
-    [[ ${#maps[@]} -gt 0 ]] || die "mux token has no forwards"
-    mkdir -p "$INST_DIR/$inst"; printf '%s\n' "${maps[@]}" > "$(mux_conf "$inst")"
-    mux_client_apply "$inst" "$relay_ip" "$ctrl" "${maps[@]}"
-    ok "foreign mux client for '$inst' up: $relay_ip:$ctrl  (${#maps[@]} forward(s))"
-}
-# mux-off <inst>   (foreign) — remove the mux client for an instance
-cmd_mux_off() { need_root; mux_remove "$1"; rm -f "$(mux_conf "$1")" 2>/dev/null || true; ok "mux client for '$1' removed"; }
-
 # --------------------------------------------------------------- remove -------
 # Removes ONLY the named instance this tool created. Never touches /etc/icmptun
 # or any interface / unit it did not create.
@@ -1089,7 +879,11 @@ inst_remove() {
     need_root; inst_exists "$1" || { warn "no such instance: $1"; return 0; }
     load_inst "$1"
     type_is_hysteria "$TYPE" && hy_remove_relays "$1"
-    mux_remove "$1"   # tear down any chisel mux server/client for this instance
+    local legacy="omnitun-$1-mux.service"
+    if [[ -f "/etc/systemd/system/$legacy" ]]; then
+        systemctl disable --now "$legacy" >/dev/null 2>&1 || true
+        rm -f "/etc/systemd/system/$legacy"
+    fi
     systemctl disable --now "$(svc_name "$1")" >/dev/null 2>&1 || true
     rm -f "/etc/systemd/system/$(svc_name "$1")"
     systemctl reset-failed "$(svc_name "$1")" 2>/dev/null || true   # no lingering 'not-found failed' ghost
@@ -1386,10 +1180,7 @@ cmd_add_auto() {
     case " $fnames " in *" $kn "*) die "the foreign $fhost already has an instance named '$kn' - choose a different name (each tunnel to a foreign needs a unique name)";; esac
     local imode="${OMNITUN_ICMP_MODE:-}" pmode="${OMNITUN_ICMP_MODE_PEER:-}"
     local m; for m in "$imode" "$pmode"; do [[ -z "$m" || "$m" == reply || "$m" == request ]] || die "icmp mode must be reply|request (got '$m')"; done
-    [[ "$t" == icmp ]] || type_is_revmux "$t" || { imode=""; pmode=""; }
-    if type_is_revmux "$t" && [[ "$imode" == request || "$pmode" == request ]]; then
-        warn "reverse-mux asked to emit echo-request; that gives up its reply-gated dodge"
-    fi
+    [[ "$t" == icmp ]] || { imode=""; pmode=""; }
     local sub port key ta pa afd
     mkdir -p "$INST_DIR" 2>/dev/null || true
     exec {afd}>"$INST_DIR/.alloc.lock" || die "cannot open allocation lock $INST_DIR/.alloc.lock"
@@ -1422,10 +1213,7 @@ cmd_add_manual() {
     # (OMNITUN_ICMP_MODE_PEER), for paths that drop one echo type in one direction.
     local imode="${OMNITUN_ICMP_MODE:-}" pmode="${OMNITUN_ICMP_MODE_PEER:-}"
     local m; for m in "$imode" "$pmode"; do [[ -z "$m" || "$m" == reply || "$m" == request ]] || die "icmp mode must be reply|request (got '$m')"; done
-    [[ "$t" == icmp ]] || type_is_revmux "$t" || { imode=""; pmode=""; }
-    if type_is_revmux "$t" && [[ "$imode" == request || "$pmode" == request ]]; then
-        warn "reverse-mux asked to emit echo-request; that gives up its reply-gated dodge"
-    fi
+    [[ "$t" == icmp ]] || { imode=""; pmode=""; }
     local sub port key ta pa
     alloc_and_create "$kn" "$t" client "$mylip" "$fhost" "$shape" "$nc" "$imode" "$want_port"
     sub="$ALLOC_SUB"; port="$ALLOC_PORT"; key="$ALLOC_KEY"; ta="10.201.$sub.1"; pa="10.201.$sub.2"
@@ -1506,16 +1294,7 @@ wizard_add() {
     provision_peer "$fhost" "$kn" "$t" "$fhost" "$mylip" "$port" "$key" "$pa" "$ta" "$shape" "$nc"
     create_inst "$kn" "$t" client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" "$shape" "$nc"
     inst_enable "$kn"; ok "instance '$kn' ($t) is up on both sides.  (subnet 10.201.$sub.0/24, port/key $port)"
-    if type_is_revmux "$t"; then
-        echo; info "reverse-mux carries user traffic over ONE muxed flow. Add its first forward now"
-        info "(a public port on THIS relay -> a destination the FOREIGN can reach, e.g. its local proxy):"
-        local rp rdh rdp
-        read -erp "  Public port on this relay [443]: " rp; rp="${rp:-443}"
-        read -erp "  Destination host from the foreign [127.0.0.1]: " rdh; rdh="${rdh:-127.0.0.1}"
-        read -erp "  Destination port [443]: " rdp; rdp="${rdp:-443}"
-        cmd_mux_add "$kn" "$rp" "$rdh" "$rdp"
-        info "add more later with:  ${C_CYAN}omnitunnel mux-add $kn <pubport> <dsthost> <dstport>${C_RESET}"
-    fi
+
 }
 
 # Manual add: brings up the near side and prints a token to paste on the
@@ -1698,32 +1477,6 @@ bench_run() {
             peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _remove '$name'" >/dev/null 2>&1 || true
             continue
         fi
-        # reverse-mux: icmp(reply) tunnel + chisel single-flow MUX. Measured THROUGH
-        # the mux public port (bench port -> foreign iperf 5599), so the row shows
-        # the muxed throughput - the whole point is that this holds up under the
-        # -P 8 parallelism where a raw icmp upload collapses on a policed path.
-        if type_is_revmux "$t"; then
-            local bport=$((20000 + sub))
-            peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _peercreate '$name' reverse-mux server '$fhost' '$mylip' '$port' '' '$pa' '$ta' none '$nc' reply" >/dev/null 2>&1
-            create_inst "$name" reverse-mux client "$mylip" "$fhost" "$port" "" "$ta" "$pa" none "$nc" reply
-            inst_enable "$name" >/dev/null 2>&1; sleep 6
-            local rout rloss rrtt
-            rout=$(ping -c5 -W2 "$pa" 2>/dev/null || true)
-            rrtt=$(echo "$rout" | awk -F'/' '/rtt|round-trip/{print $5}')
-            rloss=$(echo "$rout" | grep -oE '[0-9]+% packet loss' | grep -oE '^[0-9]+')
-            echo "$bport:127.0.0.1:5599" > "$(mux_conf "$name")"
-            mux_relay_reconcile "$name" >/dev/null 2>&1
-            peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh mux-token $(mux_token "$name")" >/dev/null 2>&1
-            sleep 4
-            local rdl rul
-            rdl=$(timeout 25 iperf3 -c 127.0.0.1 -p "$bport" -t 12 -O 4 -P 8 -R 2>/dev/null | grep -oE '[0-9.]+ [KMG]bits/sec +receiver' | tail -1 | awk '{print $1" "$2}')
-            rul=$(timeout 25 iperf3 -c 127.0.0.1 -p "$bport" -t 12 -O 4 -P 8    2>/dev/null | grep -oE '[0-9.]+ [KMG]bits/sec +receiver' | tail -1 | awk '{print $1" "$2}')
-            rows+=("$t|${rdl:-FAIL}|${rul:-FAIL}|${rloss:-100}%|${rrtt:-n/a}")
-            echo "${rdl:-FAIL} / up ${rul:-FAIL} (muxed)"
-            inst_remove "$name" >/dev/null 2>&1
-            peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh mux-off '$name'; OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _remove '$name'" >/dev/null 2>&1 || true
-            continue
-        fi
         peer_ssh "$fhost" "OMNITUN_ASSETS=/opt/omnitunnel /opt/omnitunnel/omnitunnel.sh _peercreate '$name' '$t' server '$fhost' '$mylip' '$port' '$key' '$pa' '$ta' '$shape' '$nc'" >/dev/null 2>&1
         create_inst "$name" "$t" client "$mylip" "$fhost" "$port" "$key" "$ta" "$pa" "$shape" "$nc"
         inst_enable "$name" >/dev/null 2>&1; sleep 6
@@ -1810,7 +1563,7 @@ cmd_bench_manual() {
     local rows=() i=0 t
     set +e   # best-effort measurement (see bench_run): never abort mid-run
     for t in $ALL_TYPES; do
-        { type_is_hysteria "$t" || type_is_revmux "$t"; } && { i=$((i+1)); continue; }  # manual bench (fixed keys) skips hysteria; use auto bench for it
+        type_is_hysteria "$t" && { i=$((i+1)); continue; }  # manual bench (fixed keys) skips hysteria; use auto bench for it
         local name="bench-$t" sub=$((100+i)) port=$((51900+i)) key; key=$(_bench_key_for "$t")
         local ta="10.201.$sub.1" pa="10.201.$sub.2"
         echo -n "  $t ... "
@@ -1834,7 +1587,7 @@ cmd_bench_manual() {
     printf '  %bKeep one as a permanent instance?%b %b(sets up its own fresh token)%b ' "$C_BGRN" "$C_RESET" "$C_GREY" "$C_RESET"
     local ci=1 ch keep
     for t in $ALL_TYPES; do
-        if type_is_hysteria "$t" || type_is_revmux "$t"; then
+        if type_is_hysteria "$t"; then
             printf "  %2d) %-12s %s\n" "$ci" "$t" "not measured above - use the SSH benchmark for it"
         else
             printf "  %2d) %-12s %s\n" "$ci" "$t" "$(type_desc "$t")"
@@ -1866,7 +1619,7 @@ cmd_bench_server() {
     local i=0 t
     set +e   # best-effort bring-up: don't abort if one type fails to come up
     for t in $ALL_TYPES; do
-        { type_is_hysteria "$t" || type_is_revmux "$t"; } && { i=$((i+1)); continue; }  # manual bench skips hysteria (fixed-key token path)
+        type_is_hysteria "$t" && { i=$((i+1)); continue; }  # manual bench skips hysteria (fixed-key token path)
         local name="bench-$t" sub=$((100+i)) port=$((51900+i)) key; key=$(_bench_key_for "$t")
         local ta="10.201.$sub.1" pa="10.201.$sub.2"
         inst_exists "$name" && inst_remove "$name" >/dev/null 2>&1
@@ -1905,8 +1658,9 @@ cmd_update() {
         warn "(run the installer on a box that can reach GitHub, or copy them over)."
         return 1
     fi
-    bash "$tmp"; local rc=$?; rm -f "$tmp"
+    bash "$tmp" --update; local rc=$?; rm -f "$tmp"
     [[ $rc -eq 0 ]] || { warn "update failed"; return 1; }
+    info "Update staged; activate explicitly with install.sh --apply."
     return 0
 }
 
@@ -2005,14 +1759,10 @@ pick_proto() {
 # List instance $1's forwarded ports by number; set PORT_PICK to the chosen one.
 pick_fwd_port() {
     PORT_PICK=""; PORT_KIND=""; local pf mc p dh dp ports=() kinds=() labels=() seen=" " i=1 x ch
-    pf="$(inst_pf "$1")"; mc="$(mux_conf "$1")"
+    pf="$(inst_pf "$1")"; mc=""
     if [[ -s "$pf" ]]; then
         while IFS=: read -r _ p; do [[ -z "$p" || "$seen" == *" $p "* ]] && continue
             seen+="$p "; ports+=("$p"); kinds+=(pf); labels+=("port $p"); done < "$pf"
-    fi
-    if [[ -s "$mc" ]]; then
-        while IFS=: read -r p dh dp; do [[ -z "$p" ]] && continue
-            ports+=("$p"); kinds+=(mux); labels+=("port $p  (muxed -> $dh:$dp)"); done < "$mc"
     fi
     [[ ${#ports[@]} -eq 0 ]] && { warn "this tunnel has no forwards"; return 1; }
     printf '  %bwhich forward to remove:%b\n' "$C_DIM" "$C_RESET"
@@ -2033,12 +1783,10 @@ banner() {
     _state_counts
     local fwd=0 n c m pf mc
     for n in $(list_instances); do
-        pf="$(inst_pf "$n")"; mc="$(mux_conf "$n")"; c=0; m=0
+        pf="$(inst_pf "$n")"; c=0; m=0
         [[ -s "$pf" ]] && c=$(grep -c . "$pf" 2>/dev/null || true)
-        [[ -s "$mc" ]] && m=$(grep -c . "$mc" 2>/dev/null || true)
         [[ "$c" =~ ^[0-9]+$ ]] || c=0
-        [[ "$m" =~ ^[0-9]+$ ]] || m=0
-        fwd=$((fwd+c+m))
+        fwd=$((fwd+c))
     done
     if [[ -n "$crumb" ]]; then
         local right; right="${myip:-?} · $(arch_tag)"
@@ -2064,10 +1812,10 @@ banner() {
   █████ █   █ █   █ █████   █   █████ █   █ █   █ █████ █████
 EOF
     printf '%b' "$C_RESET"
-    printf '  %bMulti-protocol obfuscated tunnel suite%b\n\n' "$C_WHITE" "$C_RESET"
+    printf '  %bOmniTunnel Direct Manager%b\n\n' "$C_WHITE" "$C_RESET"
     kv "Script Version:" "$VERSION"
     kv "Core Version:" "$("$TSUITE_BIN" version 2>/dev/null || echo 'not installed')"
-    kv "Source:" "github.com/Free-Guy-IR/OmniTunnel"
+    kv "Source:" "github.com/Amam8585/OmniTunnel"
     rule_amber
     kv "IP Address:" "${myip:-unknown}"
     kv "Architecture:" "$(arch_tag)"
@@ -2111,7 +1859,7 @@ bench_table() {
         IFS='|' read -r t dl ul ls pg <<< "$r"; v="$(_mbit "$dl")"
         sorted+=("$(printf '%012.3f|%s' "$v" "$r")")
         if _gt "$v" "$max"; then max="$v"; fi
-        case "$t" in udp|tcp|mux|ws|hysteria|fou|icmp|reverse-mux) if _gt "$v" "$sv"; then sv="$v"; stealth="$t"; fi;; esac
+        case "$t" in udp|tcp|mux|ws|hysteria|fou|icmp) if _gt "$v" "$sv"; then sv="$v"; stealth="$t"; fi;; esac
     done
     local OIFS="$IFS"; IFS=$'\n'; sorted=($(printf '%s\n' "${sorted[@]}" | sort -r)); IFS="$OIFS"
     echo
@@ -2173,7 +1921,7 @@ menu_pf() {
         heading "a port hit on this box is tunneled to the far side"
         local n pf mc any=0
         for n in $(list_instances); do
-            pf="$(inst_pf "$n")"; mc="$(mux_conf "$n")"; any=1
+            pf="$(inst_pf "$n")"; any=1
             printf '  %b%s%b %b%s%b\n' "$C_MAG" "$G_V" "$C_RESET" "$C_BOLD$C_WHITE" "$n" "$C_RESET"
             local shown=0
             if [[ -s "$pf" ]]; then
@@ -2181,13 +1929,6 @@ menu_pf() {
                 while IFS=: read -r proto port; do [[ -z "$proto" ]] && continue
                     shown=1
                     printf '       %b%s%b %b%-4s%b %s\n' "$C_GREEN" "$G_ARROW" "$C_RESET" "$C_CYAN" "$proto" "$C_RESET" "$port"; done < "$pf"
-            fi
-            if [[ -s "$mc" ]]; then
-                local mp mdh mdp
-                while IFS=: read -r mp mdh mdp; do [[ -z "$mp" ]] && continue
-                    shown=1
-                    printf '       %b%s%b %b%-4s%b %s %b-> %s:%s%b\n' "$C_GREEN" "$G_ARROW" "$C_RESET" \
-                        "$C_BMAG" "mux" "$C_RESET" "$mp" "$C_GREY" "$mdh" "$mdp" "$C_RESET"; done < "$mc"
             fi
             [[ "$shown" == 0 ]] && printf '       %b(no forwards)%b\n' "$C_DIM" "$C_RESET"
         done
@@ -2207,7 +1948,7 @@ menu_pf() {
                fi; pause;;
             2) if pick_instance; then n="$PICK"
                  if pick_fwd_port "$n"; then
-                     if [[ "$PORT_KIND" == mux ]]; then cmd_mux_del "$n" "$PORT_PICK"; else pf_del "$n" "$PORT_PICK"; fi
+                     pf_del "$n" "$PORT_PICK"
                  fi
                fi; pause;;
             0) return;;
@@ -2221,7 +1962,7 @@ menu_main() {
         echo
         nitem 1 "Benchmark all tunnels & pick the best" "$C_BGRN$C_BOLD"
         nitem 2 "Benchmark - manual (no SSH)"           "$C_BCYN$C_BOLD"
-        nitem 3 "Manage tunnels"                        "$C_BLUE$C_BOLD"
+        nitem 3 "Manage Direct tunnels"                        "$C_BLUE$C_BOLD"
         nitem 4 "Port forwarding"
         nitem 5 "Status of everything"
         nitem 6 "Update OmniTunnel"
@@ -2238,7 +1979,7 @@ menu_main() {
             5) banner "Status of everything"; echo; inst_header; rule; local a5=0
                for n in $(list_instances); do inst_status "$n" full; a5=1; done
                [[ "$a5" == 0 ]] && printf '  %b%s no tunnels%b\n' "$C_GREY" "$G_DOT_OFF" "$C_RESET"; pause;;
-            6) if cmd_update; then ok "Reloading the updated manager..."; sleep 1; exec "$SCRIPT_PATH" menu; else pause; fi;;
+            6) cmd_update; pause;;
             7) cmd_uninstall; pause;;
             0) exit 0;;
         esac
@@ -2267,10 +2008,6 @@ case "${1:-menu}" in
     _remove)          need_root; inst_remove "${2:?instance}";;
     pf-add)           pf_add "${2:?}" "${3:?}" "${4:?}";;
     pf-del)           pf_del "${2:?}" "${3:?}";;
-    mux-add)          shift; cmd_mux_add "$@";;
-    mux-del)          shift; cmd_mux_del "$@";;
-    mux-token)        need_root; cmd_mux_token "${2:?token}";;
-    mux-off)          need_root; cmd_mux_off "${2:?instance}";;
     _postup)          cmd_postup "${2:?}";;
     _prefwd)          cmd_prefwd;;
     _peercreate)      shift; cmd_peercreate "$@";;
@@ -2294,5 +2031,5 @@ case "${1:-menu}" in
     update|upgrade)   need_root; cmd_update;;
     uninstall|purge)  need_root; cmd_uninstall;;
     version|-v|--version) echo "tunnelctl $VERSION (core: $($TSUITE_BIN version 2>/dev/null || echo n/a))";;
-    *) echo "usage: $0 [menu|bench|add|list|status <n>|enable <n>|remove <n>|pf-add <n> <proto> <port>|pf-del <n> <port>|mux-add <n> <pubport> <dsthost> <dstport>|mux-del <n> <pubport>|mux-token <tok>|fix-forwarding|update|uninstall]";;
+    *) echo "usage: $0 [menu|bench|add|list|status <n>|enable <n>|remove <n>|pf-add <n> <proto> <port>|pf-del <n> <port>|fix-forwarding|update|uninstall]";;
 esac
