@@ -19,7 +19,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="3.0.0"
+VERSION="3.1.0"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -37,7 +37,7 @@ HYSTERIA_BIN="${OMNITUN_HYSTERIA_BIN:-/usr/local/bin/hysteria}"
 HY_MASQ_HOST="www.bing.com"
 # where the shipped per-arch binaries live (install.sh drops them here)
 ASSET_DIR="${OMNITUN_ASSETS:-/opt/omnitunnel}"
-RAW_BASE="https://raw.githubusercontent.com/Amam8585/OmniTunnel/${OMNITUN_REF:-refactor/direct-only-icmp-performance}"
+RAW_BASE="https://raw.githubusercontent.com/Amam8585/OmniTunnel/${OMNITUN_REF:-phase2/direct-performance-engineering}"
 
 # shellcheck disable=SC2034
 C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'; C_ITAL=$'\033[3m'
@@ -1872,7 +1872,7 @@ cmd_update() {
         warn "Refusing legacy/unknown installer: only verified stage-only updaters are allowed."
         return 1
     fi
-    OMNITUN_REF="${OMNITUN_REF:-refactor/direct-only-icmp-performance}" bash "$tmp" --update || rc=$?
+    OMNITUN_REF="${OMNITUN_REF:-phase2/direct-performance-engineering}" bash "$tmp" --update || rc=$?
     rm -f "$tmp"
     [[ $rc -eq 0 ]] || { warn "update failed (exit $rc)"; return 1; }
     info "Update staged; activate explicitly with install.sh --apply."
