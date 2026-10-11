@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 umask 022
 REPO="${OMNITUN_REPOSITORY:-Amam8585/OmniTunnel}"
-REF="${OMNITUN_REF:-main}"
+REF="${OMNITUN_REF:-refactor/direct-only-icmp-performance}"
 SOURCE="${OMNITUN_SOURCE_DIR:-}"
 PREFIX=/opt/omnitunnel
 STATE=/var/lib/omnitunnel
@@ -18,6 +18,7 @@ Usage: sudo bash install.sh [--prepare|--apply|--update|--check|--backup|--rollb
 --update/--prepare: compile and stage only. --apply: activate, never restart services.
 --allow-active: explicitly allow replacing on-disk binaries while tunnels run.
 Env: OMNITUN_REF, OMNITUN_REPOSITORY, OMNITUN_SOURCE_DIR
+This development branch defaults to the branch ref, not main.
 EOF
 }
 while (($#)); do
