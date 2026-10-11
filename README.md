@@ -35,7 +35,7 @@ lets you **benchmark them and keep the winner**:
 | `vxlan` | **VXLAN**, native kernel tunnel (no key) — Ethernet-in-UDP, the standard datacenter overlay | A kernel UDP carrier that blends in as ordinary overlay traffic; useful where `fou`'s GRE-in-UDP is fingerprinted but VXLAN is not |
 | `reverse-mux` | **ICMP echo-*reply* + single-flow MUX** (no key) — the icmp engine with the emitted echo type forced to reply, plus a chisel reverse tunnel that collapses every user connection into **one** flow | The relay→foreign **upload** is policed: many parallel connections get shredded (they collapse to a few Mbit) while a single sustained flow stays near line-rate. Also dodges paths that drop echo-*request* (type 8) in one direction but pass echo-*reply* (type 0) |
 | `stripe` | **Connection-striping TCP** — shards one flow across many fresh, short-lived connections so no single 5-tuple is ever kept alive long enough to be capped | The ISP **byte-caps each 5-tuple** (e.g. ~8760 B, then the connection is silently blackholed): a single long-lived TCP stream dies after a few KB, so `stripe` keeps spreading the flow over a rolling pool of brand-new connections and no one of them reaches the cap |
-| `ackless` | **ACK-less raw-TCP carrier** — a single flow of `flags=0` raw TCP segments carrying data only, with an app-level ARQ (selective NACK/ACK) instead of the kernel's per-packet ACKs | The ISP **caps packets-per-5-tuple** rather than bytes: a normal TCP stream's ACK/retransmit chatter burns the packet budget, so `ackless` sends only data-bearing segments and recovers loss itself |
+| `ackless` | **ACK-less raw-TCP carrier** — data-only `flags=0` raw-TCP segments spread across up to `-Fmax` (default 6) concurrent flows, each inner packet pinned to one flow by a 5-tuple hash, with an app-level ARQ (selective NACK/ACK) instead of the kernel's per-packet ACKs | The ISP **caps packets-per-5-tuple** rather than bytes: a normal TCP stream's ACK/retransmit chatter burns the packet budget, so `ackless` sends only data-bearing segments (and spreads them over several flows) and recovers loss itself |
 
 Many ISPs police only the *common* transports (TCP/UDP) and pass the "tunnel"
 protocols — GRE (IP proto 47) and ICMP — at the link's real physical rate. On
@@ -379,12 +379,13 @@ no single connection ever outlives a ~8760 B per-5-tuple byte cap.
 ### Creating an `ackless` tunnel
 
 `ackless` is the transport for a path that **caps packets-per-5-tuple** rather
-than bytes. It carries a single flow of `flags=0` raw-TCP segments that bear
-data only — no SYN/ACK/retransmit chatter to burn the packet budget — and
-recovers loss itself with an app-level ARQ (selective NACK/ACK). Where `stripe`
-spreads a flow over short-lived connections to dodge a per-5-tuple **byte** cap,
-`ackless` keeps **one** flow and strips the packet overhead to dodge a per-5-tuple
-**packet** cap.
+than bytes. It carries data-only `flags=0` raw-TCP segments — no SYN/ACK/
+retransmit chatter to burn the packet budget — and recovers loss itself with an
+app-level ARQ (selective NACK/ACK). It spreads those segments across up to
+`-Fmax` (default 6) concurrent ACK-less flows, pinning each inner packet to one
+flow by a 5-tuple hash. Where `stripe` spreads a flow over short-lived
+connections to dodge a per-5-tuple **byte** cap, `ackless` strips the per-packet
+ACK overhead (and uses a handful of flows) to dodge a per-5-tuple **packet** cap.
 
 Bring it up like any other transport — the only input is the foreign IP; the
 name is auto-derived and the key/subnet/port/device/MTU are allocated for you:
@@ -423,8 +424,8 @@ Flags:
 | `-T` | tun device name | `tsackless0` |
 | `-M` | tun MTU | `1400` |
 | `-s` | run as the server (listener) side; the client omits it | off |
-| `-F` / `-Fmin` / `-Fmax` | active / min / max concurrent flows | `2` / `1` / `6` |
-| `-auto` | auto-scale the flow count | `true` |
+| `-Fmax` | number of concurrent ACK-less flows the carrier runs; inner packets are hashed across them | `6` |
+| `-F` / `-Fmin` / `-auto` | initial / minimum flow count and the adaptive-scaling toggle — accepted for forward compatibility, but this build runs the full `-Fmax` set | `2` / `1` / `true` |
 
 ---
 
@@ -479,11 +480,11 @@ tun devices and iptables chains, the core binaries, all state under
 - **Bundled `omniackless` engine** — the `ackless` transport is powered by its
   own self-contained static Go binary ([`src/omniackless`](src/omniackless)),
   shipped in [`bin/`](bin/) for both CPUs as `omniackless-amd64` /
-  `omniackless-arm64`. It owns a `tsackless*` tun device and carries one flow of
-  `flags=0` raw-TCP segments with an app-level ARQ, self-managing its raw sockets
-  and the `nft` rules that suppress the kernel's RST/ACK for that flow (set up on
-  start, torn down on exit). Like the C core it needs no shared libraries and
-  cross-compiles trivially.
+  `omniackless-arm64`. It owns a `tsackless*` tun device and carries data-only
+  `flags=0` raw-TCP segments across up to `-Fmax` (default 6) concurrent flows
+  with an app-level ARQ, self-managing its raw sockets and the `nft` rules that
+  suppress the kernel's RST/ACK for those flows (set up on start, torn down on
+  exit). Like the C core it needs no shared libraries and cross-compiles trivially.
 - Prebuilt for **amd64** and **arm64** under [`bin/`](bin/), also attached to
   each release.
 - **`omnitunnel.sh`** — the English TUI manager: benchmark, instance

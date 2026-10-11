@@ -245,8 +245,7 @@ port_base() { case "$1" in udp|fou|vxlan) echo 28820;; stripe) echo 40000;; ackl
 type_is_hysteria() { [[ "$1" == hysteria ]]; }
 type_is_stripe() { [[ "$1" == stripe ]]; }
 type_is_ackless() { [[ "$1" == ackless ]]; }
-looks_like_host() { [[ "$1" == *.* || "$1" == *:* ]]; }
-auto_name() { local base="$1" i=1 n; n="$base"; while inst_exists "$n"; do n="$base$i"; i=$((i+1)); done; echo "$n"; }
+auto_name() { local base="$1" avoid=" ${2:-} " i=1 n; n="$base"; while inst_exists "$n" || [[ "$avoid" == *" $n "* ]]; do n="$base$i"; i=$((i+1)); done; echo "$n"; }
 
 # ------------------------------------------------------------ instance i/o ----
 inst_path() { echo "$INST_DIR/$1"; }
@@ -1225,12 +1224,13 @@ alloc_port() {
     alloc_port_span "${1:-51820}" "$(type_port_span "${3:-}")" "${2:-}"
 }
 alloc_and_create() {
-    local n="$1" t="$2" role="$3" lip="$4" pip="$5" shape="$6" nc="$7" imode="$8" want_port="${9:-}"
+    local n="$1" t="$2" role="$3" lip="$4" pip="$5" shape="$6" nc="$7" imode="$8" want_port="${9:-}" auto="${10:-}"
     local afd
     mkdir -p "$INST_DIR" 2>/dev/null || true
     exec {afd}>"$INST_DIR/.alloc.lock" || die "cannot open allocation lock $INST_DIR/.alloc.lock"
     flock "$afd" || die "cannot acquire allocation lock"
-    inst_exists "$n" && die "instance $n exists"
+    if [[ -n "$auto" ]]; then n="$(auto_name "$n")"; else inst_exists "$n" && die "instance $n exists"; fi
+    ALLOC_NAME="$n"
     ALLOC_SUB=$(next_subnet_idx)
     ALLOC_PORT=$(next_port "${want_port:-$(( $(port_base "$t") + ALLOC_SUB ))}" "$t")
     ALLOC_KEY=$(gen_key); type_uses_key "$t" || ALLOC_KEY=""
@@ -1363,6 +1363,16 @@ cmd_peercreate() {
     inst_enable "$1" >/dev/null 2>&1 || true; ok "peer instance '$1' up"
 }
 
+add_parse() {
+    ADD_AUTO=""; ADD_KN=""; ADD_FHOST=""; ADD_REST=()
+    local t="$1"; shift
+    if [[ $# -eq 1 ]]; then ADD_AUTO="auto"; ADD_KN="$t"; ADD_FHOST="$1"; shift
+    elif [[ $# -ge 2 ]]; then ADD_KN="$1"; ADD_FHOST="$2"; shift 2
+    else return 1; fi
+    ADD_REST=("$@")
+    return 0
+}
+
 # Non-interactive add for scripting/automation.
 # add-auto <type> <name> <foreign_ip> [nconn] [shape] [my_ip]
 # Far-side SSH password comes from a saved peer file or $OMNITUN_PEER_PASS
@@ -1373,15 +1383,12 @@ cmd_add_auto() {
     elif type_is_stripe "$1"; then ensure_omnistripe
     elif type_is_ackless "$1"; then ensure_omniackless
     elif ! type_is_kernel "$1"; then ensure_binary; fi
-    local t="$1"; shift
-    local kn fhost
-    if [[ $# -ge 2 ]] && looks_like_host "$2"; then kn="$1"; fhost="$2"; shift 2
-    elif [[ $# -ge 1 ]] && looks_like_host "$1"; then kn="$(auto_name "$t")"; fhost="$1"; shift
-    elif [[ $# -ge 2 ]]; then kn="$1"; fhost="$2"; shift 2
-    else die "usage: add-auto <type> [name] <foreign_ip> [nconn] [shape] [my_ip]"; fi
-    local nc="${1:-16}" shape="${2:-none}" mylip="${3:-$(default_local_ip)}"
+    local t="$1"
+    add_parse "$@" || die "usage: add-auto <type> [name] <foreign_ip> [nconn] [shape] [my_ip]"
+    local kn="$ADD_KN" fhost="$ADD_FHOST" auto_kn="$ADD_AUTO"
+    local nc="${ADD_REST[0]:-16}" shape="${ADD_REST[1]:-none}" mylip="${ADD_REST[2]:-$(default_local_ip)}"
     [[ -n "$t" && -n "$kn" && -n "$fhost" ]] || die "usage: add-auto <type> [name] <foreign_ip> [nconn] [shape] [my_ip]"
-    inst_exists "$kn" && die "instance $kn exists"
+    [[ -n "$auto_kn" ]] || { inst_exists "$kn" && die "instance $kn exists"; }
     [[ -n "${OMNITUN_PEER_PASS:-}" || -n "${OMNITUN_PEER_PROXY:-}" ]] && save_peer "$fhost" "${OMNITUN_PEER_USER:-root}" "${OMNITUN_PEER_PASS:-}" "${OMNITUN_PEER_PROXY:-}"
     guard_peer_downgrade "$fhost"
     # Ask the foreign what it already runs, so a second Iran box to the SAME foreign
@@ -1391,7 +1398,7 @@ cmd_add_auto() {
     fsub=$(peer_ssh "$fhost" "grep -hoE 'TUN_ADDR=10\\.201\\.[0-9]+' /etc/omnitunnel/inst/*/instance.conf 2>/dev/null | grep -oE '[0-9]+\$'" 2>/dev/null | tr '\r\n' '  ' || true)
     fport=$(peer_port_triples "$fhost")
     fnames=$(peer_ssh "$fhost" "ls /etc/omnitunnel/inst 2>/dev/null" 2>/dev/null | tr '\r\n' '  ' || true)
-    case " $fnames " in *" $kn "*) die "the foreign $fhost already has an instance named '$kn' - choose a different name (each tunnel to a foreign needs a unique name)";; esac
+    [[ -n "$auto_kn" ]] || case " $fnames " in *" $kn "*) die "the foreign $fhost already has an instance named '$kn' - choose a different name (each tunnel to a foreign needs a unique name)";; esac
     local imode="${OMNITUN_ICMP_MODE:-}" pmode="${OMNITUN_ICMP_MODE_PEER:-}"
     local m; for m in "$imode" "$pmode"; do [[ -z "$m" || "$m" == reply || "$m" == request ]] || die "icmp mode must be reply|request (got '$m')"; done
     [[ "$t" == icmp ]] || type_is_revmux "$t" || { imode=""; pmode=""; }
@@ -1402,7 +1409,7 @@ cmd_add_auto() {
     mkdir -p "$INST_DIR" 2>/dev/null || true
     exec {afd}>"$INST_DIR/.alloc.lock" || die "cannot open allocation lock $INST_DIR/.alloc.lock"
     flock "$afd" || die "cannot acquire allocation lock"
-    inst_exists "$kn" && die "instance $kn exists"
+    if [[ -n "$auto_kn" ]]; then kn="$(auto_name "$kn" "$fnames")"; else inst_exists "$kn" && die "instance $kn exists"; fi
     sub=$(alloc_subnet "$fsub"); ta="10.201.$sub.1"; pa="10.201.$sub.2"
     port=$(alloc_port "$(( $(port_base "$t") + sub ))" "$(printf '%s\n' "$fport" | remote_port_ranges)" "$t"); key=$(gen_key); type_uses_key "$t" || key=""
     provision_peer "$fhost" "$kn" "$t" "$fhost" "$mylip" "$port" "$key" "$pa" "$ta" "$shape" "$nc" "$pmode"
@@ -1423,15 +1430,12 @@ cmd_add_manual() {
     elif type_is_stripe "$1"; then ensure_omnistripe
     elif type_is_ackless "$1"; then ensure_omniackless
     elif ! type_is_kernel "$1"; then ensure_binary; fi
-    local t="$1"; shift
-    local kn fhost
-    if [[ $# -ge 2 ]] && looks_like_host "$2"; then kn="$1"; fhost="$2"; shift 2
-    elif [[ $# -ge 1 ]] && looks_like_host "$1"; then kn="$(auto_name "$t")"; fhost="$1"; shift
-    elif [[ $# -ge 2 ]]; then kn="$1"; fhost="$2"; shift 2
-    else die "usage: add-manual <type> [name] <foreign_ip> [nconn] [shape] [my_ip] [foreign_port]"; fi
-    local nc="${1:-16}" shape="${2:-none}" mylip="${3:-$(default_local_ip)}" want_port="${4:-}"
+    local t="$1"
+    add_parse "$@" || die "usage: add-manual <type> [name] <foreign_ip> [nconn] [shape] [my_ip] [foreign_port]"
+    local kn="$ADD_KN" fhost="$ADD_FHOST" auto_kn="$ADD_AUTO"
+    local nc="${ADD_REST[0]:-16}" shape="${ADD_REST[1]:-none}" mylip="${ADD_REST[2]:-$(default_local_ip)}" want_port="${ADD_REST[3]:-}"
     [[ -n "$t" && -n "$kn" && -n "$fhost" ]] || die "usage: add-manual <type> [name] <foreign_ip> [nconn] [shape] [my_ip] [foreign_port]"
-    inst_exists "$kn" && die "instance $kn exists"
+    [[ -n "$auto_kn" ]] || { inst_exists "$kn" && die "instance $kn exists"; }
     # icmp: this end's emitted ICMP type (OMNITUN_ICMP_MODE) and the foreign end's
     # (OMNITUN_ICMP_MODE_PEER), for paths that drop one echo type in one direction.
     local imode="${OMNITUN_ICMP_MODE:-}" pmode="${OMNITUN_ICMP_MODE_PEER:-}"
@@ -1441,8 +1445,8 @@ cmd_add_manual() {
         warn "reverse-mux asked to emit echo-request; that gives up its reply-gated dodge"
     fi
     local sub port key ta pa
-    alloc_and_create "$kn" "$t" client "$mylip" "$fhost" "$shape" "$nc" "$imode" "$want_port"
-    sub="$ALLOC_SUB"; port="$ALLOC_PORT"; key="$ALLOC_KEY"; ta="10.201.$sub.1"; pa="10.201.$sub.2"
+    alloc_and_create "$kn" "$t" client "$mylip" "$fhost" "$shape" "$nc" "$imode" "$want_port" "$auto_kn"
+    kn="$ALLOC_NAME"; sub="$ALLOC_SUB"; port="$ALLOC_PORT"; key="$ALLOC_KEY"; ta="10.201.$sub.1"; pa="10.201.$sub.2"
     inst_enable "$kn"
     # Server-side params (tun IPs swapped). Encoded so it is a single paste.
     local token; token=$(printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' "$kn" "$t" "$fhost" "$mylip" "$port" "$key" "$pa" "$ta" "$shape" "$nc" "$pmode" | base64 | tr -d '\n')
