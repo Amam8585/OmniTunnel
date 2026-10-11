@@ -70,4 +70,19 @@ pf_map_del a tcp 192.0.2.10 443 eth0
 if grep -qE -- ' -F (FORWARD|PREROUTING|POSTROUTING|INPUT)( |$)' "$LOG"; then
     fail "global firewall flush attempted"
 fi
-echo "PASS: isolated two-instance/two-IP maps, conflict guard, SNAT/DNAT/ACL, exact deletion"
+# Two administrators race for the same UDP public tuple. Exactly one may win.
+(pf_map_add a udp 192.0.2.10 5353 10.1.1.2 5353 eth0) > "$WORK/race-a" 2>&1 &
+pid_a=$!
+(pf_map_add b udp 192.0.2.10 5353 10.1.2.2 5353 eth0) > "$WORK/race-b" 2>&1 &
+pid_b=$!
+rc_a=0; rc_b=0
+wait "$pid_a" || rc_a=$?
+wait "$pid_b" || rc_b=$?
+if [[ "$rc_a" -eq 0 && "$rc_b" -eq 0 ]] ||
+   [[ "$rc_a" -ne 0 && "$rc_b" -ne 0 ]]; then
+    fail "concurrent collision not serialized (rc_a=$rc_a rc_b=$rc_b)"
+fi
+count="$(grep -hEc '^udp\|192\.0\.2\.10\|5353\|' "$INST_DIR/a/map.conf" "$INST_DIR/b/map.conf" |
+    awk '{s+=$1} END {print s+0}')"
+[[ "$count" -eq 1 ]] || fail "concurrent mapping race created $count copies"
+echo "PASS: two IPs on port443, DNAT/SNAT/FORWARD, deletion and concurrent duplicate protection"

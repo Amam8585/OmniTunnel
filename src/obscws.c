@@ -27,6 +27,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -197,9 +198,19 @@ static void b64(const unsigned char *in, int len, char *out) {
     }
     out[o]=0;
 }
-/* cheap PRNG for WS mask keys (masking is cosmetic - AEAD does the real work) */
-static _Thread_local uint32_t xs = 0;
-static unsigned char xs_byte(void){ if(!xs){ts_random(&xs,4); if(!xs)xs=2463534242u;} xs^=xs<<13; xs^=xs>>17; xs^=xs<<5; return (unsigned char)(xs&0xff); }
+/* RFC6455 client masks must be independently unpredictable.
+ * Batch bytes from the kernel CSPRNG to avoid per-frame syscalls while
+ * eliminating recoverable xorshift mask sequences. */
+static _Thread_local unsigned char ws_mask_pool[4096];
+static _Thread_local size_t ws_mask_offset = sizeof(ws_mask_pool);
+static void ws_mask_key(unsigned char out[4]) {
+    if (ws_mask_offset + 4 > sizeof(ws_mask_pool)) {
+        ts_random(ws_mask_pool, sizeof(ws_mask_pool));
+        ws_mask_offset = 0;
+    }
+    memcpy(out, ws_mask_pool + ws_mask_offset, 4);
+    ws_mask_offset += 4;
+}
 
 /* RFC 6455: SHA-1(key || 36-byte GUID), then base64-encode.
  * Handshake-only, never used for authentication (payload is AEAD-protected). */
@@ -263,6 +274,33 @@ static int ws_read_headers(int fd, char *buf, size_t cap) {
     }
     return -1;
 }
+/* RFC7230-style case-insensitive comma-separated HTTP header tokens.
+ * "Connection: keep-alive, Upgrade" must be accepted; substring matches
+ * could incorrectly accept tokens such as X-Upgrade or NotUpgrade. */
+static int ws_has_token(const char *headers, const char *name, const char *token) {
+    const size_t keylen=strlen(name), tokenlen=strlen(token);
+    const char *p=headers;
+    while (p && *p) {
+        const char *end=strstr(p,"\r\n");
+        if (!end) break;
+        const char *colon=memchr(p,':',(size_t)(end-p));
+        if (colon && (size_t)(colon-p)==keylen && !strncasecmp(p,name,keylen)) {
+            const char *value=colon+1;
+            while (value<end) {
+                while (value<end && (*value==' ' || *value=='\t' || *value==',')) value++;
+                const char *next=value;
+                while (next<end && *next!=',') next++;
+                const char *trim=next;
+                while (trim>value && (trim[-1]==' ' || trim[-1]=='\t')) trim--;
+                if ((size_t)(trim-value)==tokenlen &&
+                    !strncasecmp(value,token,tokenlen)) return 1;
+                value=next<end?next+1:end;
+            }
+        }
+        p=end+2;
+    }
+    return 0;
+}
 static int ws_client_handshake(int fd) {
     unsigned char rk[16]; ts_random(rk,sizeof(rk));
     char kb[32]; b64(rk,16,kb);
@@ -274,8 +312,8 @@ static int ws_client_handshake(int fd) {
     if (n<0 || (size_t)n>=sizeof(req) || writen(fd,(unsigned char*)req,(size_t)n) != 0) return -1;
     if (ws_read_headers(fd,headers,sizeof(headers))!=0) return -1;
     if (strncmp(headers,"HTTP/1.1 101 ",13) != 0 ||
-        !strcasestr(headers,"\r\nUpgrade: websocket") ||
-        !strcasestr(headers,"\r\nConnection: Upgrade")) return -1;
+        !ws_has_token(headers,"Upgrade","websocket") ||
+        !ws_has_token(headers,"Connection","Upgrade")) return -1;
     char expected[29];
     if (ws_accept(kb,expected)!=0) return -1;
     const char *value=strcasestr(headers,"\r\nSec-WebSocket-Accept:");
@@ -296,8 +334,8 @@ static int ws_client_handshake(int fd) {
 static int ws_server_handshake(int fd) {
     char req[8193], key[25], accepted[29], resp[512];
     if (ws_read_headers(fd,req,sizeof(req))!=0) return -1;
-    if (strncmp(req,"GET ",4)!=0 || !strcasestr(req,"\r\nUpgrade: websocket") ||
-        !strcasestr(req,"\r\nConnection: Upgrade") ||
+    if (strncmp(req,"GET ",4)!=0 || !ws_has_token(req,"Upgrade","websocket") ||
+        !ws_has_token(req,"Connection","Upgrade") ||
         !strcasestr(req,"\r\nSec-WebSocket-Version: 13")) return -1;
     const char *v = strcasestr(req,"\r\nSec-WebSocket-Key:");
     if (!v) return -1;
@@ -322,7 +360,7 @@ static int ws_frame(unsigned char *d, const unsigned char *p, int plen, int mask
     if (plen < 126) d[o++] = mb | (unsigned char)plen;
     else { d[o++] = mb | 126; d[o++] = (plen>>8)&0xff; d[o++] = plen&0xff; }
     if (mask) {
-        unsigned char mk[4]; for (int i=0;i<4;i++) mk[i]=xs_byte();
+        unsigned char mk[4]; ws_mask_key(mk);
         memcpy(d+o, mk, 4); o += 4;
         for (int i=0;i<plen;i++) d[o+i] = p[i] ^ mk[i&3];
         o += plen;
@@ -371,7 +409,7 @@ static int ws_read_frame(int fd, struct conn *c, unsigned char *out, int maxlen)
         int mask_out=!is_server;
         pong[off++]=(unsigned char)len | (mask_out?0x80:0);
         if (mask_out) {
-            unsigned char m[4]; ts_random(m,sizeof(m));
+            unsigned char m[4]; ws_mask_key(m);
             memcpy(pong+off,m,4); off+=4;
             for (uint64_t i=0;i<len;i++) pong[off+i]=out[i]^m[i&3];
         } else memcpy(pong+off,out,(size_t)len);

@@ -85,3 +85,21 @@ gcc -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer \
 Building and passing offline unit tests is necessary but **not** a claim of two-host connectivity or a throughput improvement. Never run the old builtin multi-protocol benchmark on a live server without explicit capacity permission; it creates temporary units and traffic.
 
 Legacy `icmptun-ctl.sh` is a separate manager with its own embedded C; this branch does not silently replace the legacy core.
+
+## Phase 3 development status
+
+Phase 3 is isolated in draft branch phase3/direct-reliability-validation and
+does NOT affect main or currently running production tunnels. Work includes
+the optimizer newline fix, installer failure-injection/locking, ICMP bounded
+TUN backpressure, stricter RFC6455 WebSocket framing, staged private NAT
+rule generations, and monitoring accuracy corrections.
+
+**Do not interpret the existence of CI files or regression source as test
+success.** GitHub Actions currently reports zero workflow runs. Real C/Go
+builds, sanitizer tests, installer fault tests, IPv4 forwarding in a network
+namespace, mixed-version connectivity, and high-load A/B goodput and P95/P99
+comparison are NOT TESTED.
+
+See [Phase 3 validation and rollback](docs/PHASE3_VALIDATION.md) and the
+open draft Pull Request for exact code status. The existing installation
+command above intentionally targets main, NOT the experimental branch.

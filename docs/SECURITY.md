@@ -36,3 +36,9 @@ deleting anything; never globally flush iptables/nftables.
 
 No Phase 3 C or Go sanitizer result, network security penetration result,
 or two-peer encrypted compatibility validation has been confirmed.
+
+## Fail-closed cryptographic entropy (Phase 3)
+
+The old `src/tcrypto.h` generated predictable nonce bytes if `/dev/urandom` could not be read. Phase 3 uses kernel `getrandom()` with kernel `/dev/urandom` fallback, and terminates rather than using deterministic values if neither CSPRNG is available. This protects the existing XChaCha20-Poly1305 nonce generation path without changing packet wire bytes. A mock failure-injection regression was committed but has **NOT yet passed CI**.
+
+The WebSocket mask generator now preloads 4,096 bytes of kernel CSPRNG material rather than advancing a reversible xorshift state. Failure to obtain entropy is fatal. No security guarantee is claimed until tests and cryptographic review pass.
