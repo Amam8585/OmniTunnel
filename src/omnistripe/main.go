@@ -890,24 +890,25 @@ func frameLaneDlen(frame []byte) (int, int) {
 }
 
 func readFrame(conn net.Conn) ([]byte, bool) {
-	head := make([]byte, hdrFixed)
-	if _, err := io.ReadFull(conn, head); err != nil {
+	// Read the fixed header into a stack array. Authenticate the complete
+	// frame in the existing caller; this does not change framing or MAC.
+	var head [hdrFixed]byte
+	if _, err := io.ReadFull(conn, head[:]); err != nil {
 		return nil, false
 	}
-	if binary.BigEndian.Uint16(head[0:]) != magic || head[2] != ver {
+	if binary.BigEndian.Uint16(head[:2]) != magic || head[2] != ver {
 		return nil, false
 	}
-	dlen := int(binary.BigEndian.Uint16(head[12:]))
+	dlen := int(binary.BigEndian.Uint16(head[12:14]))
 	if dlen > maxChunk {
 		return nil, false
 	}
-	rest := make([]byte, sackBytes+dlen+tailSize+macSize)
-	if _, err := io.ReadFull(conn, rest); err != nil {
+	// One packet-sized allocation rather than rest + frame and an extra copy.
+	frame := make([]byte, hdrFixed+sackBytes+dlen+tailSize+macSize)
+	copy(frame, head[:])
+	if _, err := io.ReadFull(conn, frame[hdrFixed:]); err != nil {
 		return nil, false
 	}
-	frame := make([]byte, hdrFixed+len(rest))
-	copy(frame, head)
-	copy(frame[hdrFixed:], rest)
 	return frame, true
 }
 

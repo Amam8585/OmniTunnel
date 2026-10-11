@@ -19,7 +19,7 @@
 # /etc/icmptun install (this tool never reads, edits or deletes that).
 set -euo pipefail
 
-VERSION="3.0.0"
+VERSION="3.1.0"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
@@ -37,7 +37,7 @@ HYSTERIA_BIN="${OMNITUN_HYSTERIA_BIN:-/usr/local/bin/hysteria}"
 HY_MASQ_HOST="www.bing.com"
 # where the shipped per-arch binaries live (install.sh drops them here)
 ASSET_DIR="${OMNITUN_ASSETS:-/opt/omnitunnel}"
-RAW_BASE="https://raw.githubusercontent.com/Amam8585/OmniTunnel/${OMNITUN_REF:-refactor/direct-only-icmp-performance}"
+RAW_BASE="https://raw.githubusercontent.com/Amam8585/OmniTunnel/${OMNITUN_REF:-phase2/direct-performance-engineering}"
 
 # shellcheck disable=SC2034
 C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'; C_ITAL=$'\033[3m'
@@ -822,22 +822,188 @@ inst_detail() {
 }
 
 # ------------------------------------------------------------- port fwd -------
+# Advanced Direct mapping entries: proto|public-ip|public-port|dest-ip|dest-port|ingress-if
+pf_map_file() { echo "$INST_DIR/$1/map.conf"; }
+pf_snat_chain() { echo "OMNI_S_$(printf '%s' "$1" | cksum | awk '{print $1}')"; }
+pf_filter_chain() { echo "OMNI_F_$(printf '%s' "$1" | cksum | awk '{print $1}')"; }
+pf_ipv4() { python3 -c 'import ipaddress,sys; ipaddress.IPv4Address(sys.argv[1])' "$1" 2>/dev/null; }
+pf_owned_chain() {
+    local table="$1" chain="$2" hook="$3"
+    if ! iptables -w 5 -t "$table" -N "$chain" 2>/dev/null; then
+        iptables -w 5 -t "$table" -C "$hook" -j "$chain" 2>/dev/null ||
+            die "chain $table/$chain exists without an OmniTunnel hook: refusing to flush another owner's rules"
+    fi
+    iptables -w 5 -t "$table" -F "$chain" ||
+        die "unable to flush our own $table/$chain"
+    iptables -w 5 -t "$table" -C "$hook" -j "$chain" 2>/dev/null ||
+        iptables -w 5 -t "$table" -I "$hook" 1 -j "$chain" ||
+        die "failed to hook $table/$chain"
+}
+pf_check_chain_collisions() {
+    local mine="$1" other
+    for other in $(list_instances); do
+        [[ "$other" == "$mine" ]] && continue
+        if [[ "$(dnat_chain "$other")" == "$(dnat_chain "$mine")" ||
+              "$(pf_snat_chain "$other")" == "$(pf_snat_chain "$mine")" ||
+              "$(pf_filter_chain "$other")" == "$(pf_filter_chain "$mine")" ]]; then
+            die "firewall chain naming collision between $mine and $other (no rules changed)"
+        fi
+    done
+}
 pf_apply_all() {
     load_inst "$1"
-    # hysteria forwards ports outside iptables: TCP via per-port relays (no engine
-    # restart), UDP in-config (restart only if the UDP set changed).
-    if type_is_hysteria "$TYPE"; then
-        hy_pf_reconcile "$1"
-        return 0
+    if type_is_hysteria "$TYPE"; then hy_pf_reconcile "$1"; return 0; fi
+    local pf maps ch sn fw proto pubip pubport dstip dstport ingress
+    pf="$(inst_pf "$1")"; maps="$(pf_map_file "$1")"
+    [[ -r "$pf" || -r "$maps" ]] || return 0
+    pf_check_chain_collisions "$1"
+    ch="$(dnat_chain "$1")"
+    sn="$(pf_snat_chain "$1")"
+    fw="$(pf_filter_chain "$1")"
+    # Preflight ALL config lines before mutating any firewall chain.
+    if [[ -s "$maps" ]]; then
+        while IFS='|' read -r proto pubip pubport dstip dstport ingress; do
+            [[ "$proto" == tcp || "$proto" == udp ]] || die "invalid mapped protocol"
+            pf_ipv4 "$pubip" && pf_ipv4 "$dstip" || die "invalid mapped IPv4"
+            norm_port "$pubport" >/dev/null && norm_port "$dstport" >/dev/null ||
+                die "invalid mapped port"
+            [[ "$ingress" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] ||
+                die "unsafe ingress interface name in mapping"
+            ip -o -4 addr show dev "$ingress" |
+                awk '{print $4}' | cut -d/ -f1 | grep -qxF "$pubip" ||
+                die "public IP $pubip is not owned by interface $ingress"
+            ip -4 route get "$dstip" | grep -qE "(^| )dev $DEV( |$)" ||
+                die "destination $dstip does not route through Direct device $DEV"
+        done < "$maps"
     fi
-    local pf; pf="$(inst_pf "$1")"; [[ -f "$pf" ]] || return 0
-    local ch; ch="$(dnat_chain "$1")"
-    iptables -t nat -N "$ch" 2>/dev/null || true; iptables -t nat -F "$ch"
-    iptables -t nat -C PREROUTING -j "$ch" 2>/dev/null || iptables -t nat -I PREROUTING 1 -j "$ch"
-    iptables -t nat -C POSTROUTING -o "$DEV" -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o "$DEV" -j MASQUERADE
-    local proto port
-    while IFS=: read -r proto port; do [[ -z "$proto" ]] && continue
-        iptables -t nat -A "$ch" -p "$proto" --dport "$port" -j DNAT --to-destination "$PEER_ADDR:$port"; done < "$pf"
+    pf_owned_chain nat "$ch" PREROUTING
+    # The old -o DEVICE MASQUERADE remains for legacy wildcard pf.conf.
+    if [[ -s "$pf" ]]; then
+        iptables -w 5 -t nat -C POSTROUTING -o "$DEV" -j MASQUERADE 2>/dev/null ||
+            iptables -w 5 -t nat -A POSTROUTING -o "$DEV" -j MASQUERADE ||
+            die "legacy MASQUERADE could not be installed"
+    fi
+    # Clearing only our previously registered chains also removes obsolete
+    # mappings when the last map.conf line is deleted.
+    if [[ -s "$maps" ]] || iptables -t nat -C POSTROUTING -j "$sn" 2>/dev/null; then
+        pf_owned_chain nat "$sn" POSTROUTING
+    fi
+    if [[ -s "$maps" ]] || iptables -t filter -C FORWARD -j "$fw" 2>/dev/null; then
+        pf_owned_chain filter "$fw" FORWARD
+    fi
+    if [[ ! -s "$maps" ]]; then
+        # No active advanced maps: remove only OUR empty SNAT/FORWARD hooks,
+        # otherwise stale allow/DNAT rules would survive the last removal.
+        iptables -t nat -D POSTROUTING -j "$sn" 2>/dev/null || true
+        iptables -t nat -F "$sn" 2>/dev/null || true
+        iptables -t nat -X "$sn" 2>/dev/null || true
+        iptables -t filter -D FORWARD -j "$fw" 2>/dev/null || true
+        iptables -t filter -F "$fw" 2>/dev/null || true
+        iptables -t filter -X "$fw" 2>/dev/null || true
+    fi
+    if [[ -s "$maps" ]]; then
+        while IFS='|' read -r proto pubip pubport dstip dstport ingress; do
+            iptables -w 5 -t nat -A "$ch" -i "$ingress" -d "$pubip" -p "$proto" \
+                --dport "$pubport" -j DNAT --to-destination "$dstip:$dstport" ||
+                die "DNAT mapping apply failed"
+            iptables -w 5 -t nat -A "$sn" -o "$DEV" -d "$dstip" -p "$proto" \
+                --dport "$dstport" -j SNAT --to-source "$TUN_ADDR" ||
+                die "SNAT mapping apply failed"
+            iptables -w 5 -t filter -A "$fw" -i "$ingress" -o "$DEV" \
+                -d "$dstip" -p "$proto" --dport "$dstport" \
+                -m conntrack --ctstate NEW,ESTABLISHED -j ACCEPT ||
+                die "FORWARD allow rule failed"
+            iptables -w 5 -t filter -A "$fw" -i "$DEV" -o "$ingress" \
+                -s "$dstip" -p "$proto" --sport "$dstport" \
+                -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT ||
+                die "FORWARD return rule failed"
+        done < "$maps"
+    fi
+    if [[ -s "$pf" ]]; then
+        local port
+        while IFS=: read -r proto port; do
+            [[ -z "$proto" ]] && continue
+            [[ "$proto" == tcp || "$proto" == udp ]] || die "invalid legacy protocol"
+            norm_port "$port" >/dev/null || die "invalid legacy port"
+            iptables -w 5 -t nat -A "$ch" -p "$proto" --dport "$port" \
+                -j DNAT --to-destination "$PEER_ADDR:$port" ||
+                die "legacy DNAT forwarding failed"
+        done < "$pf"
+    fi
+}
+pf_mapping_conflict() {
+    local owner="$1" proto="$2" pubip="$3" pubport="$4" ingress="$5"
+    local other f old_proto old_pub old_port old_dst old_dport old_ing
+    for other in $(list_instances); do
+        f="$(inst_pf "$other")"
+        if [[ -s "$f" ]] && grep -Eq "^$proto:$pubport$" "$f"; then
+            die "legacy wildcard forward $proto/$pubport already reserved by $other"
+        fi
+        f="$(pf_map_file "$other")"
+        [[ -s "$f" ]] || continue
+        while IFS='|' read -r old_proto old_pub old_port old_dst old_dport old_ing; do
+            if [[ "$old_proto" == "$proto" && "$old_pub" == "$pubip" &&
+                  "$old_port" == "$pubport" && "$old_ing" == "$ingress" ]]; then
+                die "Direct mapped port $proto $pubip:$pubport on $ingress already owned by $other"
+            fi
+        done < "$f"
+    done
+}
+pf_map_add() {
+    need_root
+    local name="$1" proto="$2" pubip="$3" pubport="$4" dstip="$5" dstport="$6" ingress="$7"
+    local file backup rec
+    load_inst "$name"
+    type_is_hysteria "$TYPE" && die "Hysteria uses independent SOCKS relay forwarding"
+    [[ "$proto" == tcp || "$proto" == udp ]] || die "protocol must be tcp/udp"
+    pf_ipv4 "$pubip" && pf_ipv4 "$dstip" || die "invalid public/destination IPv4"
+    pubport="$(norm_port "$pubport")" || die "invalid public port"
+    dstport="$(norm_port "$dstport")" || die "invalid destination port"
+    [[ "$ingress" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] || die "invalid ingress interface"
+    # Lock all instance maps so two concurrent administrators cannot allocate
+    # the same public-IP:port simultaneously.
+    exec {lock_fd}>"$INST_DIR/.pf.lock"
+    flock -x "$lock_fd" || die "could not lock forwarding records"
+    pf_mapping_conflict "$name" "$proto" "$pubip" "$pubport" "$ingress"
+    rec="$proto|$pubip|$pubport|$dstip|$dstport|$ingress"
+    file="$(pf_map_file "$name")"
+    backup="$(mktemp "$file.XXXXXX")" || die "cannot create map backup"
+    [[ ! -e "$file" ]] || cp -a "$file" "$backup"
+    printf '%s\n' "$rec" >> "$file"
+    if ! (pf_apply_all "$name"); then
+        cp -a "$backup" "$file"
+        (pf_apply_all "$name") || true
+        rm -f "$backup"
+        die "advanced mapping failed; old config restored"
+    fi
+    rm -f "$backup"
+    ok "Direct mapping added: $proto $pubip:$pubport -> $dstip:$dstport via $ingress"
+}
+pf_map_del() {
+    need_root
+    local name="$1" proto="$2" pubip="$3" pubport="$4" ingress="$5" file backup
+    load_inst "$name"
+    [[ "$proto" == tcp || "$proto" == udp ]] || die "invalid protocol"
+    pf_ipv4 "$pubip" || die "invalid public IP"
+    pubport="$(norm_port "$pubport")" || die "invalid port"
+    [[ "$ingress" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] || die "invalid ingress interface"
+    exec {lock_fd}>"$INST_DIR/.pf.lock"
+    flock -x "$lock_fd" || die "cannot lock forwarding records"
+    file="$(pf_map_file "$name")"
+    [[ -s "$file" ]] || die "no Direct mappings for $name"
+    backup="$(mktemp "$file.XXXXXX")" || die "cannot snapshot map"
+    cp -a "$file" "$backup"
+    awk -F'|' -v p="$proto" -v ip="$pubip" -v port="$pubport" -v dev="$ingress" \
+        '!($1==p && $2==ip && $3==port && $6==dev)' "$backup" > "$file"
+    if cmp -s "$backup" "$file"; then rm -f "$backup"; die "mapping not found"; fi
+    if ! (pf_apply_all "$name"); then
+        cp -a "$backup" "$file"
+        (pf_apply_all "$name") || true
+        rm -f "$backup"
+        die "Direct mapping removal failed; restored config"
+    fi
+    rm -f "$backup"
+    ok "Direct mapping removed: $proto $pubip:$pubport via $ingress"
 }
 pf_add() {
     need_root; load_inst "$1"; local proto="$2" ports="$3"
@@ -848,6 +1014,22 @@ pf_add() {
         np="$(norm_port "$p")" || { warn "skipping invalid port '$p'"; continue; }
         [[ -e "$pf" ]] || : > "$pf"
         for pr in $([[ "$proto" == both ]] && echo "tcp udp" || echo "$proto"); do
+            # Wildcard legacy forwards overlap every public IP on that port.
+            # Refuse conflicts with any other Direct mapping/instance.
+            local other of op oi
+            for other in $(list_instances); do
+                of="$(pf_map_file "$other")"
+                if [[ -s "$of" ]]; then
+                    while IFS='|' read -r op oi mapped_port _; do
+                        if [[ "$op" == "$pr" && "$mapped_port" == "$np" ]]; then
+                            die "wildcard $pr:$np collides with advanced mapping in $other"
+                        fi
+                    done < "$of"
+                fi
+                if [[ "$other" != "$1" ]] && grep -qxF "$pr:$np" "$(inst_pf "$other")" 2>/dev/null; then
+                    die "wildcard $pr:$np already forwarded by $other"
+                fi
+            done
             rc=0; grep -qx "$pr:$np" "$pf" 2>/dev/null || rc=$?
             [[ "$rc" -le 1 ]] || die "could not read $pf (grep exit $rc) - nothing added"
             [[ "$rc" -eq 0 ]] || echo "$pr:$np" >> "$pf"; done
@@ -870,6 +1052,14 @@ pf_flush_chain() {
     iptables -t nat -D PREROUTING -j "$ch" 2>/dev/null || true
     iptables -t nat -F "$ch" 2>/dev/null || true; iptables -t nat -X "$ch" 2>/dev/null || true
     iptables -t nat -D POSTROUTING -o "$DEV" -j MASQUERADE 2>/dev/null || true
+    local sn fw
+    sn="$(pf_snat_chain "$1")"; fw="$(pf_filter_chain "$1")"
+    iptables -t nat -D POSTROUTING -j "$sn" 2>/dev/null || true
+    iptables -t nat -F "$sn" 2>/dev/null || true
+    iptables -t nat -X "$sn" 2>/dev/null || true
+    iptables -t filter -D FORWARD -j "$fw" 2>/dev/null || true
+    iptables -t filter -F "$fw" 2>/dev/null || true
+    iptables -t filter -X "$fw" 2>/dev/null || true
 }
 
 # --------------------------------------------------------------- remove -------
@@ -1682,7 +1872,7 @@ cmd_update() {
         warn "Refusing legacy/unknown installer: only verified stage-only updaters are allowed."
         return 1
     fi
-    OMNITUN_REF="${OMNITUN_REF:-refactor/direct-only-icmp-performance}" bash "$tmp" --update || rc=$?
+    OMNITUN_REF="${OMNITUN_REF:-phase2/direct-performance-engineering}" bash "$tmp" --update || rc=$?
     rm -f "$tmp"
     [[ $rc -eq 0 ]] || { warn "update failed (exit $rc)"; return 1; }
     info "Update staged; activate explicitly with install.sh --apply."
@@ -2039,6 +2229,8 @@ case "${1:-menu}" in
     _remove)          need_root; inst_remove "${2:?instance}";;
     pf-add)           pf_add "${2:?}" "${3:?}" "${4:?}";;
     pf-del)           pf_del "${2:?}" "${3:?}";;
+    pf-map-add)       pf_map_add "${2:?name}" "${3:?protocol}" "${4:?public_ip}" "${5:?public_port}" "${6:?destination_ip}" "${7:?destination_port}" "${8:?ingress_interface}";;
+    pf-map-del)       pf_map_del "${2:?name}" "${3:?protocol}" "${4:?public_ip}" "${5:?public_port}" "${6:?ingress_interface}";;
     stats)            bash "$ASSET_DIR/scripts/monitor.sh" stats "${2:?instance}" "${3:-}";;
     monitor)          bash "$ASSET_DIR/scripts/monitor.sh" monitor "${2:?instance}" "${3:-}";;
     optimizer)        shift; bash "$ASSET_DIR/scripts/optimizer.sh" "$@";;
@@ -2066,5 +2258,5 @@ case "${1:-menu}" in
     update|upgrade)   need_root; cmd_update;;
     uninstall|purge)  need_root; cmd_uninstall;;
     version|-v|--version) echo "tunnelctl $VERSION (core: $($TSUITE_BIN version 2>/dev/null || echo n/a))";;
-    *) echo "usage: $0 [menu|bench|add|list|status <n>|enable <n>|remove <n>|pf-add <n> <proto> <port>|pf-del <n> <port>|stats <n> [--json]|monitor <n> [--json]|optimizer <action> <n>|diagnostics <n>|fix-forwarding|update|uninstall]";;
+    *) echo "usage: $0 [menu|bench|add|list|status <n>|enable <n>|remove <n>|pf-add <n> <proto> <port>|pf-del <n> <port>|pf-map-add <n> <proto> <public-ip> <pubport> <dest-ip> <dstport> <ingress-if>|pf-map-del <n> <proto> <public-ip> <pubport> <ingress-if>|stats <n> [--json]|monitor <n> [--json]|optimizer <action> <n>|diagnostics <n>|fix-forwarding|update|uninstall]";;
 esac

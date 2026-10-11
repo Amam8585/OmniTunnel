@@ -113,7 +113,7 @@ func ipcsum(h []byte) uint16 {
 
 func tcpcsum(src, dst uint32, tcp []byte) uint16 {
 	var s uint32
-	ph := make([]byte, 12)
+	var ph [12]byte
 	binary.BigEndian.PutUint32(ph[0:], src)
 	binary.BigEndian.PutUint32(ph[4:], dst)
 	ph[9] = 6

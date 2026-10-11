@@ -26,6 +26,7 @@
 #include <errno.h>
 #include <signal.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <netinet/in.h>
@@ -42,13 +43,14 @@
 
 static unsigned char key[KEY_LEN];
 static int tun_fd;
-static int conn_fd = -1;              /* current TCP connection */
+static _Atomic int conn_fd = -1;      /* current TCP connection, shared across threads */
 static pthread_mutex_t wlock = PTHREAD_MUTEX_INITIALIZER;
 static char *tun_name = "obsct0";
 static int mtu = 1400;
 static int is_server = 0, port = 443;
 static struct in_addr local_ip, peer_ip;
-static volatile int running = 1;
+static volatile sig_atomic_t running = 1;
+static _Atomic uint64_t tcp_tun_errors, tcp_socket_errors, tcp_disconnected_drops;
 
 static void die(const char *m) { perror(m); exit(1); }
 
@@ -155,11 +157,11 @@ static void *uplink(void *arg) {
         }
         if (used == 0) { usleep(500); continue; }
         int fd = conn_fd;
-        if (fd < 0) continue;                     /* not connected yet - drop */
+        if (fd < 0) { atomic_fetch_add(&tcp_disconnected_drops, cnt); continue; } /* not connected */
         pthread_mutex_lock(&wlock);
         int ok = (writen(fd, sbuf, used) == 0);
         pthread_mutex_unlock(&wlock);
-        if (!ok) { if (conn_fd == fd) { shutdown(fd, SHUT_RDWR); } }
+        if (!ok) { atomic_fetch_add(&tcp_socket_errors, 1); if (conn_fd == fd) { shutdown(fd, SHUT_RDWR); } }
     }
     return NULL;
 }
@@ -186,7 +188,12 @@ static void downlink_once(int fd) {
                          (unsigned long long)(L - NONCE_LEN),
                          NULL, 0, buf + off + 2, key) != 0) { free(buf); return; }
             int ilen = inner_ip_len(out, mlen);
-            if (ilen > 0) { if (write(tun_fd, out, ilen) < 0 && errno != EAGAIN) { /* drop */ } }
+            if (ilen > 0) {
+                ssize_t result;
+                do { result = write(tun_fd, out, (size_t)ilen); }
+                while (result < 0 && errno == EINTR);
+                if (result != ilen) atomic_fetch_add(&tcp_tun_errors, 1);
+            }
             off += 2 + L;
         }
         if (off > 0) { if (have > off) memmove(buf, buf + off, have - off); have -= off; }
@@ -250,7 +257,11 @@ int tun_main_tcp(int argc, char **argv){
             is_server?"server":"client", is_server?"listen":"connect", port, tun_name, mtu);
 
     pthread_t up;
-    pthread_create(&up, NULL, uplink, NULL);   /* reads conn_fd live */
+    if (pthread_create(&up, NULL, uplink, NULL) != 0) {
+        perror("Direct TCP uplink thread");
+        close(tun_fd);
+        return 1;
+    }
 
     if (is_server) {
         int ls = socket(AF_INET, SOCK_STREAM, 0); if (ls<0) die("socket");
@@ -286,6 +297,10 @@ int tun_main_tcp(int argc, char **argv){
         }
     }
     running = 0; pthread_join(up, NULL);
+    fprintf(stderr, "direct TCP counters: disconnected_drop=%llu socket_errors=%llu tun_write_errors=%llu\n",
+            (unsigned long long)atomic_load(&tcp_disconnected_drops),
+            (unsigned long long)atomic_load(&tcp_socket_errors),
+            (unsigned long long)atomic_load(&tcp_tun_errors));
     close(tun_fd);
     return 0;
 }

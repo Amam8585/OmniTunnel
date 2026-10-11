@@ -32,6 +32,7 @@
 #include <errno.h>
 #include <signal.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <sys/select.h>
@@ -63,13 +64,14 @@ static volatile int running = 1;
  * throughput to a fraction of the path). fd<0 means the link is down. */
 struct pkt { int len; unsigned char buf[2 + MAX_FRAME]; };
 struct conn {
-    volatile int fd;
+    _Atomic int fd; /* -1 = free, -2 = reserved/draining, >=0 = active */
     pthread_mutex_t qlock;
     pthread_cond_t  qcond;
     struct pkt *q;                    /* QDEPTH ring */
     int head, tail, count;
 };
 static struct conn conns[MAXCONN];
+static _Atomic uint64_t mux_queue_drops, mux_no_link_drops, mux_socket_write_errors;
 
 struct wr_arg { int idx; int fd; };
 
@@ -183,6 +185,8 @@ static void enqueue(int idx, const unsigned char *buf, int len) {
         c->tail = (c->tail + 1) % QDEPTH;
         c->count++;
         pthread_cond_signal(&c->qcond);
+    } else {
+        atomic_fetch_add_explicit(&mux_queue_drops, 1, memory_order_relaxed);
     }
     pthread_mutex_unlock(&c->qlock);
 }
@@ -204,7 +208,10 @@ static void *writer(void *arg) {
         c->head = (c->head + 1) % QDEPTH;
         c->count--;
         pthread_mutex_unlock(&c->qlock);
-        if (writen(fd, p.buf, p.len) != 0) { shutdown(fd, SHUT_RDWR); break; }
+        if (writen(fd, p.buf, p.len) != 0) {
+            atomic_fetch_add_explicit(&mux_socket_write_errors, 1, memory_order_relaxed);
+            shutdown(fd, SHUT_RDWR); break;
+        }
     }
     return NULL;
 }
@@ -232,6 +239,7 @@ static void *uplink(void *arg) {
         if (conns[start].fd >= 0) idx = start;
         else for (int k = 1; k < Nconn; k++) { int j = (start + k) % Nconn; if (conns[j].fd >= 0) { idx = j; break; } }
         if (idx >= 0) enqueue(idx, frame, (int)(2 + L));
+        else atomic_fetch_add_explicit(&mux_no_link_drops, 1, memory_order_relaxed);
     }
     return NULL;
 }
@@ -282,13 +290,22 @@ static void run_link(int idx, int fd) {
     set_sockopts(fd);
     pthread_mutex_lock(&c->qlock); c->head = c->tail = c->count = 0; pthread_mutex_unlock(&c->qlock);
     c->fd = fd;
-    struct wr_arg *wa = malloc(sizeof(*wa)); wa->idx = idx; wa->fd = fd;
-    pthread_t wt; pthread_create(&wt, NULL, writer, wa);
+    struct wr_arg *wa = malloc(sizeof(*wa));
+    if (!wa) { c->fd = -1; close(fd); return; }
+    wa->idx = idx; wa->fd = fd;
+    pthread_t wt;
+    if (pthread_create(&wt, NULL, writer, wa) != 0) {
+        free(wa); c->fd = -1; close(fd); return;
+    }
     downlink_once(fd);                 /* blocks until the link breaks */
-    c->fd = -1;
-    pthread_cond_signal(&c->qcond);    /* wake the writer so it can exit */
+    c->fd = -2; /* reservation: do not reuse slot while old writer drains */
+    pthread_cond_signal(&c->qcond);
+    /* Wake a writer blocked in a socket write before waiting to join.
+       The owned link has already been marked draining (fd = -2). */
+    shutdown(fd, SHUT_RDWR);
     pthread_join(wt, NULL);
     close(fd);
+    c->fd = -1;
 }
 
 /* client: one thread per slot, keeps a fresh-source-port link alive */
@@ -391,10 +408,19 @@ int tun_main_mux(int argc, char **argv){
             if (fd < 0) { if (errno==EINTR) continue; usleep(100000); continue; }
             if (ca.sin_addr.s_addr != peer_ip.s_addr) { close(fd); continue; }
             int idx=-1;
-            for (int i=0;i<Nconn;i++) if (conns[i].fd<0){ idx=i; break; }
+            for (int i=0;i<Nconn;i++) {
+                int expected = -1;
+                if (atomic_compare_exchange_strong(&conns[i].fd, &expected, -2)) { idx=i; break; }
+            }
             if (idx<0) { close(fd); continue; }                 /* pool full */
-            struct srv_arg *sa=malloc(sizeof(*sa)); sa->fd=fd; sa->idx=idx;
-            pthread_t t; pthread_create(&t,NULL,server_conn,sa); pthread_detach(t);
+            struct srv_arg *sa=malloc(sizeof(*sa));
+            if (!sa) { close(fd); conns[idx].fd=-1; continue; }
+            sa->fd=fd; sa->idx=idx;
+            pthread_t t;
+            if (pthread_create(&t,NULL,server_conn,sa) != 0) {
+                free(sa); close(fd); conns[idx].fd=-1; continue;
+            }
+            pthread_detach(t);
         }
     } else {
         pthread_t th[MAXCONN];
@@ -402,6 +428,10 @@ int tun_main_mux(int argc, char **argv){
         for (int i=0;i<Nconn;i++) pthread_join(th[i], NULL);
     }
     running = 0; pthread_join(up, NULL);
+    fprintf(stderr, "direct link counters: queue_drops=%llu offline_drops=%llu socket_write_errors=%llu\n",
+            (unsigned long long)atomic_load(&mux_queue_drops),
+            (unsigned long long)atomic_load(&mux_no_link_drops),
+            (unsigned long long)atomic_load(&mux_socket_write_errors));
     close(tun_fd);
     return 0;
 }

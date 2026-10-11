@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>OmniTunnel — benchmark twelve transports, keep the winner</title>
-<meta name="description" content="Twelve tunnel transports (gre, icmp, udp, tcp, mux, ws, hysteria, fou, vxlan, reverse-mux, stripe, ackless) in one manager. Benchmark them end-to-end on your own link, in both directions, and keep the winner.">
+<title>OmniTunnel — eleven Direct transports, experimental engineering</title>
+<meta name="description" content="Eleven Direct tunnel transports (gre, icmp, udp, tcp, mux, ws, hysteria, fou, vxlan, stripe, ackless). Performance changes remain experimental until validated.">
 <style>
   :root {
     --bg: #0a0e14;
@@ -438,7 +438,7 @@
       <a href="#install">install</a>
       <a href="#benchmark">benchmark</a>
       <a href="#how">how it works</a>
-      <a href="https://github.com/Free-Guy-IR/OmniTunnel">source</a>
+      <a href="https://github.com/Amam8585/OmniTunnel">source</a>
     </div>
   </div>
 </div>
@@ -460,9 +460,9 @@
         <span>install — run on each box</span>
         <button class="copy-btn" onclick="copyInstall(this)">copy</button>
       </div>
-      <pre id="install-cmd"><span class="tok-cmd">curl</span> -fsSL https://raw.githubusercontent.com/Free-Guy-IR/OmniTunnel/main/install.sh -o /tmp/omnitunnel-install.sh <span class="tok-dim">&&</span> <span class="tok-cmd">sudo bash</span> /tmp/omnitunnel-install.sh</pre>
+      <pre id="install-cmd"><span class="tok-cmd">curl</span> -fsSL https://raw.githubusercontent.com/Amam8585/OmniTunnel/phase2/direct-performance-engineering/install.sh -o /tmp/omnitunnel-install.sh <span class="tok-dim">&&</span> <span class="tok-cmd">sudo env</span> OMNITUN_REF=phase2/direct-performance-engineering bash /tmp/omnitunnel-install.sh --prepare</pre>
     </div>
-    <p class="install-note">One command. Downloads the tool, drops you into the setup wizard. If <code>raw.githubusercontent.com</code> is itself filtered, add <code>--socks5 host:port</code> to the second command.</p>
+    <p class="install-note">Development-only staging on a disposable test VM: checks dependencies, compiles Direct engines and saves a candidate without restarting any running tunnel. Activation requires separate review, explicit apply and verified lab tests.</p>
 
     <div class="pulse-wrap">
       <div class="pulse-label">
@@ -510,136 +510,33 @@
   </section>
 
   <section id="benchmark">
-    <div class="eyebrow"><span class="rule"></span>the evidence</div>
-    <h2>Nothing wins everywhere. So measure it.</h2>
+    <div class="eyebrow"><span class="rule"></span>performance engineering</div>
+    <h2>Measure first. Compare at identical load.</h2>
     <p class="lead">
-      The manager builds every transport end-to-end against your own foreign box,
-      measures <strong>both directions</strong> with parallel streams, tears the test
-      tunnels down again, and ranks what survived. Two real captures, two completely
-      different answers — which is the whole point.
+      OmniTunnel Direct currently provides eleven transport choices. The Phase 2
+      implementation is experimental: no controlled two-server, matched-load
+      performance study has yet proven higher goodput, lower loss or better
+      P95/P99 latency against the baseline.
     </p>
-
     <div class="bench-block">
       <div class="bench-head">
-        <h3>A real run, 10 September 2026</h3>
-        <span class="raw">raw path 228 Mbit/s down &middot; 77.7 up &middot; rtt 83 ms</span>
+        <h3>Benchmark status: NOT TESTED</h3>
+        <span class="raw">development branch &middot; no speed guarantees</span>
       </div>
-      <div class="bench-cols"><span>transport</span><span></span><span>down</span><span>up</span></div>
-        <div class="bench-row win">
-          <div class="bench-name">gre<span class="bench-tag">fastest</span></div>
-          <div class="bench-track"><div class="bench-fill" style="width:100.0%"></div></div>
-          <div class="bench-num">700M</div><div class="bench-num na">FAIL</div>
-        </div>
-        <div class="bench-row">
-          <div class="bench-name">fou<span class="bench-tag">stealth</span></div>
-          <div class="bench-track"><div class="bench-fill" style="width:91.6%"></div></div>
-          <div class="bench-num">641M</div><div class="bench-num">4.62M</div>
-        </div>
-        <div class="bench-row good">
-          <div class="bench-name">icmp<span class="bench-tag">best upload</span></div>
-          <div class="bench-track"><div class="bench-fill" style="width:89.1%"></div></div>
-          <div class="bench-num">624M</div><div class="bench-num">395M</div>
-        </div>
-        <div class="bench-row">
-          <div class="bench-name">vxlan</div>
-          <div class="bench-track"><div class="bench-fill" style="width:80.3%"></div></div>
-          <div class="bench-num">562M</div><div class="bench-num">120M</div>
-        </div>
-        <div class="bench-row">
-          <div class="bench-name">mux</div>
-          <div class="bench-track"><div class="bench-fill" style="width:77.0%"></div></div>
-          <div class="bench-num">539M</div><div class="bench-num">99.2M</div>
-        </div>
-        <div class="bench-row">
-          <div class="bench-name">udp</div>
-          <div class="bench-track"><div class="bench-fill" style="width:76.0%"></div></div>
-          <div class="bench-num">532M</div><div class="bench-num">81.7M</div>
-        </div>
-        <div class="bench-row">
-          <div class="bench-name">ws</div>
-          <div class="bench-track"><div class="bench-fill" style="width:42.9%"></div></div>
-          <div class="bench-num">300M</div><div class="bench-num">79.2M</div>
-        </div>
-        <div class="bench-row">
-          <div class="bench-name">reverse-mux</div>
-          <div class="bench-track"><div class="bench-fill" style="width:33.3%"></div></div>
-          <div class="bench-num">233M</div><div class="bench-num na">FAIL</div>
-        </div>
-        <div class="bench-row dim">
-          <div class="bench-name">hysteria</div>
-          <div class="bench-track"><div class="bench-fill" style="width:28.3%"></div></div>
-          <div class="bench-num">198M</div><div class="bench-num na">FAIL</div>
-        </div>
-        <div class="bench-row dim">
-          <div class="bench-name">tcp</div>
-          <div class="bench-track"><div class="bench-fill" style="width:9.9%"></div></div>
-          <div class="bench-num">69.6M</div><div class="bench-num">99.5M</div>
-        </div>
       <p class="bench-note">
-        One Iran relay to one foreign box, every transport built and torn down in
-        sequence. Download and upload disagree completely: kernel <code class="mono">gre</code>
-        wins the download at 700 Mbit yet returns nothing upstream, and
-        <code class="mono">fou</code> manages 641 down but collapses to 4.62 up. The one
-        transport that carries both is <code class="mono">icmp</code> — 624 down and
-        <strong>395 up, five times the 77.7 Mbit the raw path itself managed</strong>. A
-        download-only ranking would have picked exactly the wrong tunnel here.
+        Evaluate ICMP, UDP, TCP, Direct MUX, Direct WebSocket, GRE, FOU,
+        VXLAN, Hysteria, Stripe and ACKLess only in an authorized lab.
+        Collect CPU, RSS, TUN and userspace drops, goodput, RTT average,
+        P95, P99 and retransmissions at the same traffic load.
+        Existing marketing captures from older releases, including Reverse-MUX,
+        are not presented as current Direct-only performance evidence.
+      </p>
+      <p class="bench-note">
+        Consult the README and benchmark plan for repeatable test conditions,
+        security limitations and rollback. The repository must pass CI and
+        two-peer compatibility checks before production deployment.
       </p>
     </div>
-
-    <div class="bench-block">
-      <div class="bench-head">
-        <h3>A route that polices <em>upload</em></h3>
-        <span class="raw">relay &rarr; NL &middot; same ICMP carrier throughout</span>
-      </div>
-      <div class="bench-cols"><span>transport</span><span></span><span>down</span><span>up</span></div>
-        <div class="bench-row good">
-          <div class="bench-name">icmp <span class="bench-sub">1 flow</span></div>
-          <div class="bench-track"><div class="bench-fill" style="width:77.1%"></div></div>
-          <div class="bench-num na">—</div><div class="bench-num">185M</div>
-        </div>
-        <div class="bench-row bad">
-          <div class="bench-name">icmp <span class="bench-sub">8 flows</span><span class="bench-tag">collapses</span></div>
-          <div class="bench-track"><div class="bench-fill" style="width:9.1%"></div></div>
-          <div class="bench-num na">—</div><div class="bench-num">21.8M</div>
-        </div>
-        <div class="bench-row">
-          <div class="bench-name">reverse-mux <span class="bench-sub">8</span></div>
-          <div class="bench-track"><div class="bench-fill" style="width:94.2%"></div></div>
-          <div class="bench-num na">—</div><div class="bench-num">226M</div>
-        </div>
-        <div class="bench-row win">
-          <div class="bench-name">reverse-mux <span class="bench-sub">32</span><span class="bench-tag">fastest</span></div>
-          <div class="bench-track"><div class="bench-fill" style="width:100.0%"></div></div>
-          <div class="bench-num na">—</div><div class="bench-num">240M</div>
-        </div>
-      <p class="bench-note">
-        Here a download ranking would tell you nothing. One sustained flow uploads at
-        185 Mbit — but the moment real users open eight at once the aggregate
-        collapses to 21.8. <code class="mono">reverse-mux</code> funnels every
-        connection into a single flow, so the policer never sees the parallel burst it
-        punishes: <strong>226 Mbit at 8 streams, 240 at 32</strong> — a ~10&times;
-        upload difference on the same link. On this same path raw ICMP
-        echo-<em>request</em> was 100% dropped while echo-<em>reply</em> passed untouched.
-      </p>
-    </div>
-
-    <p class="bench-note">
-      Both tables came straight out of <code class="mono">omnitunnel bench</code>. Your
-      link will land somewhere else — run it, keep the winner, re-run it whenever
-      conditions change.
-    </p>
-
-    <p class="bench-note">
-      A third shape is a route that <strong>byte-caps every connection</strong> — each
-      5-tuple carries a fixed budget (seen around ~8760&nbsp;B) and is then silently
-      blackholed, so every long-lived carrier dies after its first burst. The eleventh
-      transport, <code class="mono">stripe</code>, is built for exactly that: it shards
-      one flow across a rolling pool of short-lived connections, each retired before it
-      reaches the cap. So far it is proven in a local network namespace
-      (<strong>126 Mbit download-only, stable bidirectional</strong>); real byte-capped
-      Iran&rarr;foreign numbers are still being captured, so it is not yet in the
-      <code class="mono">bench</code> tables above.
-    </p>
   </section>
 
   <section id="how">
@@ -651,22 +548,22 @@
       <div class="step">
         <div class="num">01</div>
         <div>
-          <h3>Client always sends type 8</h3>
-          <p>A genuine Echo Request, addressed to the peer's real IP — indistinguishable on the wire from a normal <code class="mono">ping</code>.</p>
+          <h3>Default client emits ICMP type 8</h3>
+          <p>An Echo Request to the peer public IP. The optional -r setting may change this; encapsulated payload lengths do not guarantee ordinary ping camouflage.</p>
         </div>
       </div>
       <div class="step">
         <div class="num">02</div>
         <div>
-          <h3>Server always answers with type 0</h3>
-          <p>A real Echo Reply. Paths that permit "a reply to my own request" while treating an unsolicited inbound request as a fresh connection never see the difference.</p>
+          <h3>Default server emits ICMP type 0</h3>
+          <p>An Echo Reply by default; operators may explicitly select another ICMP reply/request mode. Real network policy may still drop these packets.</p>
         </div>
       </div>
       <div class="step">
         <div class="num">03</div>
         <div>
           <h3>Per-flow reordering restores order</h3>
-          <p>Each inner packet's own 5-tuple keys its own small reorder buffer, so one connection's reordering event can never delay an unrelated flow — including a bare health-check ping.</p>
+          <p>The inner flow key scopes sequence reordering to each flow, reducing cross-flow head-of-line stalls. Shared kernel/TUN queues can still affect unrelated traffic.</p>
         </div>
       </div>
       <div class="step">
@@ -765,7 +662,7 @@ omnitunnel mux-add main 443 127.0.0.1 443
 omnitunnel add-auto   gre    second  &lt;foreign_ip&gt;
 omnitunnel add-manual gre    second  &lt;foreign_ip&gt;
 omnitunnel add-auto   stripe striped &lt;foreign_ip&gt;</div>
-    <p style="font-size:14px;">Full reference, architecture notes, and the source itself live in the <a href="https://github.com/Free-Guy-IR/OmniTunnel">repository</a>.</p>
+    <p style="font-size:14px;">Full reference, architecture notes, and the source itself live in the <a href="https://github.com/Amam8585/OmniTunnel">repository</a>.</p>
   </section>
 
 </div>
@@ -773,13 +670,13 @@ omnitunnel add-auto   stripe striped &lt;foreign_ip&gt;</div>
 <footer>
   <div class="wrap foot-row">
     <span>OmniTunnel · MIT licensed</span>
-    <span><a href="https://github.com/Free-Guy-IR/OmniTunnel">github.com/Free-Guy-IR/OmniTunnel</a></span>
+    <span><a href="https://github.com/Amam8585/OmniTunnel">github.com/Amam8585/OmniTunnel</a></span>
   </div>
 </footer>
 
 <script>
   function copyInstall(btn) {
-    var text = "curl -fsSL https://raw.githubusercontent.com/Free-Guy-IR/OmniTunnel/main/install.sh -o /tmp/omnitunnel-install.sh && sudo bash /tmp/omnitunnel-install.sh";
+    var text = "curl -fsSL https://raw.githubusercontent.com/Amam8585/OmniTunnel/phase2/direct-performance-engineering/install.sh -o /tmp/omnitunnel-install.sh && sudo env OMNITUN_REF=phase2/direct-performance-engineering bash /tmp/omnitunnel-install.sh --prepare";
     navigator.clipboard.writeText(text).then(function () {
       var orig = btn.textContent;
       btn.textContent = "copied";

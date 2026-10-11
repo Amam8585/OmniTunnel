@@ -148,10 +148,14 @@ static int decapsulate(const unsigned char *buf, int len,
        IHL field rather than assuming a fixed 20 bytes. */
     if (len < (int)sizeof(struct iphdr)) return -1;
     const struct iphdr *iph = (const struct iphdr*)buf;
+    if (iph->version != 4 || iph->protocol != IPPROTO_ICMP) return -1;
     int ip_hlen = iph->ihl * 4;
     if (ip_hlen < 20 || len < ip_hlen + (int)sizeof(struct icmphdr)) return -1;
     buf += ip_hlen;
     len -= ip_hlen;
+    /* Reject ICMP frames with a corrupt checksum rather than trusting the
+       raw socket to enforce it. No wire header bytes or cipher are changed. */
+    if (cksum(buf, len) != 0) return -1;
     const struct icmphdr *icmp = (const struct icmphdr*)buf;
     /* Client expects genuine Echo Reply (type 0) from the server, tagged
        with the server's own id; server expects genuine Echo Request
@@ -255,10 +259,11 @@ typedef struct {
     uint32_t   last_seen_ms;
     uint16_t   rx_next_seq;
     uint16_t   tx_next_seq;
-    uint16_t   generation;    /* invalidates stale timer-heap entries after evict/reuse */
+    uint64_t   generation;    /* prevent stale timer alias on 16-bit wrap */
+    uint16_t   pending;       /* buffered out-of-order frames */
     uint8_t    role;
     uint8_t    valid;
-    uint32_t   timer_deadline; /* 0 = no pending reorder timeout for this flow */
+    uint64_t   timer_deadline; /* 0 = no pending reorder timeout for this flow */
     rslot_t    rbuf[REORDER_WINDOW];
 } flow_entry_t;
 
@@ -269,7 +274,7 @@ typedef struct {
 static flow_bucket_t *flow_table;
 static unsigned flow_bucket_count = DEFAULT_FLOW_SLOTS / FLOW_TABLE_WAYS;
 static unsigned flow_slots = DEFAULT_FLOW_SLOTS;
-static uint32_t loop_clock_ms;
+static uint64_t loop_clock_ms;
 static struct {
     uint64_t tun_rx, tun_tx, icmp_rx, icmp_tx, rx_bytes, tx_bytes;
     uint64_t queue_full, queue_peak, tun_queue_drops, tun_queue_peak, send_errors, recv_errors, tun_errors;
@@ -364,9 +369,9 @@ static void emit_stats(uint64_t uptime_ms) {
 }
 
 typedef struct {
-    uint32_t deadline;
+    uint64_t deadline;
     flow_entry_t *flow;
-    uint16_t generation;
+    uint64_t generation;
 } timer_event_t;
 
 static timer_event_t *timer_heap;
@@ -477,6 +482,7 @@ static void flow_evict(flow_entry_t *f) {
     for (int i = 0; i < REORDER_WINDOW; i++) {
         if (f->rbuf[i].pkt) { free(f->rbuf[i].pkt); f->rbuf[i].pkt = NULL; }
     }
+    f->pending = 0;
 }
 
 static flow_entry_t *flow_table_insert(const flow_key_t *key, uint32_t hash, uint8_t role) {
@@ -516,6 +522,7 @@ static flow_entry_t *flow_table_insert(const flow_key_t *key, uint32_t hash, uin
     victim->rx_next_seq = 0;
     victim->tx_next_seq = 0;
     victim->timer_deadline = 0;
+    victim->pending = 0;
     victim->generation++;
     for (int i = 0; i < REORDER_WINDOW; i++) victim->rbuf[i].pkt = NULL;
     return victim;
@@ -550,12 +557,35 @@ static void timer_heap_sift_down(int i) {
     }
 }
 
+static void flow_flush(flow_entry_t *f);
+
+/* Compaction guarantees that stale deadlines cannot exhaust the timer heap.
+   At most one valid deadline per live flow is copied into the new heap.
+   We intentionally do not rely on a non-existent periodic full-table sweep. */
+static void timer_heap_rebuild(void) {
+    timer_heap_size = 0;
+    for (unsigned bucket = 0; bucket < flow_bucket_count; bucket++) {
+        for (int way = 0; way < FLOW_TABLE_WAYS; way++) {
+            flow_entry_t *entry = &flow_table[bucket].slots[way];
+            if (!entry->valid || !entry->timer_deadline || !entry->pending) continue;
+            if (timer_heap_size >= timer_heap_capacity) {
+                /* With 4x slot capacity this is unreachable, but don't stall
+                   delivery if future size/config changes violate that invariant. */
+                flow_flush(entry);
+                continue;
+            }
+            int i = timer_heap_size++;
+            timer_heap[i].deadline = entry->timer_deadline;
+            timer_heap[i].flow = entry;
+            timer_heap[i].generation = entry->generation;
+            timer_heap_sift_up(i);
+        }
+    }
+}
 static void timer_heap_push(flow_entry_t *f) {
     if (timer_heap_size >= timer_heap_capacity) {
-        /* Shouldn't happen (bounded by flow table size), but never
-           overflow the array - the deadline still fires via the flow's
-           own timer_deadline check during periodic flush sweeps if this
-           ever gets hit; drop the heap-acceleration for this one event. */
+        timer_heap_rebuild();
+        /* Rebuild already inserted this flow and its newest deadline. */
         return;
     }
     timer_heap[timer_heap_size].deadline = f->timer_deadline;
@@ -577,12 +607,13 @@ static void timer_heap_clean(void) {
     }
 }
 
-static uint32_t timer_heap_min_deadline(void) {
+static uint64_t timer_heap_min_deadline(void) {
     timer_heap_clean();
     return timer_heap_size ? timer_heap[0].deadline : 0;
 }
 
 static void flow_flush(flow_entry_t *f) {
+    if (!f->pending) { f->timer_deadline = 0; return; }
     uint16_t start = f->rx_next_seq;
     uint16_t max_delivered = f->rx_next_seq;
     int any = 0;
@@ -596,15 +627,24 @@ static void flow_flush(flow_entry_t *f) {
             DBG("DBG reorder: timeout-flush seq=%u to tun\n", seq);
             free(slot->pkt);
             slot->pkt = NULL;
+            if (f->pending) f->pending--;
             max_delivered = seq;
             any = 1;
         }
     }
     if (any) f->rx_next_seq = (uint16_t)(max_delivered + 1);
+    /* Flush may follow a resynchronization: reclaim stale orphan slots. */
+    if (f->pending) {
+        for (int i = 0; i < REORDER_WINDOW; i++) {
+            free(f->rbuf[i].pkt);
+            f->rbuf[i].pkt = NULL;
+        }
+        f->pending = 0;
+    }
     f->timer_deadline = 0;
 }
 
-static void timer_heap_process_expired(uint32_t now) {
+static void timer_heap_process_expired(uint64_t now) {
     timer_heap_clean();
     while (timer_heap_size > 0 && timer_heap[0].deadline <= now) {
         timer_event_t e = timer_heap[0];
@@ -619,21 +659,18 @@ static void timer_heap_process_expired(uint32_t now) {
 }
 
 static int reorder_gap_pending(const flow_entry_t *f) {
-    for (int i = 0; i < REORDER_WINDOW; i++) if (f->rbuf[i].pkt) return 1;
-    return 0;
+    return f->pending != 0;
 }
 
-/* inner/inner_len must be a heap buffer the caller is handing off
-   ownership of - flow_rx_packet either writes+frees it immediately or
-   stores it in the flow's own reorder slot until delivered or timed out. */
-static void flow_rx_packet(flow_entry_t *f, unsigned char *inner, uint16_t inner_len, uint16_t seq) {
+/* Caller owns input data. Only an out-of-order frame needs a heap copy.
+   Reorder slots own their data until delivery, timeout or eviction. */
+static void flow_rx_packet(flow_entry_t *f, const unsigned char *inner, uint16_t inner_len, uint16_t seq) {
     uint16_t expected = f->rx_next_seq;
     uint16_t delta = (uint16_t)(seq - expected);
 
     if (delta == 0) {
         tun_deliver(inner, inner_len);
         DBG("DBG reorder: in-order seq=%u to tun\n", seq);
-        free(inner);
         f->rx_next_seq++;
         while (1) {
             int idx = f->rx_next_seq & (REORDER_WINDOW - 1);
@@ -643,6 +680,7 @@ static void flow_rx_packet(flow_entry_t *f, unsigned char *inner, uint16_t inner
                 DBG("DBG reorder: drained seq=%u to tun\n", slot->seq);
                 free(slot->pkt);
                 slot->pkt = NULL;
+                if (f->pending) f->pending--;
                 f->rx_next_seq++;
             } else break;
         }
@@ -650,9 +688,13 @@ static void flow_rx_packet(flow_entry_t *f, unsigned char *inner, uint16_t inner
     } else if (delta < REORDER_WINDOW) {
         metrics.reordered++;
         int idx = seq & (REORDER_WINDOW - 1);
-        if (f->rbuf[idx].pkt && f->rbuf[idx].seq == seq) { free(inner); return; } /* duplicate */
-        if (f->rbuf[idx].pkt) free(f->rbuf[idx].pkt); /* stale leftover, shouldn't happen */
-        f->rbuf[idx].pkt = inner;
+        if (f->rbuf[idx].pkt && f->rbuf[idx].seq == seq) return; /* duplicate */
+        unsigned char *buffered = malloc(inner_len);
+        if (!buffered) { metrics.alloc_failures++; return; }
+        memcpy(buffered, inner, inner_len);
+        if (f->rbuf[idx].pkt) free(f->rbuf[idx].pkt); /* replacement */
+        else f->pending++;
+        f->rbuf[idx].pkt = buffered;
         f->rbuf[idx].len = inner_len;
         f->rbuf[idx].seq = seq;
         DBG("DBG reorder: buffered seq=%u (expected %u)\n", seq, expected);
@@ -671,7 +713,6 @@ static void flow_rx_packet(flow_entry_t *f, unsigned char *inner, uint16_t inner
         flow_flush(f);
         tun_deliver(inner, inner_len);
         DBG("DBG reorder: resync to tun\n");
-        free(inner);
         f->rx_next_seq = (uint16_t)(seq + 1);
     }
 }
@@ -679,11 +720,11 @@ static void flow_rx_packet(flow_entry_t *f, unsigned char *inner, uint16_t inner
 /* epoll_wait timeout: the minimum remaining time across every flow
    currently waiting on a missing packet, or the normal idle timeout */
 static int flow_epoll_timeout(void) {
-    uint32_t now = (uint32_t)now_ms();
-    uint32_t deadline = timer_heap_min_deadline();
+    uint64_t now = now_ms();
+    uint64_t deadline = timer_heap_min_deadline();
     if ((sq_count && !send_blocked) || (tun_count && !tun_blocked)) return 0;
     if (!deadline) return 1000;
-    return deadline > now ? (int)(deadline - now) : 0;
+    return deadline > now ? (int)((deadline - now) < 1000 ? (deadline - now) : 1000) : 0;
 }
 
 static void send_set_writable(int enabled) {
@@ -962,13 +1003,13 @@ int tun_main_icmp(int argc, char **argv) {
     struct sockaddr_in from;
     socklen_t fromlen;
 
-    loop_clock_ms = (uint32_t)now_ms();
+    loop_clock_ms = now_ms();
     while (running) {
-        loop_clock_ms = (uint32_t)now_ms();
+        loop_clock_ms = now_ms();
         struct epoll_event events[2];
         int nfds = epoll_wait(epoll_fd, events, 2, flow_epoll_timeout());
         if (nfds < 0) { if (errno == EINTR) continue; break; }
-        loop_clock_ms = (uint32_t)now_ms();
+        loop_clock_ms = now_ms();
 
         for (int i = 0; i < nfds; i++) {
             if (events[i].data.fd == tun_fd) {
@@ -1034,12 +1075,8 @@ int tun_main_icmp(int argc, char **argv) {
                             memset(&key, 0, sizeof(key));
                             f = flow_get_or_create(&key, flow_key_hash(&key), FLOW_ROLE_RX);
                         }
-                        unsigned char *copy = malloc(inlen);
-                        if (copy) {
-                            memcpy(copy, inner, inlen);
-                            metrics.rx_bytes += (uint64_t)inlen;
-                            flow_rx_packet(f, copy, (uint16_t)inlen, seq);
-                        } else metrics.alloc_failures++;
+                        metrics.rx_bytes += (uint64_t)inlen;
+                        flow_rx_packet(f, inner, (uint16_t)inlen, seq);
                     } else {
                         metrics.invalid_packets++;
                         DBG("DBG decapsulate rejected packet\n");
@@ -1047,7 +1084,7 @@ int tun_main_icmp(int argc, char **argv) {
                 }
             }
         }
-        timer_heap_process_expired((uint32_t)now_ms());
+        timer_heap_process_expired(now_ms());
         send_flush();
         tun_drain();
         emit_stats(now_ms());
@@ -1057,6 +1094,15 @@ int tun_main_icmp(int argc, char **argv) {
     close(tun_fd); close(icmp_fd); close(epoll_fd);
     free(send_queue);
     free(tun_pending);
+    /* Reclaim any outstanding out-of-order packet buffers before freeing
+       the flow table (important for sanitizer/long-lived subprocess tests). */
+    for (unsigned bucket = 0; bucket < flow_bucket_count; bucket++) {
+        for (int way = 0; way < FLOW_TABLE_WAYS; way++) {
+            flow_entry_t *entry = &flow_table[bucket].slots[way];
+            for (int slot = 0; slot < REORDER_WINDOW; slot++)
+                free(entry->rbuf[slot].pkt);
+        }
+    }
     free(flow_table);
     free(timer_heap);
     if (stats_path[0]) unlink(stats_path);

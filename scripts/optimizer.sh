@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Per-Direct-ICMP conservative optimizer. Never changes global sysctls, routes, or firewall.
+# Direct optimizer. Read-only diagnostics cover all eleven carriers.\n# Only owned L3 instance queue lengths are explicitly adjustable.
 set -euo pipefail
 ACTION="${1:-status}"; INSTANCE="${2:-}"; PROFILE="${3:-balanced}"; ACK="${4:-}"
 [[ "$ACTION" == status || "$ACTION" == recommend || "$ACTION" == dry-run || "$ACTION" == apply || "$ACTION" == rollback || "$ACTION" == compare ]] ||
@@ -9,7 +9,20 @@ conf="/etc/omnitunnel/inst/$INSTANCE/instance.conf"
 [[ -r "$conf" ]] || { echo "missing instance: $INSTANCE" >&2; exit 1; }
 type="$(sed -n 's/^TYPE=//p' "$conf" | head -1)"
 dev="$(sed -n 's/^DEV=//p' "$conf" | head -1)"
-[[ "$type" == icmp ]] || { echo "optimizer restricted to Direct ICMP (found: $type)" >&2; exit 1; }
+case "$type" in
+    icmp|udp|tcp|mux|ws|gre|fou|vxlan|stripe|ackless|hysteria) ;;
+    *) echo "unsupported Direct transport $type" >&2; exit 1;;
+esac
+if [[ "$type" == hysteria ]]; then
+    case "$ACTION" in
+        status|recommend|dry-run|compare)
+            echo "Hysteria: QUIC/SOCKS engine, no dedicated kernel TUN device."
+            echo "Engine: $(/usr/local/bin/hysteria version 2>&1 | head -1 || echo not-installed)"
+            echo "Only native engine/relay diagnostics possible; no interface modified.";;
+        *) echo "No per-instance L3 interface; refusing Hysteria queue mutation" >&2; exit 1;;
+    esac
+    exit 0
+fi
 [[ "$dev" =~ ^[A-Za-z0-9_-]{1,15}$ ]] || { echo "invalid TUN device" >&2; exit 1; }
 command -v ip >/dev/null || { echo "iproute2 missing" >&2; exit 1; }
 ip link show dev "$dev" >/dev/null || { echo "interface $dev is not up; changes refused" >&2; exit 1; }
@@ -17,9 +30,9 @@ get_qlen() { ip -o link show dev "$dev" | grep -oE 'qlen [0-9]+' | awk '{print $
 cur="$(get_qlen)"
 [[ "$cur" =~ ^[0-9]+$ ]] || { echo "unknown queue size for $dev" >&2; exit 1; }
 case "$PROFILE" in
-    balanced) proposed=1024;;
-    low-latency) proposed=512;;
-    high-throughput) proposed=2048;;
+    balanced) proposed="$cur";;
+    low-latency) proposed="$((cur > 512 ? 512 : cur))";;
+    high-throughput) proposed="$((cur < 2048 ? 2048 : cur))";;
     *) echo "unknown profile $PROFILE" >&2; exit 2;;
 esac
 backup_dir="/var/lib/omnitunnel/optimizer"
@@ -28,7 +41,7 @@ stats="/run/omnitunnel/icmp-$dev.json"
 status() {
     echo "Device: $dev | Direct protocol: $type | current TUN txqueuelen: $cur"
     echo "Kernel: $(uname -r); CPU cores: $(nproc); RAM: $(awk '/MemTotal:/{printf "%.0f MiB",$2/1024}' /proc/meminfo)"
-    ip -s link show dev "$dev"
+    ip -s link show dev "$dev"\n    echo "Interface details and MTU:"; ip -d link show dev "$dev" || true
     if command -v tc >/dev/null; then tc qdisc show dev "$dev"; fi
     if [[ -r /proc/sys/net/netfilter/nf_conntrack_max ]]; then
         echo "Conntrack: $(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo n/a)/$(cat /proc/sys/net/netfilter/nf_conntrack_max)"
@@ -46,6 +59,8 @@ case "$ACTION" in
         status
         echo "Candidate $PROFILE -> ip link set dev $dev txqueuelen $proposed (current=$cur)"
         echo "Experimental only. Lower kernel drop counts can mean longer queues and worse RTT."
+        echo "Hypothetical, NOT certified: compare matched-load goodput, P95/P99, and drops."
+        echo "GRE/FOU/VXLAN use kernel transport; no fake userspace transport is created."
         echo "No global sysctl, rp_filter, default route, firewall, qdisc, or other tunnel changed.";;
     compare)
         status
@@ -59,11 +74,15 @@ case "$ACTION" in
         [[ $EUID -eq 0 ]] || { echo "root required for apply" >&2; exit 1; }
         [[ "$ACK" == --acknowledge ]] ||
             { echo "Explicit opt-in required: optimizer.sh apply $INSTANCE $PROFILE --acknowledge" >&2; exit 2; }
+        [[ "$dev" == ts-* || "$dev" =~ ^ts[0-9]{4,}$ ]] ||
+            { echo "non-owned-looking interface, refusing change: $dev" >&2; exit 1; }
         mkdir -p "$backup_dir"
         if [[ ! -f "$snap" ]]; then
             printf '%s %s %s %s\n' "$dev" "$cur" "$PROFILE" "$(date -u +%FT%TZ)" > "$snap.tmp"
             mv -f "$snap.tmp" "$snap"
         fi
+        [[ "$proposed" != "$cur" ]] ||
+            { echo "Balanced/no-op: the current queue is unchanged"; exit 0; }
         ip link set dev "$dev" txqueuelen "$proposed"
         updated="$(get_qlen)"
         [[ "$updated" == "$proposed" ]] ||
@@ -76,6 +95,8 @@ case "$ACTION" in
         read -r olddev before _ < "$snap"
         [[ "$olddev" == "$dev" && "$before" =~ ^[0-9]+$ ]] ||
             { echo "backup does not match this interface" >&2; exit 1; }
+        [[ "$dev" == ts-* || "$dev" =~ ^ts[0-9]{4,}$ ]] ||
+            { echo "non-owned interface: rollback refused" >&2; exit 1; }
         ip link set dev "$dev" txqueuelen "$before"
         [[ "$(get_qlen)" == "$before" ]] || { echo "rollback validation failed" >&2; exit 1; }
         rm -f "$snap"
