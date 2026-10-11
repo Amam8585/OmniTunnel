@@ -198,34 +198,102 @@ static void b64(const unsigned char *in, int len, char *out) {
 static _Thread_local uint32_t xs = 0;
 static unsigned char xs_byte(void){ if(!xs){ts_random(&xs,4); if(!xs)xs=2463534242u;} xs^=xs<<13; xs^=xs>>17; xs^=xs<<5; return (unsigned char)(xs&0xff); }
 
-/* read HTTP headers up to the blank line; 0 = ok, -1 = fail */
-static int ws_read_headers(int fd) {
-    char b[4]={0}; int seen=0, total=0;
-    while (total++ < 8192) {
-        unsigned char c; ssize_t r = read(fd, &c, 1);
-        if (r <= 0) { if (r < 0 && errno == EINTR) continue; return -1; }
-        b[0]=b[1]; b[1]=b[2]; b[2]=b[3]; b[3]=c;
-        if (b[0]=='\r'&&b[1]=='\n'&&b[2]=='\r'&&b[3]=='\n') { seen=1; break; }
+/* RFC 6455: SHA-1(key || 36-byte GUID), then base64-encode.
+ * Handshake-only, never used for authentication (payload is AEAD-protected). */
+static uint32_t ws_rotl(uint32_t x, unsigned n) { return (x << n) | (x >> (32 - n)); }
+static int ws_sha1(const unsigned char *input, size_t len, unsigned char out[20]) {
+    unsigned char msg[128] = {0};
+    size_t total = (len + 9 + 63) & ~(size_t)63;
+    if (total > sizeof(msg)) return -1;
+    memcpy(msg, input, len); msg[len] = 0x80;
+    uint64_t bits = (uint64_t)len * 8;
+    for (unsigned i = 0; i < 8; i++) msg[total - 1 - i] = (unsigned char)(bits >> (i*8));
+    uint32_t h[5] = {0x67452301u,0xefcdab89u,0x98badcfeu,0x10325476u,0xc3d2e1f0u};
+    for (size_t off = 0; off < total; off += 64) {
+        uint32_t w[80];
+        for (unsigned i = 0; i < 16; i++) {
+            size_t n = off + i*4;
+            w[i] = ((uint32_t)msg[n]<<24)|((uint32_t)msg[n+1]<<16)|
+                   ((uint32_t)msg[n+2]<<8)|(uint32_t)msg[n+3];
+        }
+        for (unsigned i = 16; i < 80; i++)
+            w[i] = ws_rotl(w[i-3]^w[i-8]^w[i-14]^w[i-16],1);
+        uint32_t a=h[0],b=h[1],c=h[2],d=h[3],e=h[4];
+        for (unsigned i=0; i<80; i++) {
+            uint32_t f,k;
+            if (i<20) { f=(b&c)|(~b&d); k=0x5a827999u; }
+            else if (i<40) { f=b^c^d; k=0x6ed9eba1u; }
+            else if (i<60) { f=(b&c)|(b&d)|(c&d); k=0x8f1bbcdcu; }
+            else { f=b^c^d; k=0xca62c1d6u; }
+            uint32_t t=ws_rotl(a,5)+f+e+k+w[i];
+            e=d; d=c; c=ws_rotl(b,30); b=a; a=t;
+        }
+        h[0]+=a; h[1]+=b; h[2]+=c; h[3]+=d; h[4]+=e;
     }
-    return seen ? 0 : -1;
+    for (unsigned i=0; i<20; i++) out[i]=(unsigned char)(h[i/4] >> (24-8*(i%4)));
+    return 0;
+}
+static int ws_accept(const char *key64, char out[29]) {
+    static const char guid[]="258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    if (strlen(key64)!=24) return -1;
+    for (unsigned i=0;i<24;i++) {
+        const unsigned char c=(unsigned char)key64[i];
+        if (!(c>='A'&&c<='Z') && !(c>='a'&&c<='z') &&
+            !(c>='0'&&c<='9') && c!='+' && c!='/' && c!='=') return -1;
+    }
+    unsigned char msg[60],hash[20];
+    memcpy(msg,key64,24); memcpy(msg+24,guid,36);
+    if (ws_sha1(msg,sizeof(msg),hash)!=0) return -1;
+    b64(hash,20,out);
+    return 0;
+}
+/* Read bounded HTTP headers, preserving them for RFC 6455 validation.
+ * One-byte reads are confined to handshake setup, not the data hot path. */
+static int ws_read_headers(int fd, char *buf, size_t cap) {
+    size_t size=0;
+    if (!cap) return -1;
+    while (size < cap-1) {
+        unsigned char c; ssize_t r=read(fd,&c,1);
+        if (r<=0) { if (r<0 && errno==EINTR) continue; return -1; }
+        buf[size++]=(char)c; buf[size]=0;
+        if (size>=4 && !memcmp(buf+size-4,"\r\n\r\n",4)) return 0;
+    }
+    return -1;
 }
 static int ws_client_handshake(int fd) {
-    unsigned char rk[16]; for (int i=0;i<16;i++) rk[i]=xs_byte();
+    unsigned char rk[16]; ts_random(rk,sizeof(rk));
     char kb[32]; b64(rk,16,kb);
-    char req[512];
+    char req[512], headers[8193];
     int n = snprintf(req,sizeof(req),
         "GET /ws HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
         "Sec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n"
         "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)\r\n\r\n", WS_HOST, kb);
-    if (writen(fd,(unsigned char*)req,n) != 0) return -1;
-    return ws_read_headers(fd);
+    if (n<0 || (size_t)n>=sizeof(req) || writen(fd,(unsigned char*)req,(size_t)n) != 0) return -1;
+    if (ws_read_headers(fd,headers,sizeof(headers))!=0) return -1;
+    /* Accept legacy server response for backwards compatibility. This
+       validates the HTTP upgrade status, not the peer identity; PSK AEAD
+       remains mandatory for payload integrity and confidentiality. */
+    return !strncmp(headers,"HTTP/1.1 101 ",13) ? 0 : -1;
 }
 static int ws_server_handshake(int fd) {
-    if (ws_read_headers(fd) < 0) return -1;
-    static const char *resp =
+    char req[8193], key[25], accepted[29], resp[512];
+    if (ws_read_headers(fd,req,sizeof(req))!=0) return -1;
+    if (strncmp(req,"GET ",4)!=0 || !strcasestr(req,"\r\nUpgrade: websocket") ||
+        !strcasestr(req,"\r\nConnection: Upgrade") ||
+        !strcasestr(req,"\r\nSec-WebSocket-Version: 13")) return -1;
+    const char *v = strcasestr(req,"\r\nSec-WebSocket-Key:");
+    if (!v) return -1;
+    v+=strlen("\r\nSec-WebSocket-Key:");
+    while (*v==' '||*v=='\t') ++v;
+    const char *end=strstr(v,"\r\n");
+    if (!end || end-v!=24) return -1;
+    memcpy(key,v,24); key[24]=0;
+    if (ws_accept(key,accepted)!=0) return -1;
+    int n=snprintf(resp,sizeof(resp),
         "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
-        "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nServer: cloudflare\r\n\r\n";
-    return writen(fd,(const unsigned char*)resp,strlen(resp));
+        "Sec-WebSocket-Accept: %s\r\nServer: cloudflare\r\n\r\n",accepted);
+    if (n<0 || (size_t)n>=sizeof(resp)) return -1;
+    return writen(fd,(const unsigned char*)resp,(size_t)n);
 }
 /* build a binary WS frame (opcode 0x2) around payload p[plen] into d; masked
  * when mask!=0 (clients must mask). returns total frame length. */
