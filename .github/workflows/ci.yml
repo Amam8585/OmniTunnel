@@ -94,3 +94,31 @@ jobs:
             bash "$t"
             echo "::endgroup::"
           done
+
+  direct-c:
+    name: Direct C core and sanitizer tests (${{ matrix.os })
+    runs-on: ${{ matrix.os }
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate shell syntax
+        run: |
+          bash -n install.sh omnitunnel.sh icmptun-ctl.sh
+          for t in tests/*.sh; do bash -n "$t"; done
+      - name: Build all C Direct engines
+        run: |
+          gcc -O2 -Wall -Wextra -fstack-protector-strong -D_FORTIFY_SOURCE=2 \
+            -o /tmp/omnitun src/main.c src/obsctun.c src/obsctcp.c \
+            src/obscmux.c src/obscws.c src/icmptun.c src/monocypher.c -pthread
+          /tmp/omnitun version
+      - name: Sanitizer unit tests
+        run: |
+          gcc -O1 -g -Wall -Wextra -fsanitize=address,undefined -fno-omit-frame-pointer \
+            -o /tmp/icmptun-core-tests tests/icmptun_core_test.c
+          ASAN_OPTIONS=detect_leaks=1 /tmp/icmptun-core-tests
+      - name: Direct preservation and shell tests
+        run: |
+          for t in tests/*.sh; do bash "$t"; done
