@@ -272,7 +272,7 @@ static unsigned flow_slots = DEFAULT_FLOW_SLOTS;
 static uint32_t loop_clock_ms;
 static struct {
     uint64_t tun_rx, tun_tx, icmp_rx, icmp_tx, rx_bytes, tx_bytes;
-    uint64_t queue_full, queue_peak, send_errors, recv_errors, tun_errors;
+    uint64_t queue_full, queue_peak, tun_queue_drops, tun_queue_peak, send_errors, recv_errors, tun_errors;
     uint64_t invalid_packets, flow_evictions, flow_collisions, active_flows;
     uint64_t reordered, reorder_timeouts, alloc_failures;
 } metrics;
@@ -319,12 +319,13 @@ static void tun_deliver(const unsigned char *data, uint16_t len) {
             metrics.tun_errors++; return;
         }
     }
-    if (tun_count >= TUN_PENDING_LIMIT) { metrics.tun_errors++; return; }
+    if (tun_count >= TUN_PENDING_LIMIT) { metrics.tun_queue_drops++; return; }
     tun_pending_t *p = &tun_pending[tun_tail];
     memcpy(p->data, data, len);
     p->len = len;
     tun_tail = (tun_tail + 1) % TUN_PENDING_LIMIT;
     tun_count++;
+    if (tun_count > metrics.tun_queue_peak) metrics.tun_queue_peak = tun_count;
     tun_set_writable(1);
 }
 static void emit_stats(uint64_t uptime_ms) {
@@ -340,6 +341,7 @@ static void emit_stats(uint64_t uptime_ms) {
       "{\"timestamp_ms\":%llu,\"tun_rx_packets\":%llu,\"tun_tx_packets\":%llu,"
       "\"icmp_rx_packets\":%llu,\"icmp_tx_packets\":%llu,\"rx_bytes\":%llu,\"tx_bytes\":%llu,"
       "\"queue_drops\":%llu,\"queue_length\":%d,\"queue_peak\":%llu,"
+      "\"tun_queue_drops\":%llu,\"tun_queue_length\":%u,\"tun_queue_peak\":%llu,"
       "\"send_errors\":%llu,\"recv_errors\":%llu,\"tun_errors\":%llu,"
       "\"invalid_packets\":%llu,\"active_flows\":%llu,\"flow_evictions\":%llu,"
       "\"flow_collisions\":%llu,\"reorder_events\":%llu,\"reorder_timeouts\":%llu,"
@@ -349,6 +351,8 @@ static void emit_stats(uint64_t uptime_ms) {
       (unsigned long long)metrics.icmp_tx, (unsigned long long)metrics.rx_bytes,
       (unsigned long long)metrics.tx_bytes, (unsigned long long)metrics.queue_full,
       sq_count, (unsigned long long)metrics.queue_peak,
+      (unsigned long long)metrics.tun_queue_drops, tun_count,
+      (unsigned long long)metrics.tun_queue_peak,
       (unsigned long long)metrics.send_errors, (unsigned long long)metrics.recv_errors,
       (unsigned long long)metrics.tun_errors, (unsigned long long)metrics.invalid_packets,
       (unsigned long long)metrics.active_flows, (unsigned long long)metrics.flow_evictions,
@@ -496,7 +500,14 @@ static flow_entry_t *flow_table_insert(const flow_key_t *key, uint32_t hash, uin
 
     if (victim->valid) flow_evict(victim);
     metrics.active_flows++;
-    if (b->slots[0].valid && victim != &b->slots[0]) metrics.flow_collisions++;
+    /* Count bucket contention: at least one *other* key already occupies
+     * this bucket. This is not a full 32-bit hash collision metric. */
+    for (int way = 0; way < FLOW_TABLE_WAYS; ++way) {
+        if (&b->slots[way] != victim && b->slots[way].valid) {
+            metrics.flow_collisions++;
+            break;
+        }
+    }
 
     victim->key = *key;
     victim->valid = 1;
