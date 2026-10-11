@@ -198,9 +198,19 @@ static void b64(const unsigned char *in, int len, char *out) {
     }
     out[o]=0;
 }
-/* cheap PRNG for WS mask keys (masking is cosmetic - AEAD does the real work) */
-static _Thread_local uint32_t xs = 0;
-static unsigned char xs_byte(void){ if(!xs){ts_random(&xs,4); if(!xs)xs=2463534242u;} xs^=xs<<13; xs^=xs>>17; xs^=xs<<5; return (unsigned char)(xs&0xff); }
+/* RFC6455 client masks must be independently unpredictable.
+ * Batch bytes from the kernel CSPRNG to avoid per-frame syscalls while
+ * eliminating recoverable xorshift mask sequences. */
+static _Thread_local unsigned char ws_mask_pool[4096];
+static _Thread_local size_t ws_mask_offset = sizeof(ws_mask_pool);
+static void ws_mask_key(unsigned char out[4]) {
+    if (ws_mask_offset + 4 > sizeof(ws_mask_pool)) {
+        ts_random(ws_mask_pool, sizeof(ws_mask_pool));
+        ws_mask_offset = 0;
+    }
+    memcpy(out, ws_mask_pool + ws_mask_offset, 4);
+    ws_mask_offset += 4;
+}
 
 /* RFC 6455: SHA-1(key || 36-byte GUID), then base64-encode.
  * Handshake-only, never used for authentication (payload is AEAD-protected). */
@@ -350,7 +360,7 @@ static int ws_frame(unsigned char *d, const unsigned char *p, int plen, int mask
     if (plen < 126) d[o++] = mb | (unsigned char)plen;
     else { d[o++] = mb | 126; d[o++] = (plen>>8)&0xff; d[o++] = plen&0xff; }
     if (mask) {
-        unsigned char mk[4]; for (int i=0;i<4;i++) mk[i]=xs_byte();
+        unsigned char mk[4]; ws_mask_key(mk);
         memcpy(d+o, mk, 4); o += 4;
         for (int i=0;i<plen;i++) d[o+i] = p[i] ^ mk[i&3];
         o += plen;
@@ -399,7 +409,7 @@ static int ws_read_frame(int fd, struct conn *c, unsigned char *out, int maxlen)
         int mask_out=!is_server;
         pong[off++]=(unsigned char)len | (mask_out?0x80:0);
         if (mask_out) {
-            unsigned char m[4]; ts_random(m,sizeof(m));
+            unsigned char m[4]; ws_mask_key(m);
             memcpy(pong+off,m,4); off+=4;
             for (uint64_t i=0;i<len;i++) pong[off+i]=out[i]^m[i&3];
         } else memcpy(pong+off,out,(size_t)len);
