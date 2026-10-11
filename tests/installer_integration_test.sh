@@ -26,3 +26,39 @@ run --prepare
 stage="$(cat "$WORK/state/staged/current")"
 [[ -x "$stage/bin/omnitun-amd64" || -x "$stage/bin/omnitun-arm64" ]] || fail "real C build failed"
 [[ ! -e "$WORK/bin/omnitun" ]] || fail "prepare activated without consent"
+cp "$stage/omnitunnel.sh" "$WORK/orig"
+echo '# deliberately corrupted' >> "$stage/omnitunnel.sh"
+if run --apply; then fail "corrupt stage accepted"; fi
+[[ ! -e "$WORK/bin/omnitun" ]] || fail "bad stage modified installed binary"
+cp "$WORK/orig" "$stage/omnitunnel.sh"
+printf 'omni-icmp79.service loaded active running legacy\nic79-direct.service loaded active running legacy\nwrapper.service loaded active running custom\n' > "$FIXTURE"
+if run --apply; then fail "active legacy and custom service not detected"; fi
+: > "$FIXTURE"
+run --apply
+"$WORK/bin/omnitun" version | grep -q '^omnitun ' || fail "wrong binary"
+[[ -L "$WORK/bin/omnitunnel" ]] || fail "manager symlink absent"
+cmp "$stage/omnitunnel.sh" "$WORK/prefix/omnitunnel.sh" || fail "manager mismatch"
+python3 - "$WORK/prefix/build-info.json" <<'PY'
+import json,sys
+with open(sys.argv[1]) as stream: manifest=json.load(stream)
+for key in ("binary_sha256","source_sha256","compiler","build_flags","version","artifacts"):
+    assert manifest.get(key), key
+PY
+h="$(sha256sum "$WORK/bin/omnitun" | cut -d' ' -f1)"
+run --prepare
+if OMNITUN_TEST_FAIL_AFTER=after-copy run --apply; then
+    fail "apply fault injection ignored"
+fi
+[[ "$(sha256sum "$WORK/bin/omnitun" | cut -d' ' -f1)" == "$h" ]] ||
+    fail "automatic rollback did not restore core binary"
+run --backup
+echo break > "$WORK/bin/omnitun"
+run --rollback
+[[ "$(sha256sum "$WORK/bin/omnitun" | cut -d' ' -f1)" == "$h" ]] ||
+    fail "explicit rollback failed"
+printf 'ic80-direct.service loaded active running legacy\n' > "$FIXTURE"
+if run --uninstall; then fail "uninstall touched active Direct instance"; fi
+: > "$FIXTURE"
+run --uninstall
+[[ ! -e "$WORK/bin/omnitun" ]] || fail "uninstall failed"
+echo "PASS: real C prepare/apply/verify, corrupted stage, legacy active guard, auto/manual rollback, uninstall"
