@@ -4,7 +4,7 @@
 
 ## Test environment
 
-Use **two isolated, authorized machines** (or namespaces/VMs with CAP_NET_RAW and TUN); record CPU topology, kernel, NIC, physical link quality, TUN MTU, TCP MSS, qdisc, CPU affinity, host and tunnel routing and conntrack. Verify both peers, one on baseline commit `0588e3b8`, both on candidate commit, and mixed-version interoperability. Do not generate traffic on user-facing production addresses.
+Use **two isolated, authorized machines** (or namespaces/VMs with CAP_NET_RAW and TUN); record CPU topology, kernel, NIC, physical link quality, TUN MTU, TCP MSS, qdisc, CPU affinity, host and tunnel routing and conntrack. Verify both peers, one on Phase 3 baseline commit `6dc2800a`, both on candidate commit, and mixed-version interoperability. Do not generate traffic on user-facing production addresses.
 
 Record three independent runs for each configuration, randomize test order if possible, keep offered load and paths identical. Use `iperf3` to measure TCP goodput with 100, 1,000 and optionally 5,000+ legal independent connections, bounded by sender CPU, file descriptors, and the test network; do **not** assume 30k stable sessions. Use configured rate/parallel streams for approximate 50/100/200/300/400 Mbps steps. The offered load is distinct from achieved throughput. Change only ONE parameter per A/B comparison.
 
@@ -40,3 +40,19 @@ sudo omnitunnel diagnostics INSTANCE
 ```
 
 Total TCP connections on the whole host are **not** equal to active ICMP flow keys or active users. The user's 10-second TX drop rates and 10-sample RTT measurements are insufficient to prove cause or improvement. No benchmark figures are fabricated in this project.
+
+## Phase 3 synthetic-only profiling
+
+The offline tests/icmptun_microbench.c executable measures time per flow
+hash/lookup-or-insert at 1,024/4,096/8,192/16,384/32,768/65,536 slots,
+as well as C heap/table byte footprint and lookup probe counts. It does
+NOT create a TUN interface, ICMP socket, network flow, real CPU pressure
+or user traffic, so it cannot demonstrate higher Xray throughput.
+
+The Go test jobs include -race, -benchmem, CPU/heap pprof generation.
+A single microbenchmark result cannot establish better end-to-end p95/p99
+RTT, jitter, retransmissions, or safe connection capacity. Compare a
+documented baseline and candidate against identical legitimate offered load.
+
+**Status: NOT TESTED.** The repository has zero verifiable GitHub Actions
+workflow runs; there are no recorded Phase 3 benchmarking results.
