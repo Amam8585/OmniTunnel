@@ -67,6 +67,7 @@ struct conn {
     _Atomic int fd; /* -1 = free, -2 = reserved/draining, >=0 = active */
     pthread_mutex_t qlock;
     pthread_cond_t  qcond;
+    pthread_mutex_t sendlock; /* serialize data frames and Pong control frames */
     struct pkt *q;                    /* QDEPTH ring */
     int head, tail, count;
 };
@@ -272,10 +273,25 @@ static int ws_client_handshake(int fd) {
         "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)\r\n\r\n", WS_HOST, kb);
     if (n<0 || (size_t)n>=sizeof(req) || writen(fd,(unsigned char*)req,(size_t)n) != 0) return -1;
     if (ws_read_headers(fd,headers,sizeof(headers))!=0) return -1;
-    /* Accept legacy server response for backwards compatibility. This
-       validates the HTTP upgrade status, not the peer identity; PSK AEAD
-       remains mandatory for payload integrity and confidentiality. */
-    return !strncmp(headers,"HTTP/1.1 101 ",13) ? 0 : -1;
+    if (strncmp(headers,"HTTP/1.1 101 ",13) != 0 ||
+        !strcasestr(headers,"\r\nUpgrade: websocket") ||
+        !strcasestr(headers,"\r\nConnection: Upgrade")) return -1;
+    char expected[29];
+    if (ws_accept(kb,expected)!=0) return -1;
+    const char *value=strcasestr(headers,"\r\nSec-WebSocket-Accept:");
+    if (!value) return -1;
+    value+=strlen("\r\nSec-WebSocket-Accept:");
+    while (*value==' ' || *value=='\t') ++value;
+    const char *end=strstr(value,"\r\n");
+    if (!end || end-value != 28) return -1;
+    if (!memcmp(value,expected,28)) return 0;
+    /* Prior OmniTunnel WS servers sent a fixed RFC example digest.
+       This explicit compatibility escape hatch is UNSAFE for HTTP identity
+       verification; authenticated AEAD frames still protect tunnel data. */
+    const char *legacy=getenv("OMNITUN_WS_ALLOW_LEGACY_ACCEPT");
+    if (legacy && !strcmp(legacy,"1") &&
+        !memcmp(value,"s3pPLMBiTxaQ9kYGzzhZRbK+xOo=",28)) return 0;
+    return -1;
 }
 static int ws_server_handshake(int fd) {
     char req[8193], key[25], accepted[29], resp[512];
@@ -313,22 +329,60 @@ static int ws_frame(unsigned char *d, const unsigned char *p, int plen, int mask
     } else { memcpy(d+o, p, plen); o += plen; }
     return o;
 }
-/* read one WS frame's payload into out (unmasked); returns payload length,
- * 0 to skip a control/other frame, -1 on close/error. */
-static int ws_read_frame(int fd, unsigned char *out, int maxlen) {
+/* Strict bounded RFC6455 frame parser; oversized 64-bit lengths never get
+ * narrowed to int, unexpected masking/RSV and fragmentation are rejected.
+ * Control frames are not passed into the inner IP AEAD decoder. */
+static int ws_read_frame(int fd, struct conn *c, unsigned char *out, int maxlen) {
     unsigned char h[2];
-    if (readn(fd,h,2) < 0) return -1;
-    int op = h[0] & 0x0f, masked = h[1] & 0x80, len = h[1] & 0x7f;
-    if (len == 126) { unsigned char e[2]; if (readn(fd,e,2)<0) return -1; len=(e[0]<<8)|e[1]; }
-    else if (len == 127) { unsigned char e[8]; if (readn(fd,e,8)<0) return -1; len=(e[6]<<8)|e[7]; }
-    unsigned char mk[4] = {0,0,0,0};
-    if (masked) { if (readn(fd,mk,4)<0) return -1; }
-    if (len < 0 || len > maxlen) return -1;
-    if (readn(fd,out,len) < 0) return -1;
-    if (masked) for (int i=0;i<len;i++) out[i] ^= mk[i&3];
-    if (op == 0x8) return -1;             /* close */
-    if (op != 0x2 && op != 0x0) return 0; /* ping/pong/text -> skip */
-    return len;
+    if (readn(fd,h,2)<0) return -1;
+    const int opcode=h[0]&0x0f, masked=!!(h[1]&0x80);
+    const int final=!!(h[0]&0x80);
+    if ((h[0]&0x70) || masked != !!is_server) return -1;
+    uint64_t len=h[1]&0x7f;
+    if (len==126) {
+        unsigned char e[2];
+        if (readn(fd,e,2)<0) return -1;
+        len=((uint64_t)e[0]<<8)|e[1];
+        if (len < 126) return -1; /* non-minimal encoding */
+    } else if (len==127) {
+        unsigned char e[8];
+        if (readn(fd,e,8)<0) return -1;
+        if (e[0]&0x80) return -1;
+        len=0;
+        for (int i=0;i<8;i++) len=(len<<8)|e[i];
+        if (len < 65536) return -1; /* non-minimal 64-bit encoding */
+    }
+    if (len > (uint64_t)maxlen || (opcode&0x08 && (!final || len>125))) return -1;
+    /* OmniTunnel only emits complete binary packets. A fragmented data
+       message cannot be safely reassembled without a bounded separate buffer. */
+    if (!final || (opcode!=0x2 && opcode!=0x8 && opcode!=0x9 && opcode!=0xa))
+        return -1;
+    unsigned char mask[4]={0,0,0,0};
+    if (masked && readn(fd,mask,4)<0) return -1;
+    if (len && readn(fd,out,(size_t)len)<0) return -1;
+    if (masked) for (uint64_t i=0;i<len;i++) out[i]^=mask[i&3];
+    if (opcode==0x8) return -1;
+    if (opcode==0x9) {
+        /* Ping -> Pong. Serialize with writer() so two threads never
+           interleave WebSocket frame bytes on the same stream. */
+        unsigned char pong[2+4+125];
+        int off=0;
+        pong[off++]=0x8a;
+        int mask_out=!is_server;
+        pong[off++]=(unsigned char)len | (mask_out?0x80:0);
+        if (mask_out) {
+            unsigned char m[4]; ts_random(m,sizeof(m));
+            memcpy(pong+off,m,4); off+=4;
+            for (uint64_t i=0;i<len;i++) pong[off+i]=out[i]^m[i&3];
+        } else memcpy(pong+off,out,(size_t)len);
+        off+=(int)len;
+        pthread_mutex_lock(&c->sendlock);
+        int err=writen(fd,pong,(size_t)off);
+        pthread_mutex_unlock(&c->sendlock);
+        return err==0 ? 0 : -1;
+    }
+    if (opcode==0xa) return 0; /* expected Pong */
+    return (int)len;
 }
 
 /* append a framed packet to a link's queue; drop if full (inner TCP will
@@ -365,7 +419,10 @@ static void *writer(void *arg) {
         c->head = (c->head + 1) % QDEPTH;
         c->count--;
         pthread_mutex_unlock(&c->qlock);
-        if (writen(fd, p.buf, p.len) != 0) {
+        pthread_mutex_lock(&c->sendlock);
+        int ok=writen(fd,p.buf,p.len);
+        pthread_mutex_unlock(&c->sendlock);
+        if (ok != 0) {
             atomic_fetch_add_explicit(&mux_socket_write_errors, 1, memory_order_relaxed);
             shutdown(fd, SHUT_RDWR); break;
         }
@@ -402,11 +459,11 @@ static void *uplink(void *arg) {
 }
 
 /* WS frames -> decrypt -> TUN; returns when this link breaks */
-static void downlink_once(int fd) {
+static void downlink_once(int fd, struct conn *c) {
     unsigned char cbuf[MAX_FRAME];
     unsigned char out[MAX_INNER + TAG_LEN];
     while (running) {
-        int L = ws_read_frame(fd, cbuf, sizeof(cbuf));
+        int L = ws_read_frame(fd, c, cbuf, sizeof(cbuf));
         if (L < 0) return;
         if (L == 0) continue;                                    /* control frame */
         if (L < (int)(NONCE_LEN + TAG_LEN)) continue;
@@ -456,7 +513,7 @@ static void run_link(int idx, int fd) {
     if (pthread_create(&wt, NULL, writer, wa) != 0) {
         free(wa); c->fd = -1; close(fd); return;
     }
-    downlink_once(fd);                 /* blocks until the link breaks */
+    downlink_once(fd, c);              /* blocks until the link breaks */
     c->fd = -2; /* reservation: do not reuse slot while old writer drains */
     pthread_cond_signal(&c->qcond);
     /* Wake a writer blocked in a socket write before waiting to join.
@@ -538,6 +595,7 @@ int tun_main_ws(int argc, char **argv){
     for (int i=0;i<MAXCONN;i++){
         conns[i].fd=-1;
         pthread_mutex_init(&conns[i].qlock,NULL);
+        pthread_mutex_init(&conns[i].sendlock,NULL);
         pthread_cond_init(&conns[i].qcond,NULL);
         conns[i].head=conns[i].tail=conns[i].count=0;
         conns[i].q = (i < Nconn) ? calloc(QDEPTH, sizeof(struct pkt)) : NULL;
