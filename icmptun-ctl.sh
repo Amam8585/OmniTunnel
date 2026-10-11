@@ -115,7 +115,6 @@ TUN_LOCAL=$tun_local
 TUN_PEER=$tun_peer
 EOF
     touch "$PF_FILE"
-    write_source
     echo "config written: $CONF_FILE"
     echo "role=$role local=$local_ip peer=$peer_ip tun=$tun_local<->$tun_peer"
     echo "next: pick 'Enable auto-start' from the menu"
@@ -132,17 +131,24 @@ cmd_build() {
         echo "Refusing to replace active legacy service binary: $SERVICE_NAME" >&2
         return 1
     fi
-    local staged
+    # Keep legacy ExecStart unchanged: the compatibility shim adds the
+    # maintained binary's mandatory "icmp" subcommand.
+    local staged previous
     staged="$(mktemp "${BIN}.new.XXXXXXXX")" || return 1
-    if ! install -m 0755 "$maintained" "$staged"; then rm -f "$staged"; return 1; fi
-    local previous="${BIN}.previous"
+    cat > "$staged" <<EOF
+#!/usr/bin/env bash
+exec "$maintained" icmp "\$@"
+EOF
+    chmod 0755 "$staged" || { rm -f "$staged"; return 1; }
+    previous="${BIN}.previous"
     if [[ -e "$BIN" ]]; then
         cp -p "$BIN" "$previous" || { rm -f "$staged"; return 1; }
     fi
     mv -f "$staged" "$BIN" || { rm -f "$staged"; return 1; }
+    sha256sum "$maintained" > "${BIN}.core.sha256"
     sha256sum "$BIN" > "${BIN}.sha256"
     printf 'core=%s\n' "$maintained" > "${BIN}.provenance"
-    echo "Installed maintained core at $BIN; existing service configuration was not changed."
+    echo "Installed maintained ICMP dispatcher; legacy service ExecStart remains compatible."
 }
 
 
