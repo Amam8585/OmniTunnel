@@ -1377,9 +1377,10 @@ peer_name_absent() {
     local out rc=0
     out="$(peer_ssh "$1" "test -e /etc/omnitunnel/inst/'$2'/instance.conf && echo OMNIPRESENT || echo OMNIABSENT" 2>/dev/null)" || rc=$?
     [[ $rc -eq 0 ]] || return 2
+    out="${out//$'\r'/}"
     case "$out" in
-        *OMNIPRESENT*) return 1;;
-        *OMNIABSENT*) return 0;;
+        OMNIPRESENT) return 1;;
+        OMNIABSENT) return 0;;
         *) return 2;;
     esac
 }

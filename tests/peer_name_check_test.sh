@@ -46,4 +46,8 @@ rc=0
 ( peer_ssh() { printf 'garbage-no-sentinel\n'; }; peer_require_absent 203.0.113.9 ackless ) >/dev/null 2>&1 || rc=$?
 [[ "$rc" -ne 0 ]] || fail "inconclusive: an inconclusive remote check must fail closed, never treat the name as free (rc=$rc)"
 
+rc=0
+( peer_ssh() { printf 'ERROR OMNIABSENT\n'; }; peer_require_absent 203.0.113.9 ackless ) >/dev/null 2>&1 || rc=$?
+[[ "$rc" -ne 0 ]] || fail "non-exact: output that merely CONTAINS a sentinel (ERROR OMNIABSENT) must be inconclusive and die closed, never proceed (rc=$rc)"
+
 echo "PASSED - read-only foreign existence check: ABSENT proceeds; an existing name fails loudly with no remote state created/removed; SSH error / inconclusive output fails closed (never provisions on an unverified name)"
