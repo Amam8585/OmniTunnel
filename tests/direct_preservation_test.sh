@@ -19,6 +19,16 @@ for t in mux ws stripe vxlan ackless; do
         fail "retired transport unexpectedly active: $t"
     fi
 done
+# Retired carriers must remain unavailable in the new-tunnel selection.
+for retired in mux ws stripe vxlan ackless; do
+    if grep '^ALL_TYPES=' omnitunnel.sh | grep -qw "$retired"; then
+        fail "retired transport is selectable: $retired"
+    fi
+done
+# Hybrid IG must not be selectable until a tested implementation exists.
+if grep '^ALL_TYPES=' omnitunnel.sh | grep -qw hybrid; then
+    fail "Hybrid IG advertised before implementation"
+fi
 for t in udp tcp icmp; do
     grep -q "tun_main_$t" src/main.c || fail "C Direct core dispatcher missing: $t"
 done
