@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Direct optimizer. Read-only diagnostics cover all eleven carriers.
+# Direct optimizer. Read-only diagnostics support six active carriers and existing legacy instances.
 # Only owned L3 instance queue lengths are explicitly adjustable.
 set -euo pipefail
 ACTION="${1:-status}"; INSTANCE="${2:-}"; PROFILE="${3:-balanced}"; ACK="${4:-}"
 [[ "$ACTION" == status || "$ACTION" == analyze || "$ACTION" == recommend || "$ACTION" == dry-run || "$ACTION" == apply || "$ACTION" == rollback || "$ACTION" == compare ]] ||
-    { echo "usage: optimizer.sh status|analyze|recommend|dry-run|apply|rollback|compare <instance> [balanced|low-latency|high-throughput] [--acknowledge]" >&2; exit 2; }
+    { echo "usage: optimizer.sh status|analyze|recommend|dry-run|apply|rollback|compare <instance> [balanced|low-latency|high-throughput|extreme-connections|high-pps|auto-adaptive] [--acknowledge]" >&2; exit 2; }
 [[ "$INSTANCE" =~ ^[a-zA-Z0-9_-]+$ ]] || { echo "invalid instance" >&2; exit 2; }
 CONFIG_ROOT="${OMNITUN_CONFIG_ROOT:-/etc/omnitunnel}"
 STATE_ROOT="${OMNITUN_OPTIMIZER_STATE_DIR:-/var/lib/omnitunnel/optimizer}"
@@ -37,6 +37,7 @@ case "$PROFILE" in
     balanced) proposed="$cur";;
     low-latency) proposed="$((cur > 512 ? 512 : cur))";;
     high-throughput) proposed="$((cur < 2048 ? 2048 : cur))";;
+    extreme-connections|high-pps|auto-adaptive) proposed="$cur";;
     *) echo "unknown profile $PROFILE" >&2; exit 2;;
 esac
 backup_dir="$STATE_ROOT"
@@ -45,6 +46,20 @@ stats="/run/omnitunnel/icmp-$dev.json"
 status() {
     echo "Device: $dev | Direct protocol: $type | current TUN txqueuelen: $cur"
     echo "Kernel: $(uname -r); CPU cores: $(nproc); RAM: $(awk '/MemTotal:/{printf "%.0f MiB",$2/1024}' /proc/meminfo)"
+    echo "CPU topology: sockets=$(lscpu -p=socket 2>/dev/null | grep -cv '^#' || echo unavailable); logical=$(nproc)"
+    echo "Available RAM: $(awk '/MemAvailable:/{printf "%.0f MiB",$2/1024}' /proc/meminfo)"
+    echo "Transport-specific guidance: $type"
+    case "$type" in
+      gre|fou) echo "Kernel carrier: compare path MTU, fragmentation, softirq and interface drops; avoid global qdisc changes.";;
+      icmp) echo "ICMP userspace: inspect per-core flow/queue counters before changing flow slots; changes require planned restart.";;
+      udp) echo "UDP userspace: inspect socket receive errors and encryption CPU; do not blindly increase socket buffers.";;
+      tcp) echo "TCP userspace: inspect retransmits, HOL blocking and reconnects; kernel autotuning unchanged.";;
+      *) echo "Legacy carrier: read-only compatibility reporting.";;
+    esac
+    echo "Whole-host UDP/TCP counters (not tunnel-specific):"
+    awk '/^(Udp|Tcp):/{print}' /proc/net/snmp 2>/dev/null || true
+    echo "NIC queues (interface-specific):"
+    if [[ -d "/sys/class/net/$dev/queues" ]]; then find "/sys/class/net/$dev/queues" -mindepth 1 -maxdepth 1 -printf '%f ' 2>/dev/null; echo; fi
     ip -s link show dev "$dev"
     echo "Interface details and MTU:"
     ip -d link show dev "$dev" || true
@@ -69,8 +84,8 @@ case "$ACTION" in
         echo "Candidate command (NOT executed): ip link set dev $dev txqueuelen $proposed"
         echo "Experimental only. Lower kernel drop counts can mean longer queues and worse RTT."
         echo "Hypothetical, NOT certified: compare matched-load goodput, P95/P99, and drops."
-        echo "GRE/FOU/VXLAN use kernel transport; no fake userspace transport is created."
-        echo "No global sysctl, rp_filter, default route, firewall, qdisc, or other tunnel changed.";;
+        echo "GRE/FOU use kernel transport; no fake userspace transport is created."
+        echo "No global sysctl, rp_filter, default route, firewall, qdisc, or other tunnel changed."\n        [[ "$PROFILE" == auto-adaptive ]] && echo "Auto-adaptive is observation-only; no background controller is enabled.";;
     compare)
         status
         if [[ -r "$snap" ]]; then
