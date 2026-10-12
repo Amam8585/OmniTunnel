@@ -180,17 +180,17 @@ ensure_omniackless() {
 ALL_TYPES="gre icmp udp mux ws hysteria tcp fou vxlan stripe ackless"
 type_desc() {
     case "$1" in
-        gre)      echo "IP-over-GRE  (kernel; often unpoliced & full line-rate)";;
-        icmp)     echo "IP-over-ICMP  (blends in as ping; no key)";;
-        udp)      echo "IP-over-UDP AEAD  (fastest where UDP is allowed)";;
-        mux)      echo "multi-connection TCP  (N links; for UDP-blocking DPI)";;
-        ws)       echo "multi-connection WebSocket  (looks like HTTPS; stealthy)";;
-        hysteria) echo "Hysteria2/QUIC  (loss-agnostic; beats UDP rate-policing; looks like HTTP/3)";;
-        tcp)      echo "single TCP AEAD  (looks like one HTTPS connection)";;
-        fou)      echo "GRE-in-UDP  (kernel; GRE hidden inside plain UDP on its port)";;
-        vxlan)    echo "VXLAN L2-over-UDP  (kernel; Ethernet inside UDP)";;
-        stripe)   echo "connection-striping TCP  (shards one flow across fresh short-lived conns; beats per-5-tuple byte caps)";;
-        ackless)  echo "ACK-less TCP carrier  (single flow of flags=0 raw TCP; dodges per-5-tuple packet caps)";;
+        gre) echo "GRE";;
+        icmp) echo "ICMP";;
+        udp) echo "UDP (encrypted)";;
+        mux) echo "TCP MUX";;
+        ws) echo "WebSocket";;
+        hysteria) echo "Hysteria2";;
+        tcp) echo "TCP (encrypted)";;
+        fou) echo "FOU (GRE/UDP)";;
+        vxlan) echo "VXLAN";;
+        stripe) echo "TCP Stripe";;
+        ackless) echo "ACKLess";;
         *) echo "";;
     esac
 }
@@ -1593,9 +1593,9 @@ cmd_server_token() {
 # ------------------------------------------------------------ add wizard ------
 wizard_add() {
     need_root; ensure_binary
-    echo; echo "${C_BOLD}Add a tunnel  (this box = near side / client; far = foreign / server)${C_RESET}"
+    echo; echo "${C_BOLD}Create Tunnel (SSH automation)${C_RESET}"
     local ci=1 types=() t ch x fhost fu fp fpx kn
-    for t in $ALL_TYPES; do printf "  %2d) %-12s %s\n" "$ci" "$t" "$(type_desc "$t")"; types+=("$t"); ci=$((ci+1)); done
+    for t in $ALL_TYPES; do printf "  %2d) %s\n" "$ci" "$(type_desc "$t")"; types+=("$t"); ci=$((ci+1)); done
     read -erp "Tunnel type [1]: " ch; ch="${ch:-1}"
     ch="$(pick_num "$ch" "${#types[@]}")" || { warn "pick a number between 1 and ${#types[@]}"; return; }
     t="${types[$((ch-1))]}"
@@ -1635,9 +1635,9 @@ wizard_add() {
 # foreign box. Use it when this box cannot reach the foreign box over SSH.
 wizard_add_manual() {
     need_root; ensure_binary
-    echo; echo "${C_BOLD}Add a tunnel - MANUAL${C_RESET} ${C_DIM}(no SSH to the foreign; nothing touches port 22)${C_RESET}"
+    echo; echo "${C_BOLD}Create Tunnel (token pairing)${C_RESET}"
     local ci=1 types=() t ch x fhost kn
-    for t in $ALL_TYPES; do printf "  %2d) %-12s %s\n" "$ci" "$t" "$(type_desc "$t")"; types+=("$t"); ci=$((ci+1)); done
+    for t in $ALL_TYPES; do printf "  %2d) %s\n" "$ci" "$(type_desc "$t")"; types+=("$t"); ci=$((ci+1)); done
     read -erp "Tunnel type [2]: " ch; ch="${ch:-2}"
     ch="$(pick_num "$ch" "${#types[@]}")" || { warn "pick a number between 1 and ${#types[@]}"; return; }
     t="${types[$((ch-1))]}"
@@ -1866,7 +1866,7 @@ bench_run() {
     printf '  %bevery test tunnel was removed from both sides.%b\n\n' "$C_GREY" "$C_RESET"
     rule_green
     printf '  %bKeep one as a permanent instance?%b ' "$C_BGRN" "$C_RESET"
-    local ci=1 ch keep; for t in $ALL_TYPES; do printf "  %2d) %-12s %s\n" "$ci" "$t" "$(type_desc "$t")"; ci=$((ci+1)); done
+    local ci=1 ch keep; for t in $ALL_TYPES; do printf "  %2d) %s\n" "$ci" "$(type_desc "$t")"; ci=$((ci+1)); done
     echo "   0) keep none"
     read -erp "Choice: " ch || true; [[ -z "$ch" ]] && { info "nothing kept."; return 0; }
     [[ "$ch" =~ ^[0-9]+$ ]] || { warn "pick a number"; return; }
@@ -1946,7 +1946,7 @@ cmd_bench_manual() {
         if type_is_hysteria "$t"; then
             printf "  %2d) %-12s %s\n" "$ci" "$t" "not measured above - use the SSH benchmark for it"
         else
-            printf "  %2d) %-12s %s\n" "$ci" "$t" "$(type_desc "$t")"
+            printf "  %2d) %s\n" "$ci" "$(type_desc "$t")"
         fi
         ci=$((ci+1))
     done
