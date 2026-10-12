@@ -177,21 +177,24 @@ ensure_omniackless() {
 }
 
 # ------------------------------------------------------------ type registry ---
-ALL_TYPES="gre icmp udp mux ws hysteria tcp fou vxlan stripe ackless"
+ALL_TYPES="gre icmp udp hysteria tcp fou vxlan ackless"
 type_desc() {
     case "$1" in
         gre) echo "GRE";;
         icmp) echo "ICMP";;
         udp) echo "UDP (encrypted)";;
-        mux) echo "TCP MUX";;
-        ws) echo "WebSocket";;
         hysteria) echo "Hysteria2";;
         tcp) echo "TCP (encrypted)";;
         fou) echo "FOU (GRE/UDP)";;
         vxlan) echo "VXLAN";;
-        stripe) echo "TCP Stripe";;
         ackless) echo "ACKLess";;
         *) echo "";;
+    esac
+}
+require_supported_transport() {
+    case " $ALL_TYPES " in
+        *" $1 "*) return 0;;
+        *) die "unsupported or removed transport: $1";;
     esac
 }
 type_uses_key() { [[ "$1" != icmp && "$1" != gre && "$1" != fou && "$1" != vxlan ]]; }
@@ -1476,6 +1479,7 @@ peer_require_absent() {
 # Far-side SSH password comes from a saved peer file or $OMNITUN_PEER_PASS
 # (+ optional $OMNITUN_PEER_USER, default root).
 cmd_add_auto() {
+    require_supported_transport "$1"
     need_root
     if type_is_hysteria "$1"; then ensure_hysteria
     elif type_is_stripe "$1"; then ensure_omnistripe
@@ -1525,6 +1529,7 @@ cmd_add_auto() {
 # It never touches any server's own sshd or port 22.
 # add-manual <type> <name> <foreign_ip> [nconn] [shape] [my_ip]
 cmd_add_manual() {
+    require_supported_transport "$1"
     need_root
     if type_is_hysteria "$1"; then ensure_hysteria
     elif type_is_stripe "$1"; then ensure_omnistripe
@@ -1564,6 +1569,7 @@ cmd_server_token() {
     local name t fhost mylip port key pta ppa shape nc pmode
     IFS='|' read -r name t fhost mylip port key pta ppa shape nc pmode <<< "$dec"
     [[ -n "$name" && -n "$t" ]] || die "invalid token"
+    require_supported_transport "$t"
     if type_is_hysteria "$t"; then ensure_hysteria
     elif type_is_stripe "$t"; then ensure_omnistripe
     elif type_is_ackless "$t"; then ensure_omniackless
@@ -2380,7 +2386,7 @@ OMNI_ARGV=("$@")
 case "${1:-menu}" in
     menu|"")          need_root; ensure_binary; menu_main;;
     bench)            need_root; bench_run;;
-    add)              need_root; wizard_add;;
+    add)              need_root; wizard_add_manual;;
     add-auto)         shift; cmd_add_auto "$@";;
     add-manual)       shift; cmd_add_manual "$@";;
     server-token)     need_root; cmd_server_token "${2:?token}";;
