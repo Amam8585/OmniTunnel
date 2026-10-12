@@ -337,7 +337,9 @@ load_inst() {
 # create NAME TYPE ROLE LOCAL PEER PORT KEY TUN_ADDR PEER_ADDR [SHAPE] [NCONN]
 create_inst() {
     local n="$1" t="$2" role="$3" lip="$4" pip="$5" port="$6" key="$7" ta="$8" pa="$9" shape="${10:-none}" nc="${11:-16}" imode="${12:-}" pcount="${13:-400}"
-    case "$t" in gre|icmp|udp|mux|ws|hysteria|tcp|fou|vxlan|stripe|ackless) :;; *) die "unsupported Direct type: $t";; esac
+    # Internal instance creation is also used by pairing and automation. Never
+    # let it bypass the public transport allowlist; legacy instances still load.
+    require_supported_transport "$t"
     validate_inst_name "$n"
     local dev="ts-$n"; [[ ${#dev} -gt 15 ]] && dev="ts$(printf '%s' "$n" | cksum | tr -dc '0-9' | cut -c1-8)"
     mkdir -p "$(inst_path "$n")"; : > "$(inst_pf "$n")"
