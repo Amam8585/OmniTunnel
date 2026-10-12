@@ -177,21 +177,22 @@ ensure_omniackless() {
 }
 
 # ------------------------------------------------------------ type registry ---
-ALL_TYPES="gre icmp udp mux ws hysteria tcp fou vxlan stripe ackless"
+ALL_TYPES="gre icmp udp hysteria tcp fou"
 type_desc() {
     case "$1" in
-        gre)      echo "IP-over-GRE  (kernel; often unpoliced & full line-rate)";;
-        icmp)     echo "IP-over-ICMP  (blends in as ping; no key)";;
-        udp)      echo "IP-over-UDP AEAD  (fastest where UDP is allowed)";;
-        mux)      echo "multi-connection TCP  (N links; for UDP-blocking DPI)";;
-        ws)       echo "multi-connection WebSocket  (looks like HTTPS; stealthy)";;
-        hysteria) echo "Hysteria2/QUIC  (loss-agnostic; beats UDP rate-policing; looks like HTTP/3)";;
-        tcp)      echo "single TCP AEAD  (looks like one HTTPS connection)";;
-        fou)      echo "GRE-in-UDP  (kernel; GRE hidden inside plain UDP on its port)";;
-        vxlan)    echo "VXLAN L2-over-UDP  (kernel; Ethernet inside UDP)";;
-        stripe)   echo "connection-striping TCP  (shards one flow across fresh short-lived conns; beats per-5-tuple byte caps)";;
-        ackless)  echo "ACK-less TCP carrier  (single flow of flags=0 raw TCP; dodges per-5-tuple packet caps)";;
+        gre) echo "GRE";;
+        icmp) echo "ICMP";;
+        udp) echo "UDP (encrypted)";;
+        hysteria) echo "Hysteria2";;
+        tcp) echo "TCP (encrypted)";;
+        fou) echo "FOU (GRE/UDP)";;
         *) echo "";;
+    esac
+}
+require_supported_transport() {
+    case " $ALL_TYPES " in
+        *" $1 "*) return 0;;
+        *) die "unsupported or removed transport: $1";;
     esac
 }
 type_uses_key() { [[ "$1" != icmp && "$1" != gre && "$1" != fou && "$1" != vxlan ]]; }
@@ -1476,6 +1477,7 @@ peer_require_absent() {
 # Far-side SSH password comes from a saved peer file or $OMNITUN_PEER_PASS
 # (+ optional $OMNITUN_PEER_USER, default root).
 cmd_add_auto() {
+    require_supported_transport "$1"
     need_root
     if type_is_hysteria "$1"; then ensure_hysteria
     elif type_is_stripe "$1"; then ensure_omnistripe
@@ -1525,6 +1527,7 @@ cmd_add_auto() {
 # It never touches any server's own sshd or port 22.
 # add-manual <type> <name> <foreign_ip> [nconn] [shape] [my_ip]
 cmd_add_manual() {
+    require_supported_transport "$1"
     need_root
     if type_is_hysteria "$1"; then ensure_hysteria
     elif type_is_stripe "$1"; then ensure_omnistripe
@@ -1564,6 +1567,7 @@ cmd_server_token() {
     local name t fhost mylip port key pta ppa shape nc pmode
     IFS='|' read -r name t fhost mylip port key pta ppa shape nc pmode <<< "$dec"
     [[ -n "$name" && -n "$t" ]] || die "invalid token"
+    require_supported_transport "$t"
     if type_is_hysteria "$t"; then ensure_hysteria
     elif type_is_stripe "$t"; then ensure_omnistripe
     elif type_is_ackless "$t"; then ensure_omniackless
@@ -1593,9 +1597,9 @@ cmd_server_token() {
 # ------------------------------------------------------------ add wizard ------
 wizard_add() {
     need_root; ensure_binary
-    echo; echo "${C_BOLD}Add a tunnel  (this box = near side / client; far = foreign / server)${C_RESET}"
+    echo; echo "${C_BOLD}Create Tunnel (SSH automation)${C_RESET}"
     local ci=1 types=() t ch x fhost fu fp fpx kn
-    for t in $ALL_TYPES; do printf "  %2d) %-12s %s\n" "$ci" "$t" "$(type_desc "$t")"; types+=("$t"); ci=$((ci+1)); done
+    for t in $ALL_TYPES; do printf "  %2d) %s\n" "$ci" "$(type_desc "$t")"; types+=("$t"); ci=$((ci+1)); done
     read -erp "Tunnel type [1]: " ch; ch="${ch:-1}"
     ch="$(pick_num "$ch" "${#types[@]}")" || { warn "pick a number between 1 and ${#types[@]}"; return; }
     t="${types[$((ch-1))]}"
@@ -1635,9 +1639,9 @@ wizard_add() {
 # foreign box. Use it when this box cannot reach the foreign box over SSH.
 wizard_add_manual() {
     need_root; ensure_binary
-    echo; echo "${C_BOLD}Add a tunnel - MANUAL${C_RESET} ${C_DIM}(no SSH to the foreign; nothing touches port 22)${C_RESET}"
+    echo; echo "${C_BOLD}Create Tunnel (token pairing)${C_RESET}"
     local ci=1 types=() t ch x fhost kn
-    for t in $ALL_TYPES; do printf "  %2d) %-12s %s\n" "$ci" "$t" "$(type_desc "$t")"; types+=("$t"); ci=$((ci+1)); done
+    for t in $ALL_TYPES; do printf "  %2d) %s\n" "$ci" "$(type_desc "$t")"; types+=("$t"); ci=$((ci+1)); done
     read -erp "Tunnel type [2]: " ch; ch="${ch:-2}"
     ch="$(pick_num "$ch" "${#types[@]}")" || { warn "pick a number between 1 and ${#types[@]}"; return; }
     t="${types[$((ch-1))]}"
@@ -1866,7 +1870,7 @@ bench_run() {
     printf '  %bevery test tunnel was removed from both sides.%b\n\n' "$C_GREY" "$C_RESET"
     rule_green
     printf '  %bKeep one as a permanent instance?%b ' "$C_BGRN" "$C_RESET"
-    local ci=1 ch keep; for t in $ALL_TYPES; do printf "  %2d) %-12s %s\n" "$ci" "$t" "$(type_desc "$t")"; ci=$((ci+1)); done
+    local ci=1 ch keep; for t in $ALL_TYPES; do printf "  %2d) %s\n" "$ci" "$(type_desc "$t")"; ci=$((ci+1)); done
     echo "   0) keep none"
     read -erp "Choice: " ch || true; [[ -z "$ch" ]] && { info "nothing kept."; return 0; }
     [[ "$ch" =~ ^[0-9]+$ ]] || { warn "pick a number"; return; }
@@ -1946,7 +1950,7 @@ cmd_bench_manual() {
         if type_is_hysteria "$t"; then
             printf "  %2d) %-12s %s\n" "$ci" "$t" "not measured above - use the SSH benchmark for it"
         else
-            printf "  %2d) %-12s %s\n" "$ci" "$t" "$(type_desc "$t")"
+            printf "  %2d) %s\n" "$ci" "$(type_desc "$t")"
         fi
         ci=$((ci+1))
     done
@@ -2178,11 +2182,10 @@ EOF
     kv "Core Version:" "$("$TSUITE_BIN" version 2>/dev/null || echo 'not installed')"
     kv "Source:" "github.com/Amam8585/OmniTunnel"
     rule_amber
-    kv "IP Address:" "${myip:-unknown}"
-    kv "Architecture:" "$(arch_tag)"
-    kv "Tunnels:" "$RUN running, $STOP stopped" "$([[ $RUN -gt 0 ]] && printf '%s' "$C_BGRN" || printf '%s' "$C_GREY")"
-    kv "Port forwards:" "$fwd"
-    kv "Core:" "$([[ -x "$TSUITE_BIN" ]] && echo Installed || echo missing)" "$([[ -x "$TSUITE_BIN" ]] && printf '%s' "$C_BGRN" || printf '%s' "$C_BRED")"
+    kv "Server:" "${myip:-unknown} · $(arch_tag)"
+    kv "Tunnels:" "$RUN online · $STOP offline" "$([[ $RUN -gt 0 ]] && printf '%s' "$C_BGRN" || printf '%s' "$C_GREY")"
+    kv "Forwards:" "$fwd"
+    kv "Core:" "$([[ -x "$TSUITE_BIN" ]] && echo Ready || echo Missing)" "$([[ -x "$TSUITE_BIN" ]] && printf '%s' "$C_BGRN" || printf '%s' "$C_BRED")"
     local off; off="$(forwarding_offenders)"
     if [[ -n "$off" ]]; then
         kv "IP forwarding:" "OFF on ${off% }" "$C_BRED"
@@ -2190,7 +2193,7 @@ EOF
     fi
     local ovr; ovr="$(forwarding_conf_overrides)"
     if [[ -n "$ovr" ]]; then
-        kv "Forwarding conf:" "overridden at boot by ${ovr% }" "$C_BYEL"
+        kv "Forwarding:" "Boot override detected (${ovr% })" "$C_BYEL"
     fi
     rule_amber
     return 0
@@ -2324,50 +2327,23 @@ menu_main() {
         nitem 1 "Install / Create Tunnel" "$C_BGRN$C_BOLD"
         nitem 2 "Manage Tunnels" "$C_BLUE$C_BOLD"
         nitem 3 "Port Forwarding"
-        nitem 4 "Status & Monitoring"
-        nitem 5 "Network Optimization"
-        nitem 6 "Diagnostics & Benchmark"
-        nitem 7 "Update OmniTunnel"
-        nitem 8 "Completely Uninstall OmniTunnel" "$C_BRED$C_BOLD"
-        nitem 9 "Exit"
+        nitem 4 "Network Optimization"
+        nitem 5 "Update OmniTunnel"
+        nitem 6 "Completely Uninstall OmniTunnel" "$C_BRED$C_BOLD"
+        nitem 7 "Exit"
         rule_green
-        printf '  %bEnter your choice [1-9]:%b ' "$C_BGRN" "$C_RESET"
+        printf '  %bEnter your choice [1-7]:%b ' "$C_BGRN" "$C_RESET"
         local c n any
         read -r c || exit 0
         case "$c" in
-            1) wizard_add; pause;;
+            1) wizard_add_manual; pause;;
             2) menu_instances;;
             3) menu_pf;;
-            4) banner "Status & Monitoring"; echo; inst_header; rule
-               any=0
-               for n in $(list_instances); do inst_status "$n" full; any=1; done
-               [[ "$any" == 0 ]] && info "No tunnels configured."
-               if pick_instance; then bash "$ASSET_DIR/scripts/monitor.sh" stats "$PICK"; fi
-               pause;;
-            5) if pick_instance; then bash "$ASSET_DIR/scripts/optimizer.sh" recommend "$PICK" balanced; fi; pause;;
-            6) banner "Diagnostics & Benchmark"
-               nitem 1 "Tunnel diagnostics"
-               nitem 2 "Benchmark all transports (generates traffic)"
-               nitem 3 "Manual benchmark (generates traffic)"
-               nitem 0 "Back"
-               read -rp "Choice: " c || c=0
-               case "$c" in
-                   1) if pick_instance; then bash "$ASSET_DIR/scripts/diagnostics.sh" "$PICK"; fi;;
-                   2) read -rp "Benchmark generates network traffic. Type BENCH to continue: " c
-                      [[ "$c" == BENCH ]] && bench_run;;
-                   3) local fh mip x
-                      read -erp "Foreign server IP: " fh
-                      mip="$(default_local_ip)"
-                      read -erp "This box public IP [$mip]: " x
-                      mip="${x:-$mip}"
-                      read -rp "Benchmark generates network traffic. Type BENCH to continue: " c
-                      [[ "$c" == BENCH && -n "$fh" ]] && cmd_bench_manual "$fh" "$mip";;
-               esac
-               pause;;
-            7) cmd_update; pause;;
-            8) cmd_uninstall; pause;;
-            9|0) exit 0;;
-            *) warn "Choose a number from 1 to 9"; pause;;
+            4) if pick_instance; then bash "$ASSET_DIR/scripts/optimizer.sh" recommend "$PICK" balanced; fi; pause;;
+            5) cmd_update; pause;;
+            6) cmd_uninstall; pause;;
+            7|0) exit 0;;
+            *) warn "Choose a number from 1 to 7"; pause;;
         esac
     done
 }
@@ -2380,7 +2356,7 @@ OMNI_ARGV=("$@")
 case "${1:-menu}" in
     menu|"")          need_root; ensure_binary; menu_main;;
     bench)            need_root; bench_run;;
-    add)              need_root; wizard_add;;
+    add)              need_root; wizard_add_manual;;
     add-auto)         shift; cmd_add_auto "$@";;
     add-manual)       shift; cmd_add_manual "$@";;
     server-token)     need_root; cmd_server_token "${2:?token}";;
