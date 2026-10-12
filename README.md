@@ -50,6 +50,22 @@ Forwarding:   Boot override detected (/etc/sysctl.d/...)
 
 The forwarding warning is intentional: another sysctl configuration may override forwarding settings at boot. **Do not ignore it** when forwarding stops working after a reboot. Use `omnitunnel fix-forwarding` only after reviewing conflicting system-wide sysctl configuration.
 
+## Quick install (Ubuntu / Debian)
+
+Run as root on **each server** after reviewing the installer:
+
+```bash
+curl -fsSLo /tmp/omnitunnel-install.sh https://raw.githubusercontent.com/Amam8585/OmniTunnel/main/install.sh && sudo bash /tmp/omnitunnel-install.sh --prepare && sudo bash /tmp/omnitunnel-install.sh --check && sudo bash /tmp/omnitunnel-install.sh --apply
+```
+
+Then open the manager:
+
+```bash
+sudo omnitunnel
+```
+
+**Important:** The installer uses a staged workflow; it may refuse activation while tunnels are running unless you explicitly opt in. It does not automatically restart existing tunnels. Hybrid IG failover is not yet implemented.
+
 ## Requirements
 
 - Linux: Ubuntu 22.04 / 24.04 or Debian 12 / 13 (as accepted by `install.sh`)
