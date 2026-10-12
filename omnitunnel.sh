@@ -177,7 +177,7 @@ ensure_omniackless() {
 }
 
 # ------------------------------------------------------------ type registry ---
-ALL_TYPES="gre icmp udp hysteria tcp fou vxlan ackless"
+ALL_TYPES="gre icmp udp hysteria tcp fou"
 type_desc() {
     case "$1" in
         gre) echo "GRE";;
@@ -186,8 +186,6 @@ type_desc() {
         hysteria) echo "Hysteria2";;
         tcp) echo "TCP (encrypted)";;
         fou) echo "FOU (GRE/UDP)";;
-        vxlan) echo "VXLAN";;
-        ackless) echo "ACKLess";;
         *) echo "";;
     esac
 }
@@ -2184,11 +2182,10 @@ EOF
     kv "Core Version:" "$("$TSUITE_BIN" version 2>/dev/null || echo 'not installed')"
     kv "Source:" "github.com/Amam8585/OmniTunnel"
     rule_amber
-    kv "IP Address:" "${myip:-unknown}"
-    kv "Architecture:" "$(arch_tag)"
-    kv "Tunnels:" "$RUN running, $STOP stopped" "$([[ $RUN -gt 0 ]] && printf '%s' "$C_BGRN" || printf '%s' "$C_GREY")"
-    kv "Port forwards:" "$fwd"
-    kv "Core:" "$([[ -x "$TSUITE_BIN" ]] && echo Installed || echo missing)" "$([[ -x "$TSUITE_BIN" ]] && printf '%s' "$C_BGRN" || printf '%s' "$C_BRED")"
+    kv "Server:" "${myip:-unknown} · $(arch_tag)"
+    kv "Tunnels:" "$RUN online · $STOP offline" "$([[ $RUN -gt 0 ]] && printf '%s' "$C_BGRN" || printf '%s' "$C_GREY")"
+    kv "Forwards:" "$fwd"
+    kv "Core:" "$([[ -x "$TSUITE_BIN" ]] && echo Ready || echo Missing)" "$([[ -x "$TSUITE_BIN" ]] && printf '%s' "$C_BGRN" || printf '%s' "$C_BRED")"
     local off; off="$(forwarding_offenders)"
     if [[ -n "$off" ]]; then
         kv "IP forwarding:" "OFF on ${off% }" "$C_BRED"
@@ -2196,7 +2193,7 @@ EOF
     fi
     local ovr; ovr="$(forwarding_conf_overrides)"
     if [[ -n "$ovr" ]]; then
-        kv "Forwarding conf:" "overridden at boot by ${ovr% }" "$C_BYEL"
+        kv "Forwarding:" "Boot override detected (${ovr% })" "$C_BYEL"
     fi
     rule_amber
     return 0
@@ -2330,50 +2327,23 @@ menu_main() {
         nitem 1 "Install / Create Tunnel" "$C_BGRN$C_BOLD"
         nitem 2 "Manage Tunnels" "$C_BLUE$C_BOLD"
         nitem 3 "Port Forwarding"
-        nitem 4 "Status & Monitoring"
-        nitem 5 "Network Optimization"
-        nitem 6 "Diagnostics & Benchmark"
-        nitem 7 "Update OmniTunnel"
-        nitem 8 "Completely Uninstall OmniTunnel" "$C_BRED$C_BOLD"
-        nitem 9 "Exit"
+        nitem 4 "Network Optimization"
+        nitem 5 "Update OmniTunnel"
+        nitem 6 "Completely Uninstall OmniTunnel" "$C_BRED$C_BOLD"
+        nitem 7 "Exit"
         rule_green
-        printf '  %bEnter your choice [1-9]:%b ' "$C_BGRN" "$C_RESET"
+        printf '  %bEnter your choice [1-7]:%b ' "$C_BGRN" "$C_RESET"
         local c n any
         read -r c || exit 0
         case "$c" in
-            1) wizard_add; pause;;
+            1) wizard_add_manual; pause;;
             2) menu_instances;;
             3) menu_pf;;
-            4) banner "Status & Monitoring"; echo; inst_header; rule
-               any=0
-               for n in $(list_instances); do inst_status "$n" full; any=1; done
-               [[ "$any" == 0 ]] && info "No tunnels configured."
-               if pick_instance; then bash "$ASSET_DIR/scripts/monitor.sh" stats "$PICK"; fi
-               pause;;
-            5) if pick_instance; then bash "$ASSET_DIR/scripts/optimizer.sh" recommend "$PICK" balanced; fi; pause;;
-            6) banner "Diagnostics & Benchmark"
-               nitem 1 "Tunnel diagnostics"
-               nitem 2 "Benchmark all transports (generates traffic)"
-               nitem 3 "Manual benchmark (generates traffic)"
-               nitem 0 "Back"
-               read -rp "Choice: " c || c=0
-               case "$c" in
-                   1) if pick_instance; then bash "$ASSET_DIR/scripts/diagnostics.sh" "$PICK"; fi;;
-                   2) read -rp "Benchmark generates network traffic. Type BENCH to continue: " c
-                      [[ "$c" == BENCH ]] && bench_run;;
-                   3) local fh mip x
-                      read -erp "Foreign server IP: " fh
-                      mip="$(default_local_ip)"
-                      read -erp "This box public IP [$mip]: " x
-                      mip="${x:-$mip}"
-                      read -rp "Benchmark generates network traffic. Type BENCH to continue: " c
-                      [[ "$c" == BENCH && -n "$fh" ]] && cmd_bench_manual "$fh" "$mip";;
-               esac
-               pause;;
-            7) cmd_update; pause;;
-            8) cmd_uninstall; pause;;
-            9|0) exit 0;;
-            *) warn "Choose a number from 1 to 9"; pause;;
+            4) if pick_instance; then bash "$ASSET_DIR/scripts/optimizer.sh" recommend "$PICK" balanced; fi; pause;;
+            5) cmd_update; pause;;
+            6) cmd_uninstall; pause;;
+            7|0) exit 0;;
+            *) warn "Choose a number from 1 to 7"; pause;;
         esac
     done
 }
