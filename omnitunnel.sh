@@ -2245,7 +2245,7 @@ bench_table() {
         IFS='|' read -r t dl ul ls pg <<< "$r"; v="$(_mbit "$dl")"
         sorted+=("$(printf '%012.3f|%s' "$v" "$r")")
         if _gt "$v" "$max"; then max="$v"; fi
-        case "$t" in udp|tcp|mux|ws|hysteria|fou|icmp|reverse-mux|stripe|ackless) if _gt "$v" "$sv"; then sv="$v"; stealth="$t"; fi;; esac
+        case "$t" in udp|tcp|mux|ws|hysteria|fou|icmp|stripe|ackless) if _gt "$v" "$sv"; then sv="$v"; stealth="$t"; fi;; esac
     done
     local OIFS="$IFS"; IFS=$'\n'; sorted=($(printf '%s\n' "${sorted[@]}" | sort -r)); IFS="$OIFS"
     echo

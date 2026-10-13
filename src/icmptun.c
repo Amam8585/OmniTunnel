@@ -311,6 +311,10 @@ static void tun_set_writable(int enabled) {
     ev.data.fd = tun_fd;
     if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, tun_fd, &ev) == 0)
         tun_blocked = enabled;
+    else {
+        metrics.tun_errors++;
+        DBG("TUN epoll_ctl MOD failed: %s\n", strerror(errno));
+    }
 }
 static void tun_drain(void) {
     int budget = IO_BATCH;
@@ -762,6 +766,10 @@ static void send_set_writable(int enabled) {
     ev.data.fd = icmp_fd;
     if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, icmp_fd, &ev) == 0)
         send_blocked = enabled;
+    else {
+        metrics.send_errors++;
+        DBG("ICMP epoll_ctl MOD failed: %s\n", strerror(errno));
+    }
 }
 static void send_flush(void) {
     int budget = TX_BATCH;
@@ -1066,7 +1074,8 @@ int tun_main_icmp(int argc, char **argv) {
                     }
                     ssize_t n = read(tun_fd, tun_raw, sizeof(tun_raw));
                     if (n < 0) {
-                        if (errno != EAGAIN) { metrics.tun_errors++; DBG("tun read error: %s\n", strerror(errno)); }
+                        if (errno == EINTR) { --batch; continue; }
+                        if (errno != EAGAIN && errno != EWOULDBLOCK) { metrics.tun_errors++; DBG("tun read error: %s\n", strerror(errno)); }
                         break;
                     }
                     if (n == 0) break;
@@ -1120,7 +1129,8 @@ int tun_main_icmp(int argc, char **argv) {
                                          MSG_DONTWAIT,
                                          (struct sockaddr*)&from, &fromlen);
                     if (n < 0) {
-                        if (errno != EAGAIN) { metrics.recv_errors++; DBG("icmp recv error: %s\n", strerror(errno)); }
+                        if (errno == EINTR) { --batch; continue; }
+                        if (errno != EAGAIN && errno != EWOULDBLOCK) { metrics.recv_errors++; DBG("icmp recv error: %s\n", strerror(errno)); }
                         break;
                     }
                     metrics.icmp_rx++;

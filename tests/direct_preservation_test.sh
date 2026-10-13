@@ -48,7 +48,7 @@ s = Path("install.sh").read_text()
 start = s.index('    uninstall)\n', s.index('case "$ACTION" in'))
 end = s.index('    prepare)\n', start)
 block = s[start:end]
-assert block.index("if ((PURGE)) && compgen") < block.index("snapshot"), "purge preflight must precede snapshot"
+assert block.index("if ((PURGE)) && compgen") < block.index("\n        snapshot\n"), "purge preflight must precede snapshot"
 assert block.index("if ((PURGE)) && compgen") < block.index("((DRY))"), "dry-run must validate purge preflight"
 PY
 # A 100k-packet egress queue causes severe bufferbloat under congestion.
@@ -110,5 +110,15 @@ assert "if (sq_count >= QUEUE_SIZE)" in block
 assert "tun_set_readable(0);" in block
 assert "send_set_writable(1);" in block
 assert block.index("if (sq_count >= QUEUE_SIZE)") < len(block)
+PY
+# ICMP interruption and event registration regressions.
+python3 - <<'PY'
+from pathlib import Path
+s = Path("src/icmptun.c").read_text()
+assert s.count("if (errno == EINTR) { --batch; continue; }") == 2
+assert 'DBG("TUN epoll_ctl MOD failed:' in s
+assert 'DBG("ICMP epoll_ctl MOD failed:' in s
+assert 'send_set_writable(sq_count != 0);' in s
+assert 'tun_set_writable(tun_count != 0);' in s
 PY
 echo "PASS: six active Direct transports registered; legacy preserved; safe installer and Bash syntax"

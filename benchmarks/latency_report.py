@@ -22,7 +22,7 @@ def quantile(values, proportion):
     p = (len(sorted_values)-1) * proportion
     i = math.floor(p)
     j = math.ceil(p)
-    return sorted_values[i]*(j-p)+sorted_values[j]*(p-i) if i != j else sorted_values[i]
+    return round(sorted_values[i]*(j-p)+sorted_values[j]*(p-i), 12) if i != j else sorted_values[i]
 
 def summarize(text, sent):
     if not (1 <= sent <= 100000):
