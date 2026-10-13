@@ -74,4 +74,16 @@ for name in ("create_inst", "cmd_server_token"):
     end = s.find("\n}\n", start)
     assert end != -1 and 'require_supported_transport "$t"' in s[start:end], name
 PY
+# Regression: an ICMP TUN write backlog must keep EPOLLOUT armed
+# when the drain loop hits its per-iteration budget.
+python3 - <<'PY'
+from pathlib import Path
+s = Path("src/icmptun.c").read_text()
+start = s.index("static void tun_drain(void) {")
+end = s.index("static void tun_deliver(", start)
+body = s[start:end]
+assert "int budget = IO_BATCH;" in body
+assert "tun_set_writable(tun_count != 0);" in body
+assert "tun_set_writable(0);" not in body
+PY
 echo "PASS: six active Direct transports registered; legacy preserved; safe installer and Bash syntax"
