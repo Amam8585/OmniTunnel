@@ -48,7 +48,7 @@ s = Path("install.sh").read_text()
 start = s.index('    uninstall)\n', s.index('case "$ACTION" in'))
 end = s.index('    prepare)\n', start)
 block = s[start:end]
-assert block.index("if ((PURGE)) && compgen") < block.index("snapshot"), "purge preflight must precede snapshot"
+assert block.index("if ((PURGE)) && compgen") < block.index("\n        snapshot\n"), "purge preflight must precede snapshot"
 assert block.index("if ((PURGE)) && compgen") < block.index("((DRY))"), "dry-run must validate purge preflight"
 PY
 # A 100k-packet egress queue causes severe bufferbloat under congestion.
