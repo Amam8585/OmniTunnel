@@ -13,10 +13,10 @@ curl -fsSLo /tmp/apadana-install.sh https://raw.githubusercontent.com/Amam8585/O
 sudo bash /tmp/apadana-install.sh --prepare
 sudo bash /tmp/apadana-install.sh --check
 sudo bash /tmp/apadana-install.sh --apply
-sudo omnitunnel
+sudo apadana
 ```
 
-**Important:** the commands above install the **released main branch**, not this unmerged rebranding PR. The installer stages and validates before applying, and does not automatically restart running tunnel services. Existing on-disk command name is `omnitunnel`.
+**Important:** the commands above install the **released main branch**, not this unmerged rebranding PR. The installer stages and validates before applying, and does not automatically restart running tunnel services. The installer creates the `apadana` command and retains `omnitunnel` as a compatibility alias.
 
 ## Currently supported NEW tunnel transports
 
@@ -40,12 +40,12 @@ Legacy MUX, WebSocket, Stripe, VXLAN and ACKLess may remain in the source and on
 2) Manage Tunnels
 3) Port Forwarding
 4) Network Optimization
-5) Update OmniTunnel
-6) Completely Uninstall OmniTunnel
+5) Update APADANA
+6) Completely Uninstall APADANA
 7) Exit
 ```
 
-The menu retains historical wording for actions that operate on the existing installer and service namespace. An operator creates a tunnel on one host and pairs the other host with the generated token. The manager uses systemd to supervise the services and iptables-based forwarding for applicable L3 transports. Hysteria2 uses a separate engine and forwarding model.
+The APADANA menu uses the new product name; internal services retain historical names for compatibility. An operator creates a tunnel on one host and pairs the other host with the generated token. The manager uses systemd to supervise the services and iptables-based forwarding for applicable L3 transports. Hysteria2 uses a separate engine and forwarding model.
 
 ## Optimizer
 
@@ -72,10 +72,18 @@ Available profiles: `balanced`, `low-latency`, `high-throughput`, `extreme-conne
 
 ## Compatibility and migration policy
 
-The rebrand intentionally preserves existing `/etc/omnitunnel`, `/var/lib/omnitunnel`, `/usr/local/bin/omnitun`, systemd `omnitun-*.service`, and the `omnitunnel` command. Blindly renaming these would break live instances, backups and upgrades. A future full namespace migration requires an explicit compatibility strategy, reversible installer, and tests against existing deployments.
+The rebrand intentionally preserves existing `/etc/omnitunnel`, `/var/lib/omnitunnel`, `/usr/local/bin/omnitun`, systemd `omnitun-*.service`, and the `omnitunnel` command. Blindly renaming these would break live instances, backups and upgrades. The installer adds `/usr/local/bin/apadana` while preserving the existing `omnitunnel` command. A future full namespace migration requires an explicit compatibility strategy, reversible installer, and tests against existing deployments.
 
 ## Verification
 
 This README describes implemented behavior, **not benchmark results**. A two-host lab, supported-kernel coverage, GCC/Clang/sanitizer builds, installer tests, forwarding tests and reconnection tests are required before calling the rebrand or Hybrid IG production-ready. No throughput, PPS, concurrency or failover claims are made.
 
 Repository: https://github.com/Amam8585/OmniTunnel
+
+## Uninstall behavior
+
+The installer `--uninstall` refuses to run while detected tunnel services are active. It removes installed program files and the owned `apadana`/`omnitunnel` command links; it preserves instance configurations by default. `--purge-config --yes` is destructive and must only be used after exporting configurations and intentionally stopping all instances. The manager has a separate interactive destructive cleanup path. Neither command guarantees removal of unrelated manually configured firewall rules or third-party services.
+
+## Pairing modes
+
+The interactive **Install / Create Tunnel** menu uses token pairing: it asks for the remote IP but **not** SSH username or password. Paste the generated token on the foreign server using `sudo apadana server-token TOKEN`. The older `add-auto` SSH automation path remains available separately and may still request SSH credentials. No blanket removal of this legacy workflow has been performed.
