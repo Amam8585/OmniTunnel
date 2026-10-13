@@ -86,4 +86,17 @@ assert "int budget = IO_BATCH;" in body
 assert "tun_set_writable(tun_count != 0);" in body
 assert "tun_set_writable(0);" not in body
 PY
+# ICMP TX_BATCH limits per-loop work, not throughput: pending output must
+# remain registered for writable notifications after the batch budget ends.
+python3 - <<'PY'
+from pathlib import Path
+s = Path("src/icmptun.c").read_text()
+start = s.index("static void send_flush(void) {")
+end = s.index("static int tun_create(", start)
+block = s[start:end]
+assert "int budget = TX_BATCH;" in block
+assert "send_set_writable(sq_count != 0);" in block
+assert "send_set_writable(0);" not in block
+assert "tun_read_paused && sq_count <= QUEUE_HIGH_WATER / 2" in block
+PY
 echo "PASS: six active Direct transports registered; legacy preserved; safe installer and Bash syntax"

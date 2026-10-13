@@ -784,7 +784,10 @@ static void send_flush(void) {
         sq_head = next_idx(sq_head);
         sq_count--;
     }
-    send_set_writable(0);
+    /* TX_BATCH is a fairness budget, not a rate limit. Keep the socket
+     * writable interest armed while queued frames remain; otherwise a
+     * full batch can strand the rest until unrelated traffic arrives. */
+    send_set_writable(sq_count != 0);
     if (tun_read_paused && sq_count <= QUEUE_HIGH_WATER / 2)
         tun_set_readable(1);
 }
