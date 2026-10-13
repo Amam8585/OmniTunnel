@@ -59,4 +59,8 @@ for core in src/obsctcp.c src/obsctun.c; do
         fail "$core contains legacy oversized TUN queue"
     fi
 done
+# ICMP capacity defaults must be bounded and validated at creation time.
+grep -Fq 'OMNITUN_ICMP_FLOW_SLOTS:-8192' omnitunnel.sh || fail "ICMP default not updated"
+grep -Fq 'ICMP flow slots must be a power of two' omnitunnel.sh || fail "ICMP slot validation missing"
+grep -Fq 'FLOW_SLOTS=$icmp_slots' omnitunnel.sh || fail "ICMP validated slot count not persisted"
 echo "PASS: six active Direct transports registered; legacy preserved; safe installer and Bash syntax"
