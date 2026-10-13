@@ -61,6 +61,10 @@ static void test_frames(void) {
     n=ws_frame(frame,input,20,0);
     assert(write(fds[0],frame,n)==n);
     assert(ws_read_frame(fds[1],&c,out,sizeof(out))<0);
+    /* A rejected frame can leave unread payload bytes on a poisoned stream.
+     * Real transport closes it; use a new connection for the next case. */
+    close(fds[0]); close(fds[1]);
+    assert(socketpair(AF_UNIX,SOCK_STREAM,0,fds)==0);
 
     /* Reordered/fragmented binary frames are refused rather than dispatched
        as complete tunnel packets. */
@@ -68,11 +72,19 @@ static void test_frames(void) {
     frame[0]=0x02;
     assert(write(fds[0],frame,n)==n);
     assert(ws_read_frame(fds[1],&c,out,sizeof(out))<0);
+    /* A rejected frame can leave unread payload bytes on a poisoned stream.
+     * Real transport closes it; use a new connection for the next case. */
+    close(fds[0]); close(fds[1]);
+    assert(socketpair(AF_UNIX,SOCK_STREAM,0,fds)==0);
 
     /* A 64-bit payload-length indicator must not truncate into int. */
     const unsigned char huge[10]={0x82,0xff,0,0,0,0,0,1,0,0};
     assert(write(fds[0],huge,sizeof(huge))==(ssize_t)sizeof(huge));
     assert(ws_read_frame(fds[1],&c,out,sizeof(out))<0);
+    /* A rejected frame can leave unread payload bytes on a poisoned stream.
+     * Real transport closes it; use a new connection for the next case. */
+    close(fds[0]); close(fds[1]);
+    assert(socketpair(AF_UNIX,SOCK_STREAM,0,fds)==0);
 
     /* Ping receives a Pong of identical payload with appropriate server mask. */
     n=ws_frame(frame,input,3,1);
