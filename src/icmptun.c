@@ -327,7 +327,10 @@ static void tun_drain(void) {
         tun_head = (tun_head + 1) % TUN_PENDING_LIMIT;
         tun_count--;
     }
-    tun_set_writable(0);
+    /* If the per-iteration budget is exhausted, pending packets still need
+     * EPOLLOUT notification. Disabling it here can strand the queue forever
+     * until a new packet happens to arrive, stalling throughput under load. */
+    tun_set_writable(tun_count != 0);
 }
 static void tun_deliver(const unsigned char *data, uint16_t len) {
     if (!tun_count) {
