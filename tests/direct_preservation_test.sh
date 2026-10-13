@@ -14,11 +14,6 @@ for t in gre icmp udp hysteria tcp fou; do
     grep -qE "^[[:space:]]*$t\\)" omnitunnel.sh || fail "Direct type handler missing: $t"
 done
 # Retired transports must not be selectable for new instances.
-for t in mux ws stripe vxlan ackless; do
-    if grep -qE "^ALL_TYPES=.*(^| )$t( |\")" omnitunnel.sh; then
-        fail "retired transport unexpectedly active: $t"
-    fi
-done
 # Retired carriers must remain unavailable in the new-tunnel selection.
 for retired in mux ws stripe vxlan ackless; do
     if grep '^ALL_TYPES=' omnitunnel.sh | grep -qw "$retired"; then

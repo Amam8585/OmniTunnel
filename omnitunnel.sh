@@ -1,5 +1,5 @@
 #!/bin/bash
-# OmniTunnel Direct Manager (development branch).
+# APADANA Direct Manager (development branch).
 # All Direct carriers are retained. New installer compiles the C Direct core;
 # Go Direct engines are bundled. Dedicated Reverse-MUX/Chisel is removed.
 #
@@ -2158,7 +2158,7 @@ banner() {
     if [[ -n "$crumb" ]]; then
         local right; right="${myip:-?} · $(arch_tag)"
         local pad=$(( UI_W - ${#crumb} - ${#right} - 14 )); [[ $pad -lt 1 ]] && pad=1
-        printf '\n  %bOMNITUNNEL%b  %b%s%b%*s%b%s%b\n' \
+        printf '\n  %bAPADANA%b  %b%s%b%*s%b%s%b\n' \
             "$C_BCYN$C_BOLD" "$C_RESET" "$C_WHITE$C_BOLD" "$crumb" "$C_RESET" \
             "$pad" "" "$C_GREY" "$right" "$C_RESET"
         rule_amber
@@ -2172,14 +2172,14 @@ banner() {
     fi
     printf '%b\n' "$C_BCYN$C_BOLD"
     cat <<'EOF'
-  █████ █   █ █   █ █████ █████ █   █ █   █ █   █ █████ █
-  █   █ ██ ██ ██  █   █     █   █   █ ██  █ ██  █ █     █
-  █   █ █ █ █ █ █ █   █     █   █   █ █ █ █ █ █ █ ████  █
-  █   █ █   █ █  ██   █     █   █   █ █  ██ █  ██ █     █
-  █████ █   █ █   █ █████   █   █████ █   █ █   █ █████ █████
+       _    ____   _    ____    _    _   _    _
+      / \\  |  _ \\ / \\  |  _ \\  / \\  | \ | |  / \\
+     / _ \\ | |_) / _ \\ | | | |/ _ \\ |  \| | / _ \\
+    / ___ \\|  __/ ___ \\| |_| / ___ \\| |\\  |/ ___ \\
+   /_/   \\_\\_| /_/   \\_\\____/_/   \\_\\_| \\_/_/   \\_\\
 EOF
     printf '%b' "$C_RESET"
-    printf '  %bOmniTunnel Direct Manager%b\n\n' "$C_WHITE" "$C_RESET"
+    printf '  %bAPADANA Direct Manager%b\n\n' "$C_WHITE" "$C_RESET"
     kv "Script Version:" "$VERSION"
     kv "Core Version:" "$("$TSUITE_BIN" version 2>/dev/null || echo 'not installed')"
     kv "Source:" "github.com/Amam8585/OmniTunnel"
