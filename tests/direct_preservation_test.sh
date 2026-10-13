@@ -51,4 +51,12 @@ block = s[start:end]
 assert block.index("if ((PURGE)) && compgen") < block.index("snapshot"), "purge preflight must precede snapshot"
 assert block.index("if ((PURGE)) && compgen") < block.index("((DRY))"), "dry-run must validate purge preflight"
 PY
+# A 100k-packet egress queue causes severe bufferbloat under congestion.
+# Validate both userspace C dataplanes retain a bounded initial queue.
+for core in src/obsctcp.c src/obsctun.c; do
+    grep -q 'q.ifr_qlen = 1000;' "$core" || fail "$core must bound initial TUN queue"
+    if grep -q 'q.ifr_qlen = 100000;' "$core"; then
+        fail "$core contains legacy oversized TUN queue"
+    fi
+done
 echo "PASS: six active Direct transports registered; legacy preserved; safe installer and Bash syntax"
