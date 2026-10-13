@@ -111,4 +111,14 @@ assert "tun_set_readable(0);" in block
 assert "send_set_writable(1);" in block
 assert block.index("if (sq_count >= QUEUE_SIZE)") < len(block)
 PY
+# ICMP interruption and event registration regressions.
+python3 - <<'PY'
+from pathlib import Path
+s = Path("src/icmptun.c").read_text()
+assert s.count("if (errno == EINTR) { --batch; continue; }") == 2
+assert 'DBG("TUN epoll_ctl MOD failed:' in s
+assert 'DBG("ICMP epoll_ctl MOD failed:' in s
+assert 'send_set_writable(sq_count != 0);' in s
+assert 'tun_set_writable(tun_count != 0);' in s
+PY
 echo "PASS: six active Direct transports registered; legacy preserved; safe installer and Bash syntax"
