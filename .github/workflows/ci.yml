@@ -101,6 +101,7 @@ jobs:
           set -e
           for t in tests/*.sh; do
             [ "$t" != tests/installer_integration_test.sh ] || continue
+            [ "$t" != tests/optimizer_runtime_test.sh ] || continue  # runs with sudo in direct-c job
             echo "::group::$t"
             bash "$t"
             echo "::endgroup::"
