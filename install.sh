@@ -443,9 +443,18 @@ case "$ACTION" in
             rm -f "$APADANA_LINK"
         rm -rf "$PREFIX/scripts" "$PREFIX/docs" "$PREFIX/bin"
         rm -f "$PREFIX/build-info.json" "$PREFIX/README.md" "$PREFIX/CHANGELOG.md" "$PREFIX/LICENSE"
-        rm -f "$PREFIX/omnitunnel.sh" "$BIN_DIR/omnitun" \
-            "$BIN_DIR/hysteria" "$BIN_DIR/omnistripe" "$BIN_DIR/omniackless"
-        ((PURGE==0)) || rm -rf /etc/omnitunnel
+        rm -f "$PREFIX/omnitunnel.sh"
+        # These binaries may be shared by other applications. Do not remove
+        # them without a verifiable ownership inventory.
+        log "Shared binaries in $BIN_DIR preserved (ownership not proven)"
+        if ((PURGE)); then
+            # Configs are referenced by stopped services too. Refuse to
+            # orphan those units; remove instances through the manager first.
+            if compgen -G '/etc/systemd/system/omnitun-*.service' >/dev/null; then
+                die "managed unit files remain; remove instances with APADANA before --purge-config"
+            fi
+            rm -rf /etc/omnitunnel
+        fi
         log "APADANA program files removed; instance configs and services preserved unless explicitly purged";;
     prepare)
         ((DRY)) && { log "dry run: would fetch/build/stage"; exit 0; }
