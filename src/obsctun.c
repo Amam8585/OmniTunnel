@@ -109,7 +109,10 @@ static int tun_alloc(const char *dev, int mtu_) {
         if (ioctl(s, SIOCSIFMTU, &m) < 0) perror("SIOCSIFMTU");
         struct ifreq q; memset(&q, 0, sizeof(q));
         strncpy(q.ifr_name, dev, IFNAMSIZ - 1);
-        q.ifr_qlen = 100000;
+        /* Bound the TUN egress queue to avoid seconds of stale buffered
+         * packets during congestion. Operators can tune per instance via
+         * APADANA optimizer after measuring throughput and latency. */
+        q.ifr_qlen = 1000;
         if (ioctl(s, SIOCSIFTXQLEN, &q) < 0) perror("SIOCSIFTXQLEN");
         close(s);
     }
