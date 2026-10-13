@@ -433,9 +433,14 @@ case "$ACTION" in
             die "active instances: rollback needs --allow-active (no restart)"
         ((DRY)) && exit 0; rollback;;
     uninstall)
-        [[ -z "$(active_units)" ]] || die "stop all OmniTunnel services explicitly first"
+        [[ -z "$(active_units)" ]] || die "stop all APADANA services explicitly first"
         [[ $PURGE -eq 0 || $YES -eq 1 ]] || die "--purge-config requires --yes"
-        ((DRY)) && exit 0
+        # All destructive-operation preflight checks MUST run before snapshot
+        # or removing binaries/links, including in dry-run mode.
+        if ((PURGE)) && compgen -G '/etc/systemd/system/omnitun-*.service' >/dev/null; then
+            die "managed unit files remain; remove instances with APADANA before --purge-config"
+        fi
+        ((DRY)) && { log "dry-run: uninstall preflight passed; no files removed"; exit 0; }
         snapshot
         [[ -L "$LINK" && "$(readlink "$LINK")" == "$PREFIX/omnitunnel.sh" ]] &&
             rm -f "$LINK"
@@ -450,9 +455,6 @@ case "$ACTION" in
         if ((PURGE)); then
             # Configs are referenced by stopped services too. Refuse to
             # orphan those units; remove instances through the manager first.
-            if compgen -G '/etc/systemd/system/omnitun-*.service' >/dev/null; then
-                die "managed unit files remain; remove instances with APADANA before --purge-config"
-            fi
             rm -rf /etc/omnitunnel
         fi
         log "APADANA program files removed; instance configs and services preserved unless explicitly purged";;

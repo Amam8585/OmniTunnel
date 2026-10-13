@@ -41,4 +41,14 @@ grep -Fq 'APADANA_LINK="$BIN_DIR/apadana"' install.sh || fail "APADANA executabl
 grep -Fq 'ln -sfn "$PREFIX/omnitunnel.sh" "$APADANA_LINK"' install.sh || fail "APADANA alias not installed"
 grep -Fq 'nitem 5 "Update APADANA"' omnitunnel.sh || fail "old update menu label"
 grep -Fq 'nitem 6 "Completely Uninstall APADANA"' omnitunnel.sh || fail "old uninstall menu label"
+# Uninstall must reject an unsafe purge before it takes a snapshot or removes files.
+python3 - <<'PY'
+from pathlib import Path
+s = Path("install.sh").read_text()
+start = s.index('    uninstall)\n', s.index('case "$ACTION" in'))
+end = s.index('    prepare)\n', start)
+block = s[start:end]
+assert block.index("if ((PURGE)) && compgen") < block.index("snapshot"), "purge preflight must precede snapshot"
+assert block.index("if ((PURGE)) && compgen") < block.index("((DRY))"), "dry-run must validate purge preflight"
+PY
 echo "PASS: six active Direct transports registered; legacy preserved; safe installer and Bash syntax"
