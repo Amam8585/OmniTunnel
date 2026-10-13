@@ -1,27 +1,39 @@
-# OmniTunnel
+# APADANA — Direct Tunnel Manager
 
-**Linux tunnel manager — development release**
+> **Development build.** APADANA is the new project-facing name. The repository URL and internal `omnitunnel` / `omnitun` paths remain unchanged in this migration to avoid disrupting existing installations. A complete on-disk rename has **not** been performed.
 
-OmniTunnel manages point-to-point tunnels between two Linux servers, with instance management, systemd services, and port forwarding. This README describes the **current development branch**, not a completed Hybrid IG release.
+APADANA manages direct point-to-point tunnels between Linux servers. The Bash manager creates per-instance configurations, systemd units and forwarding rules. The C core handles selected userspace transports. Kernel transports use Linux networking facilities.
 
-> **Release status:** UI and new-tunnel transport selection have been updated. **Hybrid IG (GRE primary + ICMP fallback) is planned but NOT implemented.** Do not assume automatic failover works. Production deployment and cross-server interoperability testing have not been completed for this branch.
+## Install from the current repository
 
-## Supported choices for NEW tunnels
+Review the installer before running it as root. On supported Ubuntu/Debian hosts:
 
-| Transport | Type | Notes |
+```bash
+curl -fsSLo /tmp/apadana-install.sh https://raw.githubusercontent.com/Amam8585/OmniTunnel/main/install.sh
+sudo bash /tmp/apadana-install.sh --prepare
+sudo bash /tmp/apadana-install.sh --check
+sudo bash /tmp/apadana-install.sh --apply
+sudo omnitunnel
+```
+
+**Important:** the commands above install the **released main branch**, not this unmerged rebranding PR. The installer stages and validates before applying, and does not automatically restart running tunnel services. Existing on-disk command name is `omnitunnel`.
+
+## Currently supported NEW tunnel transports
+
+| Choice | Dataplane | Requirement |
 | --- | --- | --- |
-| GRE | Kernel GRE (IP protocol 47) | Requires bidirectional GRE reachability |
-| ICMP | Userspace ICMP/TUN | Requires permitted ICMP traffic |
-| UDP | Encrypted UDP/TUN | Requires bidirectional UDP reachability |
-| Hysteria2 | QUIC-based transport | UDP-based; implementation has distinct forwarding behavior |
-| TCP | Encrypted TCP/TUN | TCP carrier |
-| FOU | GRE encapsulated in UDP (kernel) | Requires bidirectional UDP on selected port |
+| GRE | Linux kernel GRE | GRE/IP protocol 47 permitted between peers |
+| ICMP | C userspace ICMP over TUN | Bidirectional ICMP path and raw-socket privileges |
+| UDP | C userspace authenticated encrypted UDP/TUN | UDP path and shared key |
+| Hysteria2 | External Hysteria2 QUIC engine | Compatible engine and UDP path |
+| TCP | C userspace authenticated encrypted TCP/TUN | TCP path and shared key |
+| FOU | Linux kernel GRE encapsulated over UDP | UDP path, kernel FOU support |
 
-**Planned menu order:** GRE, ICMP, Hybrid IG, UDP, Hysteria2, TCP, FOU. The actual development branch currently lists **six** options, because Hybrid IG does not have a working engine yet.
+**Hybrid IG (GRE primary + ICMP fallback) is not implemented.** There is no tested automatic failover, shared-interface handoff or connection-continuity guarantee. It is not offered as a working transport.
 
-**Removed from new-tunnel selection:** TCP MUX, WebSocket, TCP Stripe, VXLAN, ACKLess. Existing instances of retired transports are **not** automatically removed or migrated. Some legacy code and assets remain for compatibility; removal from the menu does not mean all related source files have been deleted.
+Legacy MUX, WebSocket, Stripe, VXLAN and ACKLess may remain in the source and on existing hosts for compatibility; they are **not** choices for new tunnel creation. Dedicated Reverse is not supported.
 
-## Main menu
+## Interactive manager
 
 ```text
 1) Install / Create Tunnel
@@ -29,119 +41,41 @@ OmniTunnel manages point-to-point tunnels between two Linux servers, with instan
 3) Port Forwarding
 4) Network Optimization
 5) Update OmniTunnel
-6) Uninstall OmniTunnel
+6) Completely Uninstall OmniTunnel
 7) Exit
 ```
 
-The former main-menu entries **Status & Monitoring** and **Diagnostics & Benchmark** were removed. Status information remains visible in the dashboard and tunnel management. Some CLI diagnostics and benchmark functions may still exist internally.
+The menu retains historical wording for actions that operate on the existing installer and service namespace. An operator creates a tunnel on one host and pairs the other host with the generated token. The manager uses systemd to supervise the services and iptables-based forwarding for applicable L3 transports. Hysteria2 uses a separate engine and forwarding model.
 
-## Dashboard
-
-The dashboard reports live values detected on the local machine, for example:
-
-```text
-OMNITUNNEL
-Server:       <public-ip> · amd64
-Tunnels:      1 online · 0 offline
-Forwards:     0
-Core:         Ready
-Forwarding:   Boot override detected (/etc/sysctl.d/...)
-```
-
-The forwarding warning is intentional: another sysctl configuration may override forwarding settings at boot. **Do not ignore it** when forwarding stops working after a reboot. Use `omnitunnel fix-forwarding` only after reviewing conflicting system-wide sysctl configuration.
-
-## Quick install (Ubuntu / Debian)
-
-Run as root on **each server** after reviewing the installer:
+## Optimizer
 
 ```bash
-curl -fsSLo /tmp/omnitunnel-install.sh https://raw.githubusercontent.com/Amam8585/OmniTunnel/main/install.sh && sudo bash /tmp/omnitunnel-install.sh --prepare && sudo bash /tmp/omnitunnel-install.sh --check && sudo bash /tmp/omnitunnel-install.sh --apply
+sudo bash scripts/optimizer.sh status INSTANCE
+sudo bash scripts/optimizer.sh recommend INSTANCE low-latency
+sudo bash scripts/optimizer.sh dry-run INSTANCE high-throughput
+sudo bash scripts/optimizer.sh apply INSTANCE low-latency --acknowledge
+sudo bash scripts/optimizer.sh rollback INSTANCE
 ```
 
-Then open the manager:
+Available profiles: `balanced`, `low-latency`, `high-throughput`, `extreme-connections`, `high-pps`, `auto-adaptive`. The last three are currently **observation-only**, not a working adaptive controller. Apply changes only with explicit approval and after comparing measured latency, drops and throughput under equivalent load. No performance uplift has been verified.
 
-```bash
-sudo omnitunnel
-```
+## Source layout
 
-**Important:** The installer uses a staged workflow; it may refuse activation while tunnels are running unless you explicitly opt in. It does not automatically restart existing tunnels. Hybrid IG failover is not yet implemented.
+- `omnitunnel.sh`: manager, pairing, services, forwarding and UI.
+- `install.sh`: staged installer and rollback tooling.
+- `src/icmptun.c`: ICMP userspace dataplane.
+- `src/obsctun.c`: authenticated UDP dataplane.
+- `src/obsctcp.c`: authenticated TCP dataplane.
+- `scripts/optimizer.sh`: read-only recommendations and opt-in interface queue adjustment.
+- `scripts/monitor.sh`, `scripts/diagnostics.sh`: runtime diagnostics.
+- `tests/`: source and integration test scripts.
 
-## Requirements
+## Compatibility and migration policy
 
-- Linux: Ubuntu 22.04 / 24.04 or Debian 12 / 13 (as accepted by `install.sh`)
-- Root privileges
-- amd64 or arm64
-- Two servers with routable addresses and an allowed carrier protocol
-- `curl`, systemd, and other installer-managed dependencies
+The rebrand intentionally preserves existing `/etc/omnitunnel`, `/var/lib/omnitunnel`, `/usr/local/bin/omnitun`, systemd `omnitun-*.service`, and the `omnitunnel` command. Blindly renaming these would break live instances, backups and upgrades. A future full namespace migration requires an explicit compatibility strategy, reversible installer, and tests against existing deployments.
 
-## Installation — staged and cautious
+## Verification
 
-The installer supports **prepare → check → apply**. `--prepare` stages and validates files; it **does not activate** the staged build. `--apply` activates the prepared build and is designed not to restart existing tunnel services automatically.
-
-**Development branch:**
-
-```bash
-export OMNITUN_REF=release/ui-forwarding-hardening-20261012
-curl -fsSLo /tmp/omnitunnel-install.sh "https://raw.githubusercontent.com/Amam8585/OmniTunnel/$OMNITUN_REF/install.sh"
-sudo -E bash /tmp/omnitunnel-install.sh --prepare
-sudo -E bash /tmp/omnitunnel-install.sh --check
-sudo -E bash /tmp/omnitunnel-install.sh --apply
-```
-
-Review the installer and its output before applying it. On active servers, installation may require explicit `--allow-active`; see `--help` and make a backup first. **The development branch has not been production-validated.**
-
-## Create a tunnel (manual token pairing)
-
-1. Install the **same revision** on both servers.
-2. On the first server, run `sudo omnitunnel`, choose **Install / Create Tunnel**, then select a supported transport.
-3. Enter the local public IP, foreign public IP, and instance name. The manager prints a pairing token.
-4. On the foreign server, run:
-
-```bash
-sudo omnitunnel server-token '<TOKEN_FROM_FIRST_SERVER>'
-```
-
-5. Check status and test the tunnel IPs in both directions before adding forwarding rules.
-
-Manual token pairing does **not** require SSH credentials for the foreign host. Never paste a real pairing token into a public issue or chat.
-
-## Manage instances and forwarding
-
-```bash
-sudo omnitunnel
-sudo omnitunnel list
-sudo omnitunnel status <instance>
-sudo omnitunnel pf-add <instance> <tcp|udp|both> <port>
-sudo omnitunnel pf-del <instance> <port>
-sudo omnitunnel fix-forwarding
-```
-
-Forwarding requires a healthy tunnel, correct routes, permitted firewall traffic, and IPv4 forwarding. Adding rules does not increase the bandwidth available from the underlying network.
-
-## Hybrid IG — planned, not available
-
-The intended design is **GRE as the primary path** and **ICMP only as fallback** when GRE is down or degraded. A production implementation still requires:
-
-- A real shared logical interface and a separately implemented failover controller/engine.
-- Bidirectional health checks, hysteresis, safe switchover and return to GRE.
-- Packet ordering and connection continuity validation across both carriers.
-- Installation and service lifecycle integration, token pairing and removal support.
-- Two-host failover, reboot, routing and load tests.
-
-**There is currently no Hybrid IG binary or verified working Hybrid IG transport in this branch.** No zero-downtime failover, guaranteed TCP session preservation, or speed increase is claimed.
-
-## Safety and compatibility
-
-- Do not overwrite or delete existing tunnel configurations just to change transport menus.
-- Review `/etc/omnitunnel/inst/` and back up state before upgrades.
-- Keep an out-of-band SSH/console path when changing network routes.
-- Test GRE, ICMP, UDP and other carriers on your own path; ISP filtering differs.
-- This branch has not been merged into `main` as a finalized release.
-
-## Source
+This README describes implemented behavior, **not benchmark results**. A two-host lab, supported-kernel coverage, GCC/Clang/sanitizer builds, installer tests, forwarding tests and reconnection tests are required before calling the rebrand or Hybrid IG production-ready. No throughput, PPS, concurrency or failover claims are made.
 
 Repository: https://github.com/Amam8585/OmniTunnel
-
-Development branch: `release/ui-forwarding-hardening-20261012`
-
-License and third-party notices: consult repository source and bundled components.
