@@ -87,3 +87,15 @@ The installer `--uninstall` refuses to run while detected tunnel services are ac
 ## Pairing modes
 
 The interactive **Install / Create Tunnel** menu uses token pairing: it asks for the remote IP but **not** SSH username or password. Paste the generated token on the foreign server using `sudo apadana server-token TOKEN`. The older `add-auto` SSH automation path remains available separately and may still request SSH credentials. No blanket removal of this legacy workflow has been performed.
+
+## 2,000-user / 10 Mbit/s per-user capacity target
+
+**Planning target:** 2,000 × 10 Mbit/s = **20 Gbit/s of user payload in one direction** if all users saturate simultaneously. A tunnel carries additional IP, encapsulation, retransmission and link-layer overhead; budget headroom above 20 Gbit/s in the relevant direction. The target cannot be met by a 10 Gbit/s NIC, and cannot be guaranteed by software configuration alone. CPU packet processing, packet size, upstream routing, policing, NIC queues, IRQ affinity and transport-specific overhead can all become bottlenecks.
+
+**Packet-rate estimates:** at 1,400-byte inner packets, 20 Gbit/s is about 1.79 million packets/s; at 300-byte packets, about 8.33 million packets/s, before overhead. These are capacity calculations, not measured results.
+
+**ICMP caution:** raw ICMP is often rate-limited or deprioritized by intermediate networks. The ICMP userspace core has a bounded flow table and a single TUN interface; neither its throughput nor its stability at this target has been demonstrated. New ICMP instances default to 8,192 flow slots (previously 1,024), with valid operator overrides via `OMNITUN_ICMP_FLOW_SLOTS` (power of two, 1,024–65,536). Existing instances retain their saved `FLOW_SLOTS` value. More slots may reduce flow collisions but do not create more CPU capacity or guarantee line-rate performance.
+
+**Hybrid GRE + ICMP:** not available as a production dataplane. A correct implementation needs one stable logical interface, independent carrier health probes, bounded hysteresis, sequence/replay handling, route safety and two-host failover testing. Do not interpret the existing independent GRE and ICMP modes as a working Hybrid IG.
+
+**Acceptance gates:** three independently repeated two-host load tests, each measuring concurrent active users, both directions, small-packet PPS, CPU, RSS, queue drops, jitter, P95/P99 latency, reconnect behavior and 30-minute sustained load. Failover tests must show no route loops and bounded recovery. No such tests have been run as part of this change.
