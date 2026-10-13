@@ -1,0 +1,27 @@
+name: ICMP core regression
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  compile-and-check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bash syntax
+        run: |
+          bash -n install.sh omnitunnel.sh icmptun-ctl.sh
+          for f in scripts/*.sh tests/*.sh; do bash -n "$f"; done
+      - name: Build all direct cores with warnings as errors
+        run: |
+          gcc -O2 -Wall -Wextra -Werror -fstack-protector-strong -D_FORTIFY_SOURCE=2 \
+            -o /tmp/apadana-core \
+            src/main.c src/obsctun.c src/obsctcp.c src/obscmux.c \
+            src/obscws.c src/icmptun.c src/monocypher.c -pthread
+          /tmp/apadana-core version | grep -q '^omnitun '
+      - name: ICMP source regressions
+        run: |
+          bash tests/direct_preservation_test.sh
