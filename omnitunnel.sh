@@ -1556,8 +1556,8 @@ cmd_add_manual() {
     echo "${C_GREEN}${C_BOLD}Near (Iran) side '$kn' is up.${C_RESET}"
     echo "${C_BOLD}Now run these TWO lines on the FOREIGN server ($fhost):${C_RESET}"
     echo
-    echo "  ${C_CYAN}bash <(curl -fsSL $RAW_BASE/install.sh)${C_RESET}"
-    echo "  ${C_CYAN}omnitunnel server-token $token${C_RESET}"
+    echo "  ${C_CYAN}curl -fsSLo /tmp/apadana-install.sh $RAW_BASE/install.sh && sudo bash /tmp/apadana-install.sh --prepare && sudo bash /tmp/apadana-install.sh --check && sudo bash /tmp/apadana-install.sh --apply${C_RESET}"
+    echo "  ${C_CYAN}apadana server-token $token${C_RESET}"
     echo
     echo "${C_DIM}No SSH is used between the servers, and nothing changes any server's"
     echo "own SSH login or port 22. The tunnel uses its own port ($port).${C_RESET}"
@@ -2039,7 +2039,7 @@ cmd_update() {
 cmd_uninstall() {
     need_root
     echo
-    warn "This completely removes OmniTunnel and everything it created:"
+    warn "This removes APADANA-managed instances and their associated assets:"
     echo "  - every tunnel/instance (including any 'bench-*'), its systemd unit,"
     echo "    port-forward relays, tun device and iptables chain"
     echo "  - the core binaries: $TSUITE_BIN and $HYSTERIA_BIN"
@@ -2073,7 +2073,7 @@ cmd_uninstall() {
     # 5) state, the command symlink, then the install dir (this script lives there)
     rm -rf "$ROOT_DIR"
     rm -f "$BINLINK"
-    ok "OmniTunnel removed. Deleting its own files now - goodbye."
+    ok "APADANA manager cleanup completed. Verify any external components separately."
     rm -rf "$ASSET_DIR"
     exit 0
 }
@@ -2330,8 +2330,8 @@ menu_main() {
         nitem 2 "Manage Tunnels" "$C_BLUE$C_BOLD"
         nitem 3 "Port Forwarding"
         nitem 4 "Network Optimization"
-        nitem 5 "Update OmniTunnel"
-        nitem 6 "Completely Uninstall OmniTunnel" "$C_BRED$C_BOLD"
+        nitem 5 "Update APADANA"
+        nitem 6 "Completely Uninstall APADANA" "$C_BRED$C_BOLD"
         nitem 7 "Exit"
         rule_green
         printf '  %bEnter your choice [1-7]:%b ' "$C_BGRN" "$C_RESET"
@@ -2341,7 +2341,26 @@ menu_main() {
             1) wizard_add_manual; pause;;
             2) menu_instances;;
             3) menu_pf;;
-            4) if pick_instance; then bash "$ASSET_DIR/scripts/optimizer.sh" recommend "$PICK" balanced; fi; pause;;
+            4)
+                if pick_instance; then
+                    echo "  APADANA optimizer (read-only by default)"
+                    echo "  1) Balanced  2) Low latency  3) High throughput"
+                    echo "  4) Extreme connections (observe)  5) High PPS (observe)"
+                    echo "  6) Auto adaptive (observe)"
+                    local profile_choice profile
+                    read -erp "  Profile [1]: " profile_choice
+                    case "${profile_choice:-1}" in
+                        1) profile=balanced;; 2) profile=low-latency;;
+                        3) profile=high-throughput;; 4) profile=extreme-connections;;
+                        5) profile=high-pps;; 6) profile=auto-adaptive;;
+                        *) warn "Invalid optimizer profile"; pause; continue;;
+                    esac
+                    bash "$ASSET_DIR/scripts/optimizer.sh" recommend "$PICK" "$profile"
+                    echo
+                    info "No network settings changed. To apply an evaluated profile, use:"
+                    echo "  sudo bash $ASSET_DIR/scripts/optimizer.sh apply $PICK $profile --acknowledge"
+                fi
+                pause;;
             5) cmd_update; pause;;
             6) cmd_uninstall; pause;;
             7|0) exit 0;;
