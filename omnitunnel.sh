@@ -341,6 +341,19 @@ create_inst() {
     # let it bypass the public transport allowlist; legacy instances still load.
     require_supported_transport "$t"
     validate_inst_name "$n"
+    # ICMP flow table is bounded by the C core (1024..65536, powers of two).
+    # 8192 is a conservative starting point for multi-user deployments, NOT
+    # a guarantee of 2000 users or 20 Gbit/s. Validate before writing config.
+    local icmp_slots="${OMNITUN_ICMP_FLOW_SLOTS:-8192}"
+    if [[ "$t" == icmp ]]; then
+        [[ "$icmp_slots" =~ ^[0-9]+$ ]] || die "invalid ICMP flow slots: expected power of two"
+        (( 10#$icmp_slots >= 1024 && 10#$icmp_slots <= 65536 )) ||
+            die "ICMP flow slots must be 1024..65536"
+        (( (10#$icmp_slots & (10#$icmp_slots - 1)) == 0 )) ||
+            die "ICMP flow slots must be a power of two"
+    else
+        icmp_slots=1024
+    fi
     local dev="ts-$n"; [[ ${#dev} -gt 15 ]] && dev="ts$(printf '%s' "$n" | cksum | tr -dc '0-9' | cut -c1-8)"
     mkdir -p "$(inst_path "$n")"; : > "$(inst_pf "$n")"
     cat > "$(inst_conf "$n")" <<EOF
@@ -357,7 +370,7 @@ MTU=1400
 NCONN=$nc
 SHAPE=$shape
 ICMP_MODE=$imode
-FLOW_SLOTS=${OMNITUN_ICMP_FLOW_SLOTS:-1024}
+FLOW_SLOTS=$icmp_slots
 PCOUNT=$pcount
 EOF
 }
