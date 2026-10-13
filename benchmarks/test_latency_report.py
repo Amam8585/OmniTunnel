@@ -26,7 +26,7 @@ class LatencyReportTest(unittest.TestCase):
 
     def test_invalid_offered_load_is_rejected(self):
         with self.assertRaises(ValueError):
-            summarize("time=1.0 ms\\ntime=2.0 ms\\n", 1)
+            summarize("time=1.0 ms\ntime=2.0 ms\n", 1)
 
 if __name__ == "__main__":
     unittest.main()
