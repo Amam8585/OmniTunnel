@@ -37,4 +37,8 @@ grep -q 'metrics.queue_full' src/icmptun.c || fail "internal drop metric missing
 if grep -q 'systemctl restart' install.sh; then
     fail "installer must never blindly restart live services"
 fi
+grep -Fq 'APADANA_LINK="$BIN_DIR/apadana"' install.sh || fail "APADANA executable alias missing"
+grep -Fq 'ln -sfn "$PREFIX/omnitunnel.sh" "$APADANA_LINK"' install.sh || fail "APADANA alias not installed"
+grep -Fq 'nitem 5 "Update APADANA"' omnitunnel.sh || fail "old update menu label"
+grep -Fq 'nitem 6 "Completely Uninstall APADANA"' omnitunnel.sh || fail "old uninstall menu label"
 echo "PASS: six active Direct transports registered; legacy preserved; safe installer and Bash syntax"
