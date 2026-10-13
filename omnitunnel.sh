@@ -2341,7 +2341,26 @@ menu_main() {
             1) wizard_add_manual; pause;;
             2) menu_instances;;
             3) menu_pf;;
-            4) if pick_instance; then bash "$ASSET_DIR/scripts/optimizer.sh" recommend "$PICK" balanced; fi; pause;;
+            4)
+                if pick_instance; then
+                    echo "  APADANA optimizer (read-only by default)"
+                    echo "  1) Balanced  2) Low latency  3) High throughput"
+                    echo "  4) Extreme connections (observe)  5) High PPS (observe)"
+                    echo "  6) Auto adaptive (observe)"
+                    local profile_choice profile
+                    read -erp "  Profile [1]: " profile_choice
+                    case "${profile_choice:-1}" in
+                        1) profile=balanced;; 2) profile=low-latency;;
+                        3) profile=high-throughput;; 4) profile=extreme-connections;;
+                        5) profile=high-pps;; 6) profile=auto-adaptive;;
+                        *) warn "Invalid optimizer profile"; pause; continue;;
+                    esac
+                    bash "$ASSET_DIR/scripts/optimizer.sh" recommend "$PICK" "$profile"
+                    echo
+                    info "No network settings changed. To apply an evaluated profile, use:"
+                    echo "  sudo bash $ASSET_DIR/scripts/optimizer.sh apply $PICK $profile --acknowledge"
+                fi
+                pause;;
             5) cmd_update; pause;;
             6) cmd_uninstall; pause;;
             7|0) exit 0;;
