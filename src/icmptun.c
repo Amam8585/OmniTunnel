@@ -1050,6 +1050,15 @@ int tun_main_icmp(int argc, char **argv) {
             if (events[i].data.fd == tun_fd) {
                 if (events[i].events & EPOLLOUT) tun_drain();
                 for (int batch = 0; batch < IO_BATCH && (events[i].events & EPOLLIN) && !tun_read_paused; ++batch) {
+                    /* Never consume an inner packet if the outgoing ring has
+                     * no free slot: once read from TUN it cannot be put back.
+                     * Pause TUN intake and let EPOLLOUT drain the ring first. */
+                    if (sq_count >= QUEUE_SIZE) {
+                        metrics.queue_pauses++;
+                        tun_set_readable(0);
+                        send_set_writable(1);
+                        break;
+                    }
                     if (sq_count >= QUEUE_HIGH_WATER && send_blocked) {
                         metrics.queue_pauses++;
                         tun_set_readable(0);
