@@ -190,6 +190,13 @@ type_desc() {
     esac
 }
 require_supported_transport() {
+    # Hybrid IG has no shared dataplane or safe failover implementation.
+    # Reject it explicitly in manual, automation and token-pairing paths.
+    case "${1,,}" in
+        hybrid|hybrid-ig|hybrid_ig|icmp-gre|gre-icmp|ig)
+            die "Hybrid GRE/ICMP is unavailable; use a supported single transport"
+            ;;
+    esac
     case " $ALL_TYPES " in
         *" $1 "*) return 0;;
         *) die "unsupported or removed transport: $1";;
