@@ -99,3 +99,9 @@ The interactive **Install / Create Tunnel** menu uses token pairing: it asks for
 **Hybrid GRE + ICMP:** not available as a production dataplane. A correct implementation needs one stable logical interface, independent carrier health probes, bounded hysteresis, sequence/replay handling, route safety and two-host failover testing. Do not interpret the existing independent GRE and ICMP modes as a working Hybrid IG.
 
 **Acceptance gates:** three independently repeated two-host load tests, each measuring concurrent active users, both directions, small-packet PPS, CPU, RSS, queue drops, jitter, P95/P99 latency, reconnect behavior and 30-minute sustained load. Failover tests must show no route loops and bounded recovery. No such tests have been run as part of this change.
+
+## Hybrid IG and TUN multiqueue status
+
+**Hybrid IG is disabled.** The manager explicitly rejects `hybrid`, `hybrid-ig`, `hybrid_ig`, `icmp-gre`, `gre-icmp` and `ig` in the supported-transport validator, including creation and pairing paths. No automatic GRE-to-ICMP failover exists; do not configure it manually expecting session preservation.
+
+**Multiqueue TUN is not enabled.** The Linux kernel exposes `IFF_MULTI_QUEUE`, but adding that flag to the existing ICMP event loop without multiple TUN descriptors, flow-consistent worker assignment and synchronization would not increase processing parallelism and could introduce packet reordering. A future implementation must include real workers, per-flow affinity, correct backpressure, teardown and throughput tests. It is unsafe to claim a 2,000-user or 20 Gbit/s gain without measurements.
