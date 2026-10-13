@@ -99,4 +99,16 @@ assert "send_set_writable(sq_count != 0);" in block
 assert "send_set_writable(0);" not in block
 assert "tun_read_paused && sq_count <= QUEUE_HIGH_WATER / 2" in block
 PY
+# Full outgoing ICMP ring must pause TUN reads BEFORE consuming a packet.
+python3 - <<'PY'
+from pathlib import Path
+s = Path("src/icmptun.c").read_text()
+start = s.index("for (int batch = 0; batch < IO_BATCH && (events[i].events & EPOLLIN) && !tun_read_paused;")
+end = s.index("ssize_t n = read(tun_fd, tun_raw, sizeof(tun_raw));", start)
+block = s[start:end]
+assert "if (sq_count >= QUEUE_SIZE)" in block
+assert "tun_set_readable(0);" in block
+assert "send_set_writable(1);" in block
+assert block.index("if (sq_count >= QUEUE_SIZE)") < len(block)
+PY
 echo "PASS: six active Direct transports registered; legacy preserved; safe installer and Bash syntax"
