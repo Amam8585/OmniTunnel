@@ -63,4 +63,15 @@ done
 grep -Fq 'OMNITUN_ICMP_FLOW_SLOTS:-8192' omnitunnel.sh || fail "ICMP default not updated"
 grep -Fq 'ICMP flow slots must be a power of two' omnitunnel.sh || fail "ICMP slot validation missing"
 grep -Fq 'FLOW_SLOTS=$icmp_slots' omnitunnel.sh || fail "ICMP validated slot count not persisted"
+# Fail closed: incomplete Hybrid IG must never be offered or accepted.
+grep -Fq 'hybrid|hybrid-ig|hybrid_ig|icmp-gre|gre-icmp|ig)' omnitunnel.sh ||
+    fail "explicit Hybrid IG rejection guard missing"
+python3 - <<'PY'
+from pathlib import Path
+s = Path("omnitunnel.sh").read_text()
+for name in ("create_inst", "cmd_server_token"):
+    start = s.index(name + "() {")
+    end = s.find("\n}\n", start)
+    assert end != -1 and 'require_supported_transport "$t"' in s[start:end], name
+PY
 echo "PASS: six active Direct transports registered; legacy preserved; safe installer and Bash syntax"
