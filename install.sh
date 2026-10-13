@@ -10,10 +10,11 @@ PREFIX="${OMNITUN_PREFIX:-/opt/omnitunnel}"
 STATE="${OMNITUN_STATE_DIR:-/var/lib/omnitunnel}"
 BIN_DIR="${OMNITUN_BIN_DIR:-/usr/local/bin}"
 LINK="$BIN_DIR/omnitunnel"
+APADANA_LINK="$BIN_DIR/apadana"
 STAGES=$STATE/staged
 BACKUPS=$STATE/backups
 ACTION=install; YES=0; ACTIVE_OK=0; DRY=0; PURGE=0; DOWNGRADE_OK=0
-log() { printf '[omnitunnel] %s\n' "$*"; }
+log() { printf '[apadana] %s\n' "$*"; }
 die() { log "ERROR: $*" >&2; exit 1; }
 usage() { cat <<'EOF'
 Usage: sudo bash install.sh [--prepare|--apply|--update|--check|--backup|--rollback|--uninstall]
@@ -127,6 +128,8 @@ snapshot() {
         if [[ -f "$PREFIX/$n" ]]; then cp -a "$PREFIX/$n" "$dir/$n"
         else printf 'ABSENT:%s\n' "$n" >> "$dir/.inventory"; fi
     done
+    if [[ -L "$APADANA_LINK" ]]; then cp -a --no-dereference "$APADANA_LINK" "$dir/apadana-link"
+    else printf 'ABSENT:apadana-link\n' >> "$dir/.inventory"; fi
     if [[ -L "$LINK" ]]; then cp -a --no-dereference "$LINK" "$dir/link"
     else printf 'ABSENT:link\n' >> "$dir/.inventory"; fi
     printf '%s\n' "$dir" > "$BACKUPS/.latest.new"
@@ -155,6 +158,8 @@ rollback_snapshot() {
         if [[ -f "$dir/$n" ]]; then cp -a "$dir/$n" "$PREFIX/$n"
         elif grep -qx "ABSENT:$n" "$dir/.inventory"; then rm -f "$PREFIX/$n"; fi
     done
+    if [[ -L "$dir/apadana-link" ]]; then ln -sfn "$(readlink "$dir/apadana-link")" "$APADANA_LINK"
+    elif grep -qx 'ABSENT:apadana-link' "$dir/.inventory"; then rm -f "$APADANA_LINK"; fi
     if [[ -L "$dir/link" ]]; then ln -sfn "$(readlink "$dir/link")" "$LINK"
     elif grep -qx 'ABSENT:link' "$dir/.inventory"; then rm -f "$LINK"; fi
     log "Snapshot restored: $dir; no running services restarted."
@@ -338,6 +343,7 @@ apply() {
     [[ -z "$active" || $ACTIVE_OK -eq 1 ]] ||
         die "active tunnels detected: $active. --allow-active required; NO restarts performed"
     [[ ! -e "$LINK" || -L "$LINK" ]] || die "refusing to overwrite unowned $LINK"
+    [[ ! -e "$APADANA_LINK" || -L "$APADANA_LINK" ]] || die "refusing to overwrite unowned $APADANA_LINK"
     ((DRY==0)) || { log "dry-run: stage checks passed; no writes"; return 0; }
     mkdir -p "$PREFIX" "$BIN_DIR"
     snapshot
@@ -367,6 +373,7 @@ apply() {
         cp -a "$stage/build-info.json" "$PREFIX/build-info.json.new.${BASHPID}" || exit 1
         mv -f "$PREFIX/build-info.json.new.${BASHPID}" "$PREFIX/build-info.json" || exit 1
         ln -sfn "$PREFIX/omnitunnel.sh" "$LINK" || exit 1
+        ln -sfn "$PREFIX/omnitunnel.sh" "$APADANA_LINK" || exit 1
         if [[ "$PREFIX" != /opt/omnitunnel && "${OMNITUN_TEST_FAIL_AFTER:-}" == partial-write ]]; then
             printf 'partial simulated FS write\n' >> "$PREFIX/omnitunnel.sh"
             exit 79
@@ -432,12 +439,14 @@ case "$ACTION" in
         snapshot
         [[ -L "$LINK" && "$(readlink "$LINK")" == "$PREFIX/omnitunnel.sh" ]] &&
             rm -f "$LINK"
+        [[ -L "$APADANA_LINK" && "$(readlink "$APADANA_LINK")" == "$PREFIX/omnitunnel.sh" ]] &&
+            rm -f "$APADANA_LINK"
         rm -rf "$PREFIX/scripts" "$PREFIX/docs" "$PREFIX/bin"
         rm -f "$PREFIX/build-info.json" "$PREFIX/README.md" "$PREFIX/CHANGELOG.md" "$PREFIX/LICENSE"
         rm -f "$PREFIX/omnitunnel.sh" "$BIN_DIR/omnitun" \
             "$BIN_DIR/hysteria" "$BIN_DIR/omnistripe" "$BIN_DIR/omniackless"
         ((PURGE==0)) || rm -rf /etc/omnitunnel
-        log "Program files removed; unrelated network rules/services untouched";;
+        log "APADANA program files removed; instance configs and services preserved unless explicitly purged";;
     prepare)
         ((DRY)) && { log "dry run: would fetch/build/stage"; exit 0; }
         deps; prepare;;
