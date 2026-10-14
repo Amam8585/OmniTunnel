@@ -13,9 +13,13 @@ import re
 import subprocess
 import sys
 
-RX = re.compile(r"\btime[=<]\s*(\d+(?:\.\d+)?)\s*ms\b", re.IGNORECASE)
+# `time<1 ms` is an upper bound, not an exact RTT observation.
+RX = re.compile(r"\btime=\s*(\d+(?:\.\d+)?)\s*ms\b", re.IGNORECASE)
+CENSORED_RX = re.compile(r"\btime<\s*\d+(?:\.\d+)?\s*ms\b", re.IGNORECASE)
 
 def quantile(values, proportion):
+    if not math.isfinite(proportion) or not 0 <= proportion <= 1:
+        raise ValueError("quantile must be between 0 and 1")
     sorted_values = sorted(values)
     if not sorted_values:
         return None
@@ -27,6 +31,8 @@ def quantile(values, proportion):
 def summarize(text, sent):
     if not (1 <= sent <= 100000):
         raise ValueError("invalid requested packet count")
+    if CENSORED_RX.search(text):
+        raise ValueError("censored RTT values (time<...) cannot be used as exact measurements")
     samples = [float(x) for x in RX.findall(text)]
     if any(not math.isfinite(n) or n < 0 for n in samples):
         raise ValueError("invalid RTT sample")
