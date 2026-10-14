@@ -69,7 +69,10 @@ status() {
     ip -s link show dev "$dev"
     echo "Interface details and MTU:"
     ip -d link show dev "$dev" || true
-    if command -v tc >/dev/null; then tc qdisc show dev "$dev"; fi
+    # tc is diagnostic only; an absent/disappearing qdisc must not abort status.
+    if command -v tc >/dev/null; then
+        tc qdisc show dev "$dev" || echo "qdisc details unavailable (no changes made)"
+    fi
     if [[ -r /proc/sys/net/netfilter/nf_conntrack_max ]]; then
         echo "Conntrack: $(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo n/a)/$(cat /proc/sys/net/netfilter/nf_conntrack_max)"
     else

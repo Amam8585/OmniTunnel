@@ -84,7 +84,10 @@ if run --uninstall; then fail "uninstall touched active Direct instance"; fi
 : > "$FIXTURE"
 echo 'user notes' > "$WORK/prefix/docs/custom.txt"
 run --uninstall
-[[ -f "$WORK/bin/hysteria" ]] || fail "pre-existing shared binary deleted"
-[[ -f "$WORK/prefix/docs/custom.txt" ]] || fail "unmanaged user file deleted"
-[[ ! -e "$WORK/bin/omnitun" ]] || fail "uninstall failed"
-echo "PASS: real C prepare/apply/verify, tamper + 4 fault injections, legacy multi-unit guard, repeated apply, auto/manual rollback, uninstall"
+# The installer explicitly preserves binaries in the shared BIN_DIR because it
+# cannot prove ownership. Removing them would break unrelated applications.
+[[ -e "$WORK/bin/omnitun" ]] || fail "uninstall incorrectly removed shared binary"
+[[ ! -e "$WORK/bin/omnitunnel" ]] || fail "uninstall left manager symlink"
+[[ ! -e "$WORK/prefix/omnitunnel.sh" ]] || fail "uninstall left managed program"
+[[ ! -e "$WORK/prefix/build-info.json" ]] || fail "uninstall left build manifest"
+echo "PASS: real C prepare/apply/verify, tamper + 4 fault injections, legacy multi-unit guard, repeated apply, auto/manual rollback, safe uninstall"

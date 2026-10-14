@@ -14,13 +14,13 @@ import re
 import subprocess
 import sys
 
-RX = re.compile(r"\btime[=<]\s*(\d+(?:\.\d+)?)\s*ms\b", re.IGNORECASE)
+# `time<1 ms` is an upper bound, not an exact RTT observation.
+RX = re.compile(r"\btime=\s*(\d+(?:\.\d+)?)\s*ms\b", re.IGNORECASE)
+CENSORED_RX = re.compile(r"\btime<\s*\d+(?:\.\d+)?\s*ms\b", re.IGNORECASE)
 
 def quantile(values, proportion):
     if not math.isfinite(proportion) or not 0 <= proportion <= 1:
-        raise ValueError("quantile proportion must be finite and within [0, 1]")
-    if any(not math.isfinite(v) or v < 0 for v in values):
-        raise ValueError("invalid quantile sample")
+        raise ValueError("quantile must be between 0 and 1")
     sorted_values = sorted(values)
     if not sorted_values:
         return None
@@ -32,28 +32,9 @@ def quantile(values, proportion):
 def summarize(text, sent):
     if not (1 <= sent <= 100000):
         raise ValueError("invalid requested packet count")
-    # DUP replies are not extra delivered probes. Sequence IDs also deduplicate
-    # captures without iputils' DUP marker; retain receive order for jitter.
-    samples = []
-    seen = set()
-    for line in text.splitlines():
-        if "DUP!" in line:
-            continue
-        if re.search(r"\btime<", line, re.IGNORECASE):
-            raise ValueError("censored RTT (time<) is not an exact sample; use ping -3")
-        found = RX.search(line)
-        if not found:
-            continue
-        sequence = re.search(r"\bicmp_seq=(\d+)\b", line)
-        if sequence:
-            ident = int(sequence.group(1))
-            if ident in seen:
-                continue
-            seen.add(ident)
-        samples.append(float(found.group(1)))
-    count = re.search(r"(\d+) packets transmitted", text)
-    if count and int(count.group(1)) != sent:
-        raise ValueError("transmitted count differs from --sent")
+    if CENSORED_RX.search(text):
+        raise ValueError("censored RTT values (time<...) cannot be used as exact measurements")
+    samples = [float(x) for x in RX.findall(text)]
     if any(not math.isfinite(n) or n < 0 for n in samples):
         raise ValueError("invalid RTT sample")
     if len(samples) > sent:

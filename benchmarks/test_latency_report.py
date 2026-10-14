@@ -19,6 +19,15 @@ class LatencyReportTest(unittest.TestCase):
         self.assertEqual(result["rtt_p99_ms"], 29.8)
         self.assertIsNone(result["application_goodput_mbps"])
 
+    def test_censored_rtt_is_not_treated_as_exact(self):
+        with self.assertRaisesRegex(ValueError, "censored RTT"):
+            summarize("64 bytes from host: icmp_seq=1 time<1 ms\n", 1)
+
+    def test_quantile_rejects_invalid_probability(self):
+        for proportion in (-0.01, 1.01, float("nan")):
+            with self.assertRaises(ValueError):
+                quantile([1.0, 2.0], proportion)
+
     def test_no_data_is_explicitly_null(self):
         result = summarize("", 10)
         self.assertEqual(result["loss_percent"], 100)
