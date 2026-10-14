@@ -17,7 +17,7 @@ jobs:
           for f in scripts/*.sh tests/*.sh; do bash -n "$f"; done
       - name: Build all direct cores with warnings as errors
         run: |
-          gcc -O2 -Wall -Wextra -fstack-protector-strong -D_FORTIFY_SOURCE=2 \
+          gcc -O2 -Wall -Wextra -Werror -fstack-protector-strong -D_FORTIFY_SOURCE=2 \
             -o /tmp/apadana-core \
             src/main.c src/obsctun.c src/obsctcp.c src/obscmux.c \
             src/obscws.c src/icmptun.c src/monocypher.c -pthread

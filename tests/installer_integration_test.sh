@@ -22,6 +22,9 @@ run() {
         "OMNITUN_TEST_FAIL_AFTER=${OMNITUN_TEST_FAIL_AFTER:-}" bash "$ROOT/install.sh")
     if (( EUID != 0 )); then sudo "${cmd[@]}" "$@"; else "${cmd[@]}" "$@"; fi
 }
+# A pre-existing shared executable must never become uninstall-owned.
+printf '#!/bin/sh\nexit 0\n' > "$WORK/bin/hysteria"
+chmod +x "$WORK/bin/hysteria"
 run --prepare
 [[ -e "$WORK/state/staged/current" ]] || fail "prepare pointer missing"
 stage="$(cat "$WORK/state/staged/current")"
@@ -32,6 +35,17 @@ echo '# deliberately corrupted' >> "$stage/omnitunnel.sh"
 if run --apply; then fail "corrupt stage accepted"; fi
 [[ ! -e "$WORK/bin/omnitun" ]] || fail "bad stage modified installed binary"
 cp "$WORK/orig" "$stage/omnitunnel.sh"
+cp "$stage/build-info.json" "$WORK/manifest"
+python3 - "$stage/build-info.json" <<'PY_BAD'
+import json,sys
+p=sys.argv[1];v=json.load(open(p));del v['artifacts']['omnitunnel.sh']
+with open(p,'w') as f: json.dump(v,f)
+PY_BAD
+if run --apply; then fail "incomplete artifact inventory accepted"; fi
+cp "$WORK/manifest" "$stage/build-info.json"
+ln -s /some/other/application "$WORK/bin/apadana"
+if run --apply; then fail "foreign command symlink overwritten"; fi
+rm "$WORK/bin/apadana"
 printf 'omni-icmp79.service loaded active running legacy\nic79-direct.service loaded active running legacy\nwrapper.service loaded active running custom\n' > "$FIXTURE"
 if run --apply; then fail "active legacy and custom service not detected"; fi
 : > "$FIXTURE"
@@ -68,6 +82,7 @@ run --rollback
 printf 'ic80-direct.service loaded active running legacy\n' > "$FIXTURE"
 if run --uninstall; then fail "uninstall touched active Direct instance"; fi
 : > "$FIXTURE"
+echo 'user notes' > "$WORK/prefix/docs/custom.txt"
 run --uninstall
 # The installer explicitly preserves binaries in the shared BIN_DIR because it
 # cannot prove ownership. Removing them would break unrelated applications.

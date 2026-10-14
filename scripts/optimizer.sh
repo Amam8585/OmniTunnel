@@ -9,6 +9,12 @@ ACTION="${1:-status}"; INSTANCE="${2:-}"; PROFILE="${3:-balanced}"; ACK="${4:-}"
 CONFIG_ROOT="${OMNITUN_CONFIG_ROOT:-/etc/omnitunnel}"
 STATE_ROOT="${OMNITUN_OPTIMIZER_STATE_DIR:-/var/lib/omnitunnel/optimizer}"
 [[ "$CONFIG_ROOT" = /* && "$STATE_ROOT" = /* ]] || { echo "config/state must be absolute paths" >&2; exit 2; }
+if [[ "$ACTION" == apply || "$ACTION" == rollback ]]; then
+    [[ $EUID -eq 0 ]] || { echo "root required for mutation" >&2; exit 1; }
+    install -d -m 0700 "$STATE_ROOT"
+    exec {optimizer_lock}>"$STATE_ROOT/$INSTANCE.lock"
+    flock -w 30 "$optimizer_lock" || { echo "optimizer busy" >&2; exit 1; }
+fi
 conf="$CONFIG_ROOT/inst/$INSTANCE/instance.conf"
 [[ -r "$conf" ]] || { echo "missing instance: $INSTANCE" >&2; exit 1; }
 type="$(sed -n 's/^TYPE=//p' "$conf" | head -1)"

@@ -51,7 +51,7 @@ def resource_snapshot():
                                                 os.sysconf("SC_CLK_TCK") / elapsed, 1)
         last_proc = (pid, ticks, now, start_ticks)
         return res
-    except (OSError, ValueError, IndexError, StopIteration):
+    except (OSError, ValueError, IndexError, StopIteration, subprocess.TimeoutExpired):
         return {}
 last_proc = None
 

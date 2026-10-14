@@ -9,6 +9,7 @@ Network mode MUST be used on authorized lab peers only.
 import argparse
 import json
 import math
+import os
 import re
 import subprocess
 import sys
@@ -47,6 +48,7 @@ def summarize(text, sent):
         "inter_sample_jitter_ms":round(sum(abs(samples[i]-samples[i-1]) for i in range(1,len(samples)))/(len(samples)-1),3)
                                     if len(samples)>1 else None,
         "application_goodput_mbps":None,
+        "throughput_mbps":None,
         "limitations":["ICMP RTT is not application latency",
                        "network performance improvements require matched offered load and repeated A/B trials"]
     }
@@ -63,12 +65,14 @@ def main():
     if args.target:
         if not args.allow_network:
             parser.error("active probing requires --allow-network and lab authorization")
-        if args.sent<10 or args.sent>1000 or args.interval<0.1 or args.interval>10:
+        if args.sent<10 or args.sent>1000 or not math.isfinite(args.interval) or args.interval<0.1 or args.interval>10:
             parser.error("probe rate/count outside safe laboratory bounds")
         proc=subprocess.run(["ping","-n","-c",str(args.sent),
-                             "-i",str(args.interval),"-W","2",args.target],
-                            capture_output=True,text=True,
+                             "-i",str(args.interval),"-W","2","--",args.target],
+                            capture_output=True,text=True,env={**os.environ,"LC_ALL":"C"},
                             timeout=args.sent*(args.interval+2)+10)
+        if proc.returncode not in (0,1):
+            raise ValueError("ping failed: " + proc.stderr.strip())
         content=proc.stdout
     else:
         with open(args.file,encoding="utf-8") as handle:

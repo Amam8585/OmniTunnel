@@ -66,14 +66,17 @@ static void test_frames(void) {
     close(fds[0]); close(fds[1]);
     assert(socketpair(AF_UNIX,SOCK_STREAM,0,fds)==0);
 
-    /* Reordered/fragmented binary frames are refused rather than dispatched
-       as complete tunnel packets. */
-    n=ws_frame(frame,input,20,1);
-    frame[0]=0x02;
+    /* Binary fragmentation is bounded and only delivered once complete. */
+    n=ws_frame(frame,input,20,1); frame[0]=0x02;
+    assert(write(fds[0],frame,n)==n);
+    assert(ws_read_frame(fds[1],&c,out,sizeof(out))==0);
+    n=ws_frame(frame,input+20,20,1); frame[0]=0x80;
+    assert(write(fds[0],frame,n)==n);
+    assert(ws_read_frame(fds[1],&c,out,sizeof(out))==40);
+    assert(!memcmp(input,out,40));
+    /* Continuation with no active message poisons the connection. */
     assert(write(fds[0],frame,n)==n);
     assert(ws_read_frame(fds[1],&c,out,sizeof(out))<0);
-    /* A rejected frame can leave unread payload bytes on a poisoned stream.
-     * Real transport closes it; use a new connection for the next case. */
     close(fds[0]); close(fds[1]);
     assert(socketpair(AF_UNIX,SOCK_STREAM,0,fds)==0);
 
@@ -162,6 +165,16 @@ int main(void) {
     assert(ws_accept("dGhlIHNhbXBsZSBub25j=Q==",accept)!=0); /* embedded padding */
     assert(ws_has_token("HTTP/1.1 101 Switching Protocols\r\nConnection: keep-alive, UpGrAdE\r\n\r\n","Connection","Upgrade"));
     assert(!ws_has_token("HTTP/1.1 101 Switching Protocols\r\nConnection: NotUpgrade\r\n\r\n","Connection","Upgrade"));
+    assert(ws_accept("========================",accept)!=0);
+    assert(ws_accept("dGhlIHNhbXBsZSBub25jZR==",accept)!=0);
+    /* Every failed upgrade releases the server's reserved connection slot. */
+    int fd[2];
+    assert(socketpair(AF_UNIX,SOCK_STREAM,0,fd)==0);
+    is_server=1; conns[0].fd=-2;
+    assert(write(fd[0],"BAD\r\n\r\n",7)==7);
+    run_link(0,fd[1]);
+    assert(conns[0].fd==-1);
+    close(fd[0]);
     test_upgrade();
     test_frames();
     test_bad_frames();

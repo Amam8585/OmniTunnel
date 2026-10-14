@@ -15,7 +15,8 @@ extract() {
     }' "$SCRIPT"
 }
 
-eval "$(extract "auto_name alloc_and_create next_subnet_idx next_port alloc_port_span occupied_port_ranges remote_port_ranges type_port_span list_instances inst_conf inst_path inst_pf inst_exists validate_inst_name create_inst gen_key type_uses_key port_base")"
+ALL_TYPES="gre icmp udp hysteria tcp fou"
+eval "$(extract "require_supported_transport auto_name alloc_and_create next_subnet_idx next_port alloc_port_span occupied_port_ranges remote_port_ranges type_port_span list_instances inst_conf inst_path inst_pf inst_exists validate_inst_name create_inst gen_key type_uses_key port_base")"
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
 die() { echo "DIE: $*" >&2; exit 1; }
@@ -27,8 +28,8 @@ dup_addrs() { grep -h '^TUN_ADDR=' "$INST_DIR"/*/instance.conf 2>/dev/null | sor
 dup_ports() { grep -h '^PORT=' "$INST_DIR"/*/instance.conf 2>/dev/null | sort | uniq -d; }
 
 N=8
-BASE=ackless
-T=ackless
+BASE=tcp
+T=tcp
 
 unlocked_auto_create() {
     local base="$1" t="$2" n sub port key

@@ -338,7 +338,21 @@ load_inst() {
     local n="$1"; inst_exists "$n" || die "no such instance: $n"
     TYPE=""; ROLE=""; LOCAL_IP=""; PEER_IP=""; TUN_ADDR=""; PEER_ADDR=""; PORT=""; KEY=""; DEV=""; MTU="1400"; NCONN="16"; SHAPE="none"; ICMP_MODE=""; PCOUNT="400"; FLOW_SLOTS="1024"
     # shellcheck disable=SC1090
-    source "$(inst_conf "$n")"; INAME="$n"
+    # Config is data, never shell code (including legacy plain KEY=value files).
+    local line field value
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        [[ "$line" == *=* ]] || die "malformed instance configuration"
+        field="${line%%=*}"; value="${line#*=}"
+        [[ "$value" =~ ^[A-Za-z0-9_.:/-]*$ ]] || die "unsafe value for $field"
+        case "$field" in
+            TYPE|ROLE|LOCAL_IP|PEER_IP|TUN_ADDR|PEER_ADDR|PORT|KEY|DEV|MTU|NCONN|SHAPE|ICMP_MODE|PCOUNT|FLOW_SLOTS)
+                printf -v "$field" '%s' "$value";;
+            *) die "unknown instance field: $field";;
+        esac
+    done < "$(inst_conf "$n")"
+    [[ "$DEV" =~ ^[A-Za-z0-9_-]{1,15}$ ]] || die "invalid instance device"
+    INAME="$n"
 }
 
 # create NAME TYPE ROLE LOCAL PEER PORT KEY TUN_ADDR PEER_ADDR [SHAPE] [NCONN]
@@ -348,6 +362,13 @@ create_inst() {
     # let it bypass the public transport allowlist; legacy instances still load.
     require_supported_transport "$t"
     validate_inst_name "$n"
+    local value
+    for value in "$role" "$lip" "$pip" "$port" "$key" "$ta" "$pa" "$shape" "$nc" "$imode" "$pcount"; do
+        [[ "$value" =~ ^[A-Za-z0-9_.:/-]*$ ]] || die "unsafe instance parameter"
+    done
+    [[ "$role" == server || "$role" == client ]] || die "invalid role"
+    [[ "$nc" =~ ^[0-9]{1,2}$ ]] && ((10#$nc>=1 && 10#$nc<=32)) || die "invalid connection count"
+    [[ "$port" =~ ^[0-9]{1,5}$ ]] && ((10#$port>=1 && 10#$port<=65535)) || die "invalid port"
     # ICMP flow table is bounded by the C core (1024..65536, powers of two).
     # 8192 is a conservative starting point for multi-user deployments, NOT
     # a guarantee of 2000 users or 20 Gbit/s. Validate before writing config.
@@ -362,7 +383,7 @@ create_inst() {
         icmp_slots=1024
     fi
     local dev="ts-$n"; [[ ${#dev} -gt 15 ]] && dev="ts$(printf '%s' "$n" | cksum | tr -dc '0-9' | cut -c1-8)"
-    mkdir -p "$(inst_path "$n")"; : > "$(inst_pf "$n")"
+    install -d -m 0700 "$(inst_path "$n")"; : > "$(inst_pf "$n")"
     cat > "$(inst_conf "$n")" <<EOF
 TYPE=$t
 ROLE=$role
@@ -380,6 +401,7 @@ ICMP_MODE=$imode
 FLOW_SLOTS=$icmp_slots
 PCOUNT=$pcount
 EOF
+    chmod 600 "$(inst_conf "$n")"
 }
 
 # ------------------------------------------------- kernel carrier commands ----
@@ -1371,8 +1393,9 @@ _peer_creds() {
 # password or an ssh key, not TOFU. An optional saved SOCKS5 proxy routes the
 # provisioning SSH/SCP around an ISP that blocks the foreign box's port 22 -
 # this only affects the outbound connection we make, never any server's sshd.
-SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=15 -o ServerAliveInterval=10 -o ServerAliveCountMax=3)
+SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -o ConnectTimeout=15 -o ServerAliveInterval=10 -o ServerAliveCountMax=3)
 _proxy_opts() { PROXY_OPTS=(); [[ -n "${PEER_PROXY:-}" ]] || return 0
+    [[ "$PEER_PROXY" =~ ^[A-Za-z0-9.-]+:[0-9]{1,5}$ ]] || die "invalid proxy host:port"
     # Route ONLY the control SSH/SCP to the foreign through a SOCKS5 proxy (for
     # DPI-blocked Iran<->foreign paths). The tunnel data never touches the proxy.
     # OpenBSD nc uses '-X 5 -x host:port'; nmap's ncat uses '--proxy-type socks5'.
@@ -2088,13 +2111,17 @@ cmd_uninstall() {
         iptables -t nat -X "$ch" 2>/dev/null || true
     done
     # 4) core binaries + relay helper
-    rm -f "$TSUITE_BIN" "$HYSTERIA_BIN" "$HY_RELAY" "$FWD_SYSCTL_FILE"
-    rm -rf /etc/systemd/system/omnitun-*.service.d
+    # Shared executables may belong to other applications. The transactional
+    # installer can remove only binaries with proven ownership and digest.
+    warn "Shared core executables preserved; use installer --uninstall for verified binary cleanup."
+    rm -f "$HY_RELAY" "$FWD_SYSCTL_FILE"
+    # Keep administrator-owned service drop-ins.
     # 5) state, the command symlink, then the install dir (this script lives there)
     rm -rf "$ROOT_DIR"
     rm -f "$BINLINK"
     ok "APADANA manager cleanup completed. Verify any external components separately."
-    rm -rf "$ASSET_DIR"
+    # Do not recursively delete an asset directory that may contain user files.
+    info "Assets preserved at $ASSET_DIR; installer --uninstall handles program inventory."
     exit 0
 }
 

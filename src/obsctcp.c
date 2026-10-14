@@ -49,7 +49,7 @@ static char *tun_name = "obsct0";
 static int mtu = 1400;
 static int is_server = 0, port = 443;
 static struct in_addr local_ip, peer_ip;
-static volatile sig_atomic_t running = 1;
+static _Atomic int running = 1;
 static _Atomic uint64_t tcp_tun_errors, tcp_socket_errors, tcp_disconnected_drops;
 
 static void die(const char *m) { perror(m); exit(1); }
@@ -110,16 +110,6 @@ static int tun_configure(const char *dev, struct in_addr lt, struct in_addr pt) 
     close(s); return 0;
 }
 
-/* read exactly n bytes from a stream fd */
-static int readn(int fd, unsigned char *buf, size_t n) {
-    size_t got = 0;
-    while (got < n) {
-        ssize_t r = read(fd, buf + got, n - got);
-        if (r <= 0) { if (r < 0 && errno == EINTR) continue; return -1; }
-        got += r;
-    }
-    return 0;
-}
 static int writen(int fd, const unsigned char *buf, size_t n) {
     size_t put = 0;
     while (put < n) {
@@ -140,6 +130,11 @@ static void *uplink(void *arg) {
     unsigned char in[MAX_INNER];
     unsigned char sbuf[UP_BATCH * (2 + MAX_FRAME)];
     while (running) {
+        struct pollfd ready={.fd=tun_fd,.events=POLLIN};
+        int pr=poll(&ready,1,250);
+        if (pr<0 && errno==EINTR) continue;
+        if (pr<0 || (ready.revents & (POLLERR|POLLHUP|POLLNVAL))) { running=0; break; }
+        if (pr==0) continue;
         size_t used = 0; int cnt = 0;
         for (;;) {
             ssize_t n = read(tun_fd, in, sizeof(in));
@@ -159,12 +154,15 @@ static void *uplink(void *arg) {
             if (poll(&pfd, 1, 0) <= 0) break;     /* nothing more queued - flush */
         }
         if (used == 0) { usleep(500); continue; }
-        int fd = conn_fd;
-        if (fd < 0) { atomic_fetch_add(&tcp_disconnected_drops, cnt); continue; } /* not connected */
         pthread_mutex_lock(&wlock);
-        int ok = (writen(fd, sbuf, used) == 0);
+        int fd = conn_fd;
+        if (fd < 0) {
+            atomic_fetch_add(&tcp_disconnected_drops, cnt);
+        } else if (writen(fd, sbuf, used) != 0) {
+            atomic_fetch_add(&tcp_socket_errors, 1);
+            shutdown(fd, SHUT_RDWR);
+        }
         pthread_mutex_unlock(&wlock);
-        if (!ok) { atomic_fetch_add(&tcp_socket_errors, 1); if (conn_fd == fd) { shutdown(fd, SHUT_RDWR); } }
     }
     return NULL;
 }
@@ -208,6 +206,16 @@ static void downlink_once(int fd) {
     free(buf);
 }
 
+/* Unpublish first, wake a blocked writer, then close under its lock. This
+ * prevents a queued write from reaching an unrelated reused descriptor. */
+static void retire_connection(int fd) {
+    conn_fd=-1;
+    shutdown(fd,SHUT_RDWR);
+    pthread_mutex_lock(&wlock);
+    close(fd);
+    pthread_mutex_unlock(&wlock);
+}
+
 static void set_sockopts(int fd) {
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
@@ -221,7 +229,7 @@ static void set_sockopts(int fd) {
 static void sigh(int s){ (void)s; running = 0; if (conn_fd >= 0) shutdown(conn_fd, SHUT_RDWR); }
 
 static int parse_hexkey(const char *hex) {
-    if (strlen(hex) != KEY_LEN * 2) return -1;
+    if (strlen(hex) != KEY_LEN * 2 || strspn(hex, "0123456789abcdefABCDEF") != KEY_LEN * 2) return -1;
     for (int i = 0; i < KEY_LEN; i++){ unsigned b; if (sscanf(hex+i*2,"%2x",&b)!=1) return -1; key[i]=(unsigned char)b; }
     return 0;
 }
@@ -250,6 +258,7 @@ int tun_main_tcp(int argc, char **argv){
         }
     }
     if(!gL||!gR||!gA||!gP||!gk) usage(argv[0]);
+    if(port<1 || port>65535 || mtu<576 || mtu>MAX_INNER || !tun_name[0] || strlen(tun_name)>=IFNAMSIZ) return 1;
     if(parse_hexkey(keyhex)<0){fprintf(stderr,"key must be 64 hex chars\n");return 1;}
 
     tun_fd = tun_alloc(tun_name, mtu);
@@ -274,6 +283,11 @@ int tun_main_tcp(int argc, char **argv){
         if (bind(ls,(struct sockaddr*)&a,sizeof(a))<0) die("bind");
         if (listen(ls, 4) < 0) die("listen");
         while (running) {
+            struct pollfd incoming={.fd=ls,.events=POLLIN};
+            int pr=poll(&incoming,1,250);
+            if (pr<0 && errno==EINTR) continue;
+            if (pr<0 || (incoming.revents & (POLLERR|POLLHUP|POLLNVAL))) break;
+            if (pr==0) continue;
             struct sockaddr_in ca; socklen_t cl=sizeof(ca);
             int fd = accept(ls, (struct sockaddr*)&ca, &cl);
             if (fd < 0) { if (errno==EINTR) continue; usleep(100000); continue; }
@@ -281,8 +295,9 @@ int tun_main_tcp(int argc, char **argv){
             set_sockopts(fd);
             conn_fd = fd;
             downlink_once(fd);
-            conn_fd = -1; close(fd);
+            retire_connection(fd);
         }
+        close(ls);
     } else {
         while (running) {
             int fd = socket(AF_INET, SOCK_STREAM, 0); if (fd<0) die("socket");
@@ -295,7 +310,7 @@ int tun_main_tcp(int argc, char **argv){
             set_sockopts(fd);
             conn_fd = fd;
             downlink_once(fd);
-            conn_fd = -1; close(fd);
+            retire_connection(fd);
             if (running) sleep(1);            /* reconnect */
         }
     }

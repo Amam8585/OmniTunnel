@@ -7,7 +7,7 @@ import sys
 root = pathlib.Path(__file__).resolve().parent.parent
 suspicious = re.compile(
     r'\\n[ \t]+(?:echo|ip|tc|sysctl|iptables|nft|if|for|while|local|export|'
-    r'printf|sudo|systemctl|return|exit|mkdir|mv|cp|rm|cat)\b')
+    r'printf|sudo|systemctl|return|exit|mkdir|mv|cp|rm|cat|\[\[)(?:\b|(?=\s))')
 failures = []
 checked = 0
 for path in root.rglob("*.sh"):
