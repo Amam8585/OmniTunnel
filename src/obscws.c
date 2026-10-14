@@ -31,6 +31,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <poll.h>
 #include <signal.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -57,7 +58,7 @@ static char *tun_name = "obscm0";
 static int mtu = 1400;
 static int is_server = 0, port = 443, Nconn = 8;
 static struct in_addr local_ip, peer_ip;
-static volatile int running = 1;
+static _Atomic int running = 1;
 
 /* One slot per parallel link. Each link has its own outbound queue drained by
  * its own writer thread, so a stalled link never blocks the TUN reader or the
@@ -71,6 +72,9 @@ struct conn {
     pthread_mutex_t sendlock; /* serialize data frames and Pong control frames */
     struct pkt *q;                    /* QDEPTH ring */
     int head, tail, count;
+    unsigned char fragment[MAX_FRAME]; /* reader-owned, bounded message assembly */
+    size_t fragment_len;
+    int fragmented;
 };
 static struct conn conns[MAXCONN];
 static _Atomic uint64_t mux_queue_drops, mux_no_link_drops, mux_socket_write_errors;
@@ -127,7 +131,7 @@ static int tun_alloc(const char *dev, int mtu_) {
         struct ifreq m; memset(&m, 0, sizeof(m)); strncpy(m.ifr_name, dev, IFNAMSIZ-1);
         m.ifr_mtu = mtu_; ioctl(s, SIOCSIFMTU, &m);
         struct ifreq q; memset(&q, 0, sizeof(q)); strncpy(q.ifr_name, dev, IFNAMSIZ-1);
-        q.ifr_qlen = 100000; ioctl(s, SIOCSIFTXQLEN, &q);
+        q.ifr_qlen = 1000; ioctl(s, SIOCSIFTXQLEN, &q);
         close(s);
     }
     return fd;
@@ -249,11 +253,13 @@ static int ws_sha1(const unsigned char *input, size_t len, unsigned char out[20]
 }
 static int ws_accept(const char *key64, char out[29]) {
     static const char guid[]="258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-    if (strlen(key64)!=24) return -1;
-    for (unsigned i=0;i<24;i++) {
+    if (strlen(key64)!=24 || key64[22]!='=' || key64[23]!='=') return -1;
+    /* A 16-byte key has two padding chars and four zero padding bits. */
+    if (!strchr("AQgw", key64[21])) return -1;
+    for (unsigned i=0;i<22;i++) {
         const unsigned char c=(unsigned char)key64[i];
         if (!(c>='A'&&c<='Z') && !(c>='a'&&c<='z') &&
-            !(c>='0'&&c<='9') && c!='+' && c!='/' && c!='=') return -1;
+            !(c>='0'&&c<='9') && c!='+' && c!='/') return -1;
     }
     unsigned char msg[60],hash[20];
     memcpy(msg,key64,24); memcpy(msg+24,guid,36);
@@ -269,6 +275,7 @@ static int ws_read_headers(int fd, char *buf, size_t cap) {
     while (size < cap-1) {
         unsigned char c; ssize_t r=read(fd,&c,1);
         if (r<=0) { if (r<0 && errno==EINTR) continue; return -1; }
+        if (!c) return -1; /* embedded NUL must not hide trailing headers */
         buf[size++]=(char)c; buf[size]=0;
         if (size>=4 && !memcmp(buf+size-4,"\r\n\r\n",4)) return 0;
     }
@@ -336,7 +343,7 @@ static int ws_server_handshake(int fd) {
     if (ws_read_headers(fd,req,sizeof(req))!=0) return -1;
     if (strncmp(req,"GET ",4)!=0 || !ws_has_token(req,"Upgrade","websocket") ||
         !ws_has_token(req,"Connection","Upgrade") ||
-        !strcasestr(req,"\r\nSec-WebSocket-Version: 13")) return -1;
+        !ws_has_token(req,"Sec-WebSocket-Version","13")) return -1;
     const char *v = strcasestr(req,"\r\nSec-WebSocket-Key:");
     if (!v) return -1;
     v+=strlen("\r\nSec-WebSocket-Key:");
@@ -371,6 +378,7 @@ static int ws_frame(unsigned char *d, const unsigned char *p, int plen, int mask
  * narrowed to int, unexpected masking/RSV and fragmentation are rejected.
  * Control frames are not passed into the inner IP AEAD decoder. */
 static int ws_read_frame(int fd, struct conn *c, unsigned char *out, int maxlen) {
+    if (maxlen < 0 || maxlen > MAX_FRAME) return -1;
     unsigned char h[2];
     if (readn(fd,h,2)<0) return -1;
     const int opcode=h[0]&0x0f, masked=!!(h[1]&0x80);
@@ -391,10 +399,11 @@ static int ws_read_frame(int fd, struct conn *c, unsigned char *out, int maxlen)
         if (len < 65536) return -1; /* non-minimal 64-bit encoding */
     }
     if (len > (uint64_t)maxlen || (opcode&0x08 && (!final || len>125))) return -1;
-    /* OmniTunnel only emits complete binary packets. A fragmented data
-       message cannot be safely reassembled without a bounded separate buffer. */
-    if (!final || (opcode!=0x2 && opcode!=0x8 && opcode!=0x9 && opcode!=0xa))
+    if (opcode!=0x0 && opcode!=0x2 && opcode!=0x8 && opcode!=0x9 && opcode!=0xa)
         return -1;
+    if (opcode==0x0 && !c->fragmented) return -1;
+    if (opcode==0x2 && c->fragmented) return -1;
+    if (opcode==0x0 && (c->fragment_len > (size_t)maxlen || len > (uint64_t)maxlen - c->fragment_len)) return -1;
     unsigned char mask[4]={0,0,0,0};
     if (masked && readn(fd,mask,4)<0) return -1;
     if (len && readn(fd,out,(size_t)len)<0) return -1;
@@ -420,6 +429,22 @@ static int ws_read_frame(int fd, struct conn *c, unsigned char *out, int maxlen)
         return err==0 ? 0 : -1;
     }
     if (opcode==0xa) return 0; /* expected Pong */
+    if (opcode==0x2 && !final) {
+        memcpy(c->fragment,out,(size_t)len);
+        c->fragment_len=(size_t)len;
+        c->fragmented=1;
+        return 0;
+    }
+    if (opcode==0x0) {
+        memcpy(c->fragment+c->fragment_len,out,(size_t)len);
+        c->fragment_len+=(size_t)len;
+        if (!final) return 0;
+        memcpy(out,c->fragment,c->fragment_len);
+        int size=(int)c->fragment_len;
+        c->fragment_len=0;
+        c->fragmented=0;
+        return size;
+    }
     return (int)len;
 }
 
@@ -477,6 +502,11 @@ static void *uplink(void *arg) {
     unsigned char frame[10 + MAX_FRAME]; /* WS header + payload */
     int mask = !is_server;               /* clients MUST mask their frames */
     while (running) {
+        struct pollfd ready={.fd=tun_fd,.events=POLLIN};
+        int pr=poll(&ready,1,250);
+        if (pr<0 && errno==EINTR) continue;
+        if (pr<0 || (ready.revents & (POLLERR|POLLHUP|POLLNVAL))) { running=0; break; }
+        if (pr==0) continue;
         ssize_t n = read(tun_fd, in, sizeof(in));
         if (n <= 0) { if (errno == EINTR) continue; usleep(1000); continue; }
         unsigned char *nonce = pay;
@@ -517,21 +547,18 @@ static void downlink_once(int fd, struct conn *c) {
 }
 
 static int connect_timeout(int fd, struct sockaddr_in *ra, int ms) {
-    int fl = fcntl(fd, F_GETFL, 0);
-    fcntl(fd, F_SETFL, fl | O_NONBLOCK);
-    int r = connect(fd, (struct sockaddr*)ra, sizeof(*ra));
-    if (r != 0) {
-        if (errno != EINPROGRESS) return -1;
-        fd_set wf; FD_ZERO(&wf); FD_SET(fd, &wf);
-        struct timeval tv = { ms / 1000, (ms % 1000) * 1000 };
-        r = select(fd + 1, NULL, &wf, NULL, &tv);
-        if (r <= 0) return -1;                       /* timeout/err -> abandon this 5-tuple */
-        int err = 0; socklen_t el = sizeof(err);
-        getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el);
-        if (err) return -1;
+    int fl=fcntl(fd,F_GETFL,0);
+    if (fl<0 || fcntl(fd,F_SETFL,fl|O_NONBLOCK)<0) return -1;
+    int r=connect(fd,(struct sockaddr*)ra,sizeof(*ra));
+    if (r!=0) {
+        if (errno!=EINPROGRESS) return -1;
+        struct pollfd p={.fd=fd,.events=POLLOUT};
+        r=poll(&p,1,ms);
+        if (r<=0) return -1;
+        int error=0; socklen_t len=sizeof(error);
+        if (getsockopt(fd,SOL_SOCKET,SO_ERROR,&error,&len)<0 || error) return -1;
     }
-    fcntl(fd, F_SETFL, fl);
-    return 0;
+    return fcntl(fd,F_SETFL,fl);
 }
 
 /* bring a freshly-connected link into service: reset its queue, publish the
@@ -539,9 +566,18 @@ static int connect_timeout(int fd, struct sockaddr_in *ra, int ms) {
 static void run_link(int idx, int fd) {
     struct conn *c = &conns[idx];
     set_sockopts(fd);
-    /* WebSocket handshake before any tunnel data flows on this link */
-    if (is_server) { if (ws_server_handshake(fd) < 0) { close(fd); return; } }
-    else           { if (ws_client_handshake(fd) < 0) { close(fd); return; } }
+    /* Bound silent/partial handshakes. Always release the reserved slot. */
+    struct timeval timeout={5,0}, clear={0,0};
+    if (setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&timeout,sizeof(timeout)) < 0 ||
+        setsockopt(fd,SOL_SOCKET,SO_SNDTIMEO,&timeout,sizeof(timeout)) < 0 ||
+        (is_server ? ws_server_handshake(fd) : ws_client_handshake(fd)) < 0) {
+        close(fd); c->fd=-1; return;
+    }
+    if (setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&clear,sizeof(clear)) < 0 ||
+        setsockopt(fd,SOL_SOCKET,SO_SNDTIMEO,&clear,sizeof(clear)) < 0) {
+        close(fd); c->fd=-1; return;
+    }
+    c->fragmented=0; c->fragment_len=0;
     pthread_mutex_lock(&c->qlock); c->head = c->tail = c->count = 0; pthread_mutex_unlock(&c->qlock);
     c->fd = fd;
     struct wr_arg *wa = malloc(sizeof(*wa));
@@ -573,7 +609,7 @@ static void *client_slot(void *arg) {
         bind(fd, (struct sockaddr*)&la, sizeof(la));
         struct sockaddr_in ra; memset(&ra, 0, sizeof(ra));
         ra.sin_family = AF_INET; ra.sin_addr = peer_ip; ra.sin_port = htons(port);
-        if (connect_timeout(fd, &ra, 3000) < 0) { close(fd); continue; }  /* retry, new port */
+        if (connect_timeout(fd, &ra, 3000) < 0) { close(fd); usleep(100000); continue; }  /* retry, new port */
         run_link(idx, fd);
     }
     return NULL;
@@ -595,7 +631,7 @@ static void sigh(int s){
 }
 
 static int parse_hexkey(const char *hex) {
-    if (strlen(hex) != KEY_LEN * 2) return -1;
+    if (strlen(hex) != KEY_LEN * 2 || strspn(hex, "0123456789abcdefABCDEF") != KEY_LEN * 2) return -1;
     for (int i = 0; i < KEY_LEN; i++){ unsigned b; if (sscanf(hex+i*2,"%2x",&b)!=1) return -1; key[i]=(unsigned char)b; }
     return 0;
 }
@@ -628,6 +664,7 @@ int tun_main_ws(int argc, char **argv){
     }
     if(!gL||!gR||!gA||!gP||!gk) usage(argv[0]);
     if(Nconn<1||Nconn>MAXCONN){fprintf(stderr,"N must be 1..%d\n",MAXCONN);return 1;}
+    if(port<1 || port>65535 || mtu<576 || mtu>MAX_INNER || !tun_name[0] || strlen(tun_name)>=IFNAMSIZ) return 1;
     if(parse_hexkey(keyhex)<0){fprintf(stderr,"key must be 64 hex chars\n");return 1;}
 
     for (int i=0;i<MAXCONN;i++){
@@ -658,6 +695,11 @@ int tun_main_ws(int argc, char **argv){
         if (bind(ls,(struct sockaddr*)&a,sizeof(a))<0) die("bind");
         if (listen(ls, MAXCONN) < 0) die("listen");
         while (running) {
+            struct pollfd incoming={.fd=ls,.events=POLLIN};
+            int pr=poll(&incoming,1,250);
+            if (pr<0 && errno==EINTR) continue;
+            if (pr<0 || (incoming.revents & (POLLERR|POLLHUP|POLLNVAL))) break;
+            if (pr==0) continue;
             struct sockaddr_in ca; socklen_t cl=sizeof(ca);
             int fd = accept(ls, (struct sockaddr*)&ca, &cl);
             if (fd < 0) { if (errno==EINTR) continue; usleep(100000); continue; }
@@ -677,6 +719,7 @@ int tun_main_ws(int argc, char **argv){
             }
             pthread_detach(t);
         }
+        close(ls);
     } else {
         pthread_t th[MAXCONN];
         for (int i=0;i<Nconn;i++) pthread_create(&th[i], NULL, client_slot, (void*)(long)i);

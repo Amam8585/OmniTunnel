@@ -66,14 +66,17 @@ static void test_frames(void) {
     close(fds[0]); close(fds[1]);
     assert(socketpair(AF_UNIX,SOCK_STREAM,0,fds)==0);
 
-    /* Reordered/fragmented binary frames are refused rather than dispatched
-       as complete tunnel packets. */
-    n=ws_frame(frame,input,20,1);
-    frame[0]=0x02;
+    /* Binary fragmentation is bounded and only delivered once complete. */
+    n=ws_frame(frame,input,20,1); frame[0]=0x02;
+    assert(write(fds[0],frame,n)==n);
+    assert(ws_read_frame(fds[1],&c,out,sizeof(out))==0);
+    n=ws_frame(frame,input+20,20,1); frame[0]=0x80;
+    assert(write(fds[0],frame,n)==n);
+    assert(ws_read_frame(fds[1],&c,out,sizeof(out))==40);
+    assert(!memcmp(input,out,40));
+    /* Continuation with no active message poisons the connection. */
     assert(write(fds[0],frame,n)==n);
     assert(ws_read_frame(fds[1],&c,out,sizeof(out))<0);
-    /* A rejected frame can leave unread payload bytes on a poisoned stream.
-     * Real transport closes it; use a new connection for the next case. */
     close(fds[0]); close(fds[1]);
     assert(socketpair(AF_UNIX,SOCK_STREAM,0,fds)==0);
 
@@ -98,6 +101,26 @@ static void test_frames(void) {
     close(fds[0]);close(fds[1]);
     pthread_mutex_destroy(&c.sendlock);
 }
+static void reject_frame(const unsigned char *frame, size_t size, int server) {
+    int fd[2]; struct conn c={0}; unsigned char out[MAX_FRAME];
+    assert(socketpair(AF_UNIX,SOCK_STREAM,0,fd)==0);
+    pthread_mutex_init(&c.sendlock,NULL);is_server=server;
+    assert(write(fd[0],frame,size)==(ssize_t)size);
+    shutdown(fd[0],SHUT_WR); /* incomplete input must terminate at EOF */
+    assert(ws_read_frame(fd[1],&c,out,sizeof(out))<0);
+    close(fd[0]);close(fd[1]);pthread_mutex_destroy(&c.sendlock);
+}
+static void test_invalid_frames(void) {
+    const unsigned char reserved[]={0xc2,0};reject_frame(reserved,sizeof(reserved),0);
+    const unsigned char masked_server[]={0x82,0x80};reject_frame(masked_server,sizeof(masked_server),0);
+    const unsigned char short_length[]={0x82,126,0,1};reject_frame(short_length,sizeof(short_length),0);
+    const unsigned char signed_length[]={0x82,127,128,0,0,0,0,0,0,0};reject_frame(signed_length,sizeof(signed_length),0);
+    const unsigned char short64[]={0x82,127,0,0,0,0,0,0,0,126};reject_frame(short64,sizeof(short64),0);
+    const unsigned char split_ping[]={0x09,0};reject_frame(split_ping,sizeof(split_ping),0);
+    const unsigned char oversized_ping[]={0x89,126,0,126};reject_frame(oversized_ping,sizeof(oversized_ping),0);
+    const unsigned char partial[]={0x82,5,1,2};reject_frame(partial,sizeof(partial),0);
+    const unsigned char partial_mask[]={0x82,0x81,1,2};reject_frame(partial_mask,sizeof(partial_mask),1);
+}
 int main(void) {
     char accept[29];
     assert(ws_accept("dGhlIHNhbXBsZSBub25jZQ==",accept)==0);
@@ -105,8 +128,19 @@ int main(void) {
     assert(ws_accept("not-24-bytes",accept)!=0);
     assert(ws_has_token("HTTP/1.1 101 Switching Protocols\r\nConnection: keep-alive, UpGrAdE\r\n\r\n","Connection","Upgrade"));
     assert(!ws_has_token("HTTP/1.1 101 Switching Protocols\r\nConnection: NotUpgrade\r\n\r\n","Connection","Upgrade"));
+    assert(ws_accept("========================",accept)!=0);
+    assert(ws_accept("dGhlIHNhbXBsZSBub25jZR==",accept)!=0);
+    /* Every failed upgrade releases the server's reserved connection slot. */
+    int fd[2];
+    assert(socketpair(AF_UNIX,SOCK_STREAM,0,fd)==0);
+    is_server=1; conns[0].fd=-2;
+    assert(write(fd[0],"BAD\r\n\r\n",7)==7);
+    run_link(0,fd[1]);
+    assert(conns[0].fd==-1);
+    close(fd[0]);
     test_upgrade();
     test_frames();
-    puts("PASS: RFC6455 Accept verification, client/server handshake, masked frames, fragmentation rejection, 64-bit validation and Pong");
+    test_invalid_frames();
+    puts("PASS: RFC6455 Accept verification, client/server handshake, masked frames, bounded fragmentation, 64-bit validation and Pong");
     return 0;
 }

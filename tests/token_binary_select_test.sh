@@ -18,7 +18,8 @@ extract() {
     }' "$SCRIPT"
 }
 
-eval "$(extract "ensure_binary ensure_omnistripe ensure_omniackless type_is_hysteria type_is_stripe type_is_ackless type_is_kernel cmd_server_token")"
+ALL_TYPES="gre icmp udp hysteria tcp fou"
+eval "$(extract "require_supported_transport ensure_binary ensure_omnistripe ensure_omniackless type_is_hysteria type_is_stripe type_is_ackless type_is_kernel cmd_server_token")"
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
 
@@ -49,13 +50,17 @@ mk_token() {
         | base64 | tr -d '\n'
 }
 
+# Retired engines remain usable by existing instances, but pairing must reject
+# creation of new retired carriers even if their executable already exists.
 for T in stripe ackless; do
     out="$(cmd_server_token "$(mk_token "$T")" 2>&1)"; rc=$?
-    (( rc == 0 )) || fail "$T: server-token exited $rc on a box with no omnitun core (out: $out)"
-    case "$out" in
-        *"omnitun"*"not found"*) fail "$T: server-token wrongly demanded the omnitun core binary: $out";;
-    esac
+    (( rc != 0 )) || fail "$T: retired token accepted"
+    [[ "$out" == *"unsupported or removed transport"* ]] || fail "$T: wrong rejection: $out"
 done
+ensure_omnistripe || fail "legacy stripe binary lookup failed"
+ensure_omniackless || fail "legacy ackless binary lookup failed"
+out="$(cmd_server_token "$(mk_token hysteria)" 2>&1)"; rc=$?
+(( rc == 0 )) || fail "hysteria must not require omnitun: $out"
 
 out="$(cmd_server_token "$(mk_token tcp)" 2>&1)"; rc=$?
 (( rc != 0 )) || fail "control: a tcp token did NOT require omnitun - the harness cannot detect the bug"
@@ -64,4 +69,4 @@ case "$out" in
     *) fail "control: tcp token failed for the wrong reason (expected missing omnitun core): $out";;
 esac
 
-echo "PASSED - server-token for stripe/ackless uses ensure_omnistripe/ensure_omniackless and does not require the omnitun core (tcp still does)"
+echo "PASSED - retired pairing refused; legacy Go lookups retained; Hysteria independent of C core; TCP requires core"

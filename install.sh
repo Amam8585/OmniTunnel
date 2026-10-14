@@ -56,6 +56,20 @@ case "$ID:$VERSION_ID" in
     ubuntu:22.04|ubuntu:24.04|debian:12|debian:13) ;;
     *) die "unsupported OS $ID $VERSION_ID";;
 esac
+# Refuse destructive path aliases and overlapping install/state roots.
+python3 - "$PREFIX" "$STATE" "$BIN_DIR" <<'PY_PATHS' || die "unsafe install paths"
+import pathlib,sys
+paths=[]
+for value in sys.argv[1:]:
+    p=pathlib.Path(value)
+    if not p.is_absolute() or p.resolve()!=p or str(p) in ("/","/etc","/usr","/usr/local","/opt","/var","/var/lib"):
+        raise SystemExit("paths must be canonical absolute dedicated directories")
+    paths.append(p)
+for i,p in enumerate(paths):
+    for q in paths[i+1:]:
+        if p==q or p in q.parents or q in p.parents:
+            raise SystemExit("install/state/bin paths must not overlap")
+PY_PATHS
 log "System: $ID $VERSION_ID $ARCH"
 active_units() {
     local unit exec_line
@@ -124,7 +138,7 @@ snapshot() {
         if [[ -d "$PREFIX/$n" ]]; then cp -a "$PREFIX/$n" "$dir/$n"
         else printf 'ABSENT:%s\n' "$n" >> "$dir/.inventory"; fi
     done
-    for n in README.md LICENSE CHANGELOG.md build-info.json; do
+    for n in README.md LICENSE CHANGELOG.md build-info.json owned-binaries; do
         if [[ -f "$PREFIX/$n" ]]; then cp -a "$PREFIX/$n" "$dir/$n"
         else printf 'ABSENT:%s\n' "$n" >> "$dir/.inventory"; fi
     done
@@ -154,7 +168,7 @@ rollback_snapshot() {
             rm -rf "$PREFIX/$n"; cp -a "$dir/$n" "$PREFIX/$n"
         elif grep -qx "ABSENT:$n" "$dir/.inventory"; then rm -rf "$PREFIX/$n"; fi
     done
-    for n in README.md LICENSE CHANGELOG.md build-info.json; do
+    for n in README.md LICENSE CHANGELOG.md build-info.json owned-binaries; do
         if [[ -f "$dir/$n" ]]; then cp -a "$dir/$n" "$PREFIX/$n"
         elif grep -qx "ABSENT:$n" "$dir/.inventory"; then rm -f "$PREFIX/$n"; fi
     done
@@ -172,6 +186,8 @@ prepare() {
     mkdir -p "$STAGES"
     local work stage archive n commit="" archive_sha=""
     work="$(mktemp -d "$STAGES/.build.XXXXXX")"
+    # EXIT also covers explicit die calls; do not leave half-built releases.
+    BUILD_WORK="$work"
     mkdir -p "$work/source" "$work/release/bin"
     if [[ -z "$SOURCE" && -f "$(dirname "${BASH_SOURCE[0]}")/src/main.c" ]]; then
         SOURCE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -235,6 +251,15 @@ PY
     [[ ! -f "$src/README.md" ]] || cp -a "$src/README.md" "$out/README.md"
     [[ ! -f "$src/LICENSE" ]] || cp -a "$src/LICENSE" "$out/LICENSE"
     [[ ! -f "$src/CHANGELOG.md" ]] || cp -a "$src/CHANGELOG.md" "$out/CHANGELOG.md"
+    (cd "$src" && sha256sum -c bin/SHA256SUMS) || die "bundled binary SHA256 mismatch"
+    python3 - "$src/bin" "$ARCH" <<'PY_ELF' || die "bundled binary architecture mismatch"
+import pathlib,struct,sys
+root=pathlib.Path(sys.argv[1]);arch=sys.argv[2]
+for name in ("hysteria","omnistripe","omniackless"):
+    with (root/(name+"-"+arch)).open("rb") as stream: header=stream.read(20)
+    assert header[:6]==b"\x7fELF\x02\x01",name
+    assert struct.unpack_from("<H",header,18)[0]=={"amd64":62,"arm64":183}[arch],name
+PY_ELF
     # Retain Go Direct transports and Hysteria; no Chisel reverse engine.
     for n in hysteria omnistripe omniackless; do
         [[ -s "$src/bin/$n-$ARCH" ]] || die "missing Direct binary $n-$ARCH"
@@ -290,6 +315,9 @@ import hashlib,json,pathlib,sys
 root=pathlib.Path(sys.argv[1])
 meta=json.loads((root/"build-info.json").read_text())
 assert isinstance(meta.get("artifacts"),dict) and len(meta["artifacts"])>=7
+actual={str(f.relative_to(root)) for f in root.rglob("*") if f.is_file() and f.name!="build-info.json"}
+assert actual==set(meta["artifacts"]), "artifact inventory differs from stage"
+assert not any(f.is_symlink() for f in root.rglob("*")), "symlink in stage"
 for key, expected in meta["artifacts"].items():
     f=root/key
     assert f.is_file() and not f.is_symlink(),key
@@ -344,6 +372,9 @@ apply() {
         die "active tunnels detected: $active. --allow-active required; NO restarts performed"
     [[ ! -e "$LINK" || -L "$LINK" ]] || die "refusing to overwrite unowned $LINK"
     [[ ! -e "$APADANA_LINK" || -L "$APADANA_LINK" ]] || die "refusing to overwrite unowned $APADANA_LINK"
+    for n in "$LINK" "$APADANA_LINK"; do
+        [[ ! -L "$n" || "$(readlink "$n")" == "$PREFIX/omnitunnel.sh" ]] || die "unowned command symlink: $n"
+    done
     ((DRY==0)) || { log "dry-run: stage checks passed; no writes"; return 0; }
     mkdir -p "$PREFIX" "$BIN_DIR"
     snapshot
@@ -351,6 +382,14 @@ apply() {
     # Checked actions; each rename is atomic within one filesystem.
     # Multi-file replacement cannot be globally atomic; rollback on failure.
     if (
+        # Only executables absent on first activation become owned. Existing
+        # shared programs can be backed up/restored, but never uninstalled.
+        touch "$PREFIX/owned-binaries" || exit 1
+        for n in omnitun hysteria omnistripe omniackless; do
+            if [[ ! -e "$BIN_DIR/$n" && ! -L "$BIN_DIR/$n" ]]; then
+                grep -qxF "$n" "$PREFIX/owned-binaries" || echo "$n" >> "$PREFIX/owned-binaries" || exit 1
+            fi
+        done
         for n in omnitun hysteria omnistripe omniackless; do
             install -m 0755 "$stage/bin/$n-$ARCH" "$BIN_DIR/$n.new.${BASHPID}" || exit 1
             mv -f "$BIN_DIR/$n.new.${BASHPID}" "$BIN_DIR/$n" || exit 1
@@ -420,6 +459,8 @@ if [[ "$ACTION" == check ]]; then
     exit 0
 fi
 root
+BUILD_WORK=""
+trap '[[ -z "$BUILD_WORK" ]] || rm -rf -- "$BUILD_WORK"' EXIT
 # A single lock covers staging pointer, snapshots, apply, rollback and removal.
 # Prevent overlapping installers from racing to replace the same paths.
 mkdir -p "$STATE"
@@ -446,12 +487,38 @@ case "$ACTION" in
             rm -f "$LINK"
         [[ -L "$APADANA_LINK" && "$(readlink "$APADANA_LINK")" == "$PREFIX/omnitunnel.sh" ]] &&
             rm -f "$APADANA_LINK"
-        rm -rf "$PREFIX/scripts" "$PREFIX/docs" "$PREFIX/bin"
-        rm -f "$PREFIX/build-info.json" "$PREFIX/README.md" "$PREFIX/CHANGELOG.md" "$PREFIX/LICENSE"
-        rm -f "$PREFIX/omnitunnel.sh"
+        # Remove only newly installed, unchanged binaries proven by inventory.
+        python3 - "$PREFIX" "$BIN_DIR" "$ARCH" <<'PY_REMOVE'
+import hashlib,json,pathlib,sys
+prefix,bindir=map(pathlib.Path,sys.argv[1:3]);arch=sys.argv[3]
+owned=prefix/"owned-binaries";manifest=prefix/"build-info.json"
+if owned.is_file() and manifest.is_file():
+    meta=json.loads(manifest.read_text())
+    for name in owned.read_text().splitlines():
+        if name not in ("omnitun","hysteria","omnistripe","omniackless"): continue
+        f=bindir/name
+        expected=meta.get("artifacts",{}).get("bin/"+name+"-"+arch)
+        if f.is_file() and not f.is_symlink() and hashlib.sha256(f.read_bytes()).hexdigest()==expected:
+            f.unlink()
+PY_REMOVE
+        python3 - "$PREFIX" <<'PY_ASSETS'
+import hashlib,json,pathlib,sys
+root=pathlib.Path(sys.argv[1]);manifest=root/"build-info.json"
+if manifest.is_file():
+    meta=json.loads(manifest.read_text())
+    for name,digest in meta.get("artifacts",{}).items():
+        f=root/name
+        if not f.resolve().is_relative_to(root.resolve()) or f.is_symlink(): continue
+        if f.is_file() and hashlib.sha256(f.read_bytes()).hexdigest()==digest: f.unlink()
+    for directory in sorted((f for f in root.rglob("*") if f.is_dir() and not f.is_symlink()),key=lambda p:len(p.parts),reverse=True):
+        try: directory.rmdir()
+        except OSError: pass # retain user/unmanaged content
+    manifest.unlink()
+    (root/"owned-binaries").unlink(missing_ok=True)
+PY_ASSETS
         # These binaries may be shared by other applications. Do not remove
         # them without a verifiable ownership inventory.
-        log "Shared binaries in $BIN_DIR preserved (ownership not proven)"
+        log "Unowned or modified shared binaries in $BIN_DIR preserved"
         if ((PURGE)); then
             # Configs are referenced by stopped services too. Refuse to
             # orphan those units; remove instances through the manager first.

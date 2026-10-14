@@ -28,5 +28,23 @@ class LatencyReportTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             summarize("time=1.0 ms\ntime=2.0 ms\n", 1)
 
+    def test_duplicates_do_not_hide_loss(self):
+        log = "icmp_seq=1 time=10 ms\nicmp_seq=1 time=11 ms (DUP!)\nicmp_seq=1 time=10 ms\nicmp_seq=2 time=20 ms"
+        result = summarize(log, 4)
+        self.assertEqual(result["received_packets"], 2)
+        self.assertEqual(result["loss_percent"], 50)
+        self.assertEqual(result["inter_sample_jitter_ms"], 10)
+        self.assertIsNone(result["throughput_mbps"])
+
+    def test_invalid_quantile(self):
+        for p in (-1, 2, float("nan")):
+            with self.assertRaises(ValueError):
+                quantile([1, 2], p)
+
+    def test_censored_and_incomplete_measurements(self):
+        for log in ("icmp_seq=1 time<1 ms", "3 packets transmitted"):
+            with self.assertRaises(ValueError):
+                summarize(log, 4)
+
 if __name__ == "__main__":
     unittest.main()

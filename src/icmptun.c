@@ -84,9 +84,9 @@ static inline int next_idx(int i) { return (i + 1) % QUEUE_SIZE; }
 
 static uint16_t cksum(const void *buf, int len) {
     uint32_t sum = 0;
-    const uint16_t *p = buf;
-    while (len > 1) { sum += *p++; len -= 2; }
-    if (len) sum += *(const uint8_t*)p;
+    const unsigned char *p = buf;
+    while (len > 1) { uint16_t word; memcpy(&word,p,2); sum += word; p+=2; len-=2; }
+    if (len) sum += *p;
     sum = (sum >> 16) + (sum & 0xFFFF);
     sum += (sum >> 16);
     return (uint16_t)~sum;
@@ -178,7 +178,7 @@ static int decapsulate(const unsigned char *buf, int len,
         icmp->code != 0 || ntohs(icmp->un.echo.id) != remote_ident)
         return -1;
     int payload = len - (int)sizeof(*icmp);
-    if (payload < 0 || payload > mtu) return -1;
+    if (payload < 20 || payload > mtu || payload > MAX_INNER) return -1;
     /* Small packets are padded up to MIN_ICMP_PAYLOAD by the sender (see
        encapsulate()) with no separate length field - the true length is
        whatever the inner IP header itself declares. Trust that over the
@@ -293,6 +293,15 @@ typedef struct {
 static tun_pending_t *tun_pending;
 static unsigned tun_head, tun_tail, tun_count;
 static int tun_blocked, send_blocked, tun_read_paused;
+static int io_failed;
+/* Losing an epoll subscription is fatal: a silently stranded queue can never
+ * recover. Exit nonzero so Restart=on-failure can rebuild the descriptors. */
+static int epoll_modify(int fd, struct epoll_event *ev) {
+    int rc;
+    do { rc=epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, ev); } while (rc<0 && errno==EINTR);
+    if (rc<0) { if (!io_failed) perror("ICMP epoll_ctl MOD"); io_failed=1; }
+    return rc;
+}
 static void tun_set_readable(int enabled) {
     int pause = !enabled;
     if (tun_read_paused == pause) return;
@@ -300,7 +309,7 @@ static void tun_set_readable(int enabled) {
         .events = (enabled ? EPOLLIN : 0) | (tun_blocked ? EPOLLOUT : 0)
     };
     ev.data.fd = tun_fd;
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, tun_fd, &ev) == 0)
+    if (epoll_modify(tun_fd, &ev) == 0)
         tun_read_paused = pause;
     else
         metrics.tun_errors++;
@@ -309,7 +318,7 @@ static void tun_set_writable(int enabled) {
     if (tun_blocked == enabled) return;
     struct epoll_event ev = { .events = (tun_read_paused ? 0 : EPOLLIN) | (enabled ? EPOLLOUT : 0) };
     ev.data.fd = tun_fd;
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, tun_fd, &ev) == 0)
+    if (epoll_modify(tun_fd, &ev) == 0)
         tun_blocked = enabled;
     else {
         metrics.tun_errors++;
@@ -321,7 +330,7 @@ static void tun_drain(void) {
     while (tun_count && budget-- > 0) {
         tun_pending_t *p = &tun_pending[tun_head];
         ssize_t n = write(tun_fd, p->data, p->len);
-        if (n < 0 && errno == EINTR) { ++budget; continue; }
+        if (n < 0 && errno == EINTR) continue;
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             tun_set_writable(1);
             return;
@@ -764,7 +773,7 @@ static void send_set_writable(int enabled) {
     if (send_blocked == enabled) return;
     struct epoll_event ev = { .events = EPOLLIN | (enabled ? EPOLLOUT : 0) };
     ev.data.fd = icmp_fd;
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, icmp_fd, &ev) == 0)
+    if (epoll_modify(icmp_fd, &ev) == 0)
         send_blocked = enabled;
     else {
         metrics.send_errors++;
@@ -822,7 +831,7 @@ static int tun_create(const char *dev, int mtu_) {
         close(s);
     }
     int fl = fcntl(fd, F_GETFL, 0);
-    fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+    if (fl<0 || fcntl(fd, F_SETFL, fl | O_NONBLOCK)<0) { perror("nonblocking fd"); close(fd); return -1; }
     return fd;
 }
 
@@ -882,11 +891,11 @@ static int icmp_sock_create(struct in_addr local) {
         perror("bind raw ICMP"); close(fd); return -1;
     }
     int fl = fcntl(fd, F_GETFL, 0);
-    fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+    if (fl<0 || fcntl(fd, F_SETFL, fl | O_NONBLOCK)<0) { perror("nonblocking fd"); close(fd); return -1; }
     return fd;
 }
 
-static volatile int running = 1;
+static volatile sig_atomic_t running = 1;
 static void int_handler(int sig) { (void)sig; running = 0; }
 
 static void usage(const char *arg0) {
@@ -969,6 +978,8 @@ int tun_main_icmp(int argc, char **argv) {
         }
     }
     if (!got_local || !got_peer || !got_tun_local || !got_tun_peer) usage(argv[0]);
+    if (!tun_name[0] || strlen(tun_name)>=IFNAMSIZ ||
+        strspn(tun_name,"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")!=strlen(tun_name)) usage(argv[0]);
 
     /* Client owns id=ident (used on its Echo Request); server owns
        id=ident+1 (used on its Echo Reply). Each side's decapsulate()
@@ -1047,14 +1058,25 @@ int tun_main_icmp(int argc, char **argv) {
     socklen_t fromlen;
 
     loop_clock_ms = now_ms();
-    while (running) {
+    while (running && !io_failed) {
         loop_clock_ms = now_ms();
         struct epoll_event events[2];
         int nfds = epoll_wait(epoll_fd, events, 2, flow_epoll_timeout());
-        if (nfds < 0) { if (errno == EINTR) continue; break; }
+        if (nfds < 0) { if (errno == EINTR) continue; perror("epoll_wait"); io_failed=1; break; }
         loop_clock_ms = now_ms();
 
-        for (int i = 0; i < nfds; i++) {
+        for (int i = 0; i < nfds && !io_failed; i++) {
+            if (events[i].events & EPOLLHUP) {
+                fprintf(stderr,"ICMP descriptor hangup: %d\n",events[i].data.fd);
+                io_failed=1; break;
+            }
+            if (events[i].events & EPOLLERR) {
+                if (events[i].data.fd==icmp_fd) {
+                    int error=0; socklen_t size=sizeof(error);
+                    if (getsockopt(icmp_fd,SOL_SOCKET,SO_ERROR,&error,&size)<0) { io_failed=1; break; }
+                    metrics.recv_errors++; /* SO_ERROR read clears the level event. */
+                } else { io_failed=1; break; }
+            }
             if (events[i].data.fd == tun_fd) {
                 if (events[i].events & EPOLLOUT) tun_drain();
                 for (int batch = 0; batch < IO_BATCH && (events[i].events & EPOLLIN) && !tun_read_paused; ++batch) {
@@ -1181,5 +1203,5 @@ int tun_main_icmp(int argc, char **argv) {
     free(flow_table);
     free(timer_heap);
     if (stats_path[0]) unlink(stats_path);
-    return 0;
+    return io_failed ? 1 : 0;
 }

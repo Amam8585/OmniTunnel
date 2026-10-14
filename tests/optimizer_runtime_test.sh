@@ -24,7 +24,13 @@ else
     echo "unexpected ip args: $*" >&2; exit 1
 fi
 SH
-chmod +x "$DIR/stubs/ip"
+cat > "$DIR/stubs/tc" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "$*" == 'qdisc show dev ts-lab' ]] || exit 1
+echo 'qdisc fq_codel 0: root'
+SH
+chmod +x "$DIR/stubs/ip" "$DIR/stubs/tc"
 export TEST_QLEN="$DIR/current_qlen" TEST_WRITES="$DIR/writes"
 export OMNITUN_CONFIG_ROOT="$DIR/config" OMNITUN_OPTIMIZER_STATE_DIR="$DIR/state"
 export PATH="$DIR/stubs:$PATH"

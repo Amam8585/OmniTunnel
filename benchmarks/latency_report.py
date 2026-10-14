@@ -9,6 +9,7 @@ Network mode MUST be used on authorized lab peers only.
 import argparse
 import json
 import math
+import os
 import re
 import subprocess
 import sys
@@ -16,6 +17,10 @@ import sys
 RX = re.compile(r"\btime[=<]\s*(\d+(?:\.\d+)?)\s*ms\b", re.IGNORECASE)
 
 def quantile(values, proportion):
+    if not math.isfinite(proportion) or not 0 <= proportion <= 1:
+        raise ValueError("quantile proportion must be finite and within [0, 1]")
+    if any(not math.isfinite(v) or v < 0 for v in values):
+        raise ValueError("invalid quantile sample")
     sorted_values = sorted(values)
     if not sorted_values:
         return None
@@ -27,7 +32,28 @@ def quantile(values, proportion):
 def summarize(text, sent):
     if not (1 <= sent <= 100000):
         raise ValueError("invalid requested packet count")
-    samples = [float(x) for x in RX.findall(text)]
+    # DUP replies are not extra delivered probes. Sequence IDs also deduplicate
+    # captures without iputils' DUP marker; retain receive order for jitter.
+    samples = []
+    seen = set()
+    for line in text.splitlines():
+        if "DUP!" in line:
+            continue
+        if re.search(r"\btime<", line, re.IGNORECASE):
+            raise ValueError("censored RTT (time<) is not an exact sample; use ping -3")
+        found = RX.search(line)
+        if not found:
+            continue
+        sequence = re.search(r"\bicmp_seq=(\d+)\b", line)
+        if sequence:
+            ident = int(sequence.group(1))
+            if ident in seen:
+                continue
+            seen.add(ident)
+        samples.append(float(found.group(1)))
+    count = re.search(r"(\d+) packets transmitted", text)
+    if count and int(count.group(1)) != sent:
+        raise ValueError("transmitted count differs from --sent")
     if any(not math.isfinite(n) or n < 0 for n in samples):
         raise ValueError("invalid RTT sample")
     if len(samples) > sent:
@@ -41,6 +67,7 @@ def summarize(text, sent):
         "inter_sample_jitter_ms":round(sum(abs(samples[i]-samples[i-1]) for i in range(1,len(samples)))/(len(samples)-1),3)
                                     if len(samples)>1 else None,
         "application_goodput_mbps":None,
+        "throughput_mbps":None,
         "limitations":["ICMP RTT is not application latency",
                        "network performance improvements require matched offered load and repeated A/B trials"]
     }
@@ -57,12 +84,14 @@ def main():
     if args.target:
         if not args.allow_network:
             parser.error("active probing requires --allow-network and lab authorization")
-        if args.sent<10 or args.sent>1000 or args.interval<0.1 or args.interval>10:
+        if args.sent<10 or args.sent>1000 or not math.isfinite(args.interval) or args.interval<0.1 or args.interval>10:
             parser.error("probe rate/count outside safe laboratory bounds")
         proc=subprocess.run(["ping","-n","-c",str(args.sent),
-                             "-i",str(args.interval),"-W","2",args.target],
-                            capture_output=True,text=True,
+                             "-i",str(args.interval),"-W","2","--",args.target],
+                            capture_output=True,text=True,env={**os.environ,"LC_ALL":"C"},
                             timeout=args.sent*(args.interval+2)+10)
+        if proc.returncode not in (0,1):
+            raise ValueError("ping failed: " + proc.stderr.strip())
         content=proc.stdout
     else:
         with open(args.file,encoding="utf-8") as handle:

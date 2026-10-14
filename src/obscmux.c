@@ -30,6 +30,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <poll.h>
 #include <signal.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -56,7 +57,7 @@ static char *tun_name = "obscm0";
 static int mtu = 1400;
 static int is_server = 0, port = 443, Nconn = 8;
 static struct in_addr local_ip, peer_ip;
-static volatile int running = 1;
+static _Atomic int running = 1;
 
 /* One slot per parallel link. Each link has its own outbound queue drained by
  * its own writer thread, so a stalled link never blocks the TUN reader or the
@@ -223,6 +224,11 @@ static void *uplink(void *arg) {
     unsigned char in[MAX_INNER];
     unsigned char frame[2 + MAX_FRAME];
     while (running) {
+        struct pollfd ready={.fd=tun_fd,.events=POLLIN};
+        int pr=poll(&ready,1,250);
+        if (pr<0 && errno==EINTR) continue;
+        if (pr<0 || (ready.revents & (POLLERR|POLLHUP|POLLNVAL))) { running=0; break; }
+        if (pr==0) continue;
         ssize_t n = read(tun_fd, in, sizeof(in));
         if (n <= 0) { if (errno == EINTR) continue; usleep(1000); continue; }
         unsigned char *nonce = frame + 2;
@@ -266,21 +272,18 @@ static void downlink_once(int fd) {
 }
 
 static int connect_timeout(int fd, struct sockaddr_in *ra, int ms) {
-    int fl = fcntl(fd, F_GETFL, 0);
-    fcntl(fd, F_SETFL, fl | O_NONBLOCK);
-    int r = connect(fd, (struct sockaddr*)ra, sizeof(*ra));
-    if (r != 0) {
-        if (errno != EINPROGRESS) return -1;
-        fd_set wf; FD_ZERO(&wf); FD_SET(fd, &wf);
-        struct timeval tv = { ms / 1000, (ms % 1000) * 1000 };
-        r = select(fd + 1, NULL, &wf, NULL, &tv);
-        if (r <= 0) return -1;                       /* timeout/err -> abandon this 5-tuple */
-        int err = 0; socklen_t el = sizeof(err);
-        getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el);
-        if (err) return -1;
+    int fl=fcntl(fd,F_GETFL,0);
+    if (fl<0 || fcntl(fd,F_SETFL,fl|O_NONBLOCK)<0) return -1;
+    int r=connect(fd,(struct sockaddr*)ra,sizeof(*ra));
+    if (r!=0) {
+        if (errno!=EINPROGRESS) return -1;
+        struct pollfd p={.fd=fd,.events=POLLOUT};
+        r=poll(&p,1,ms);
+        if (r<=0) return -1;
+        int error=0; socklen_t len=sizeof(error);
+        if (getsockopt(fd,SOL_SOCKET,SO_ERROR,&error,&len)<0 || error) return -1;
     }
-    fcntl(fd, F_SETFL, fl);
-    return 0;
+    return fcntl(fd,F_SETFL,fl);
 }
 
 /* bring a freshly-connected link into service: reset its queue, publish the
@@ -319,7 +322,7 @@ static void *client_slot(void *arg) {
         bind(fd, (struct sockaddr*)&la, sizeof(la));
         struct sockaddr_in ra; memset(&ra, 0, sizeof(ra));
         ra.sin_family = AF_INET; ra.sin_addr = peer_ip; ra.sin_port = htons(port);
-        if (connect_timeout(fd, &ra, 3000) < 0) { close(fd); continue; }  /* retry, new port */
+        if (connect_timeout(fd, &ra, 3000) < 0) { close(fd); usleep(100000); continue; }  /* retry, new port */
         run_link(idx, fd);
     }
     return NULL;
@@ -341,7 +344,7 @@ static void sigh(int s){
 }
 
 static int parse_hexkey(const char *hex) {
-    if (strlen(hex) != KEY_LEN * 2) return -1;
+    if (strlen(hex) != KEY_LEN * 2 || strspn(hex, "0123456789abcdefABCDEF") != KEY_LEN * 2) return -1;
     for (int i = 0; i < KEY_LEN; i++){ unsigned b; if (sscanf(hex+i*2,"%2x",&b)!=1) return -1; key[i]=(unsigned char)b; }
     return 0;
 }
@@ -374,6 +377,7 @@ int tun_main_mux(int argc, char **argv){
     }
     if(!gL||!gR||!gA||!gP||!gk) usage(argv[0]);
     if(Nconn<1||Nconn>MAXCONN){fprintf(stderr,"N must be 1..%d\n",MAXCONN);return 1;}
+    if(port<1 || port>65535 || mtu<576 || mtu>MAX_INNER || !tun_name[0] || strlen(tun_name)>=IFNAMSIZ) return 1;
     if(parse_hexkey(keyhex)<0){fprintf(stderr,"key must be 64 hex chars\n");return 1;}
 
     for (int i=0;i<MAXCONN;i++){
@@ -403,6 +407,11 @@ int tun_main_mux(int argc, char **argv){
         if (bind(ls,(struct sockaddr*)&a,sizeof(a))<0) die("bind");
         if (listen(ls, MAXCONN) < 0) die("listen");
         while (running) {
+            struct pollfd incoming={.fd=ls,.events=POLLIN};
+            int pr=poll(&incoming,1,250);
+            if (pr<0 && errno==EINTR) continue;
+            if (pr<0 || (incoming.revents & (POLLERR|POLLHUP|POLLNVAL))) break;
+            if (pr==0) continue;
             struct sockaddr_in ca; socklen_t cl=sizeof(ca);
             int fd = accept(ls, (struct sockaddr*)&ca, &cl);
             if (fd < 0) { if (errno==EINTR) continue; usleep(100000); continue; }
@@ -422,6 +431,7 @@ int tun_main_mux(int argc, char **argv){
             }
             pthread_detach(t);
         }
+        close(ls);
     } else {
         pthread_t th[MAXCONN];
         for (int i=0;i<Nconn;i++) pthread_create(&th[i], NULL, client_slot, (void*)(long)i);

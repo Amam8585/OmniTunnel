@@ -14,7 +14,7 @@ Do not run privileged remote installers without reviewing and pinning their comm
 
 Reverse removal does not automatically kill old Chisel units. Audit existing `omnitun-*-mux.service` on a controlled maintenance window; cleanup an explicitly retired instance only after verifying ownership and user impact.
 
-The legacy ICMP manager `icmptun-ctl.sh` retains independent embedded code and older behavior; this PR did not rewrite it to share the new implementation. Do not mix its units and the new manager under the same interface name.
+The legacy ICMP manager `icmptun-ctl.sh` uses the maintained core; its historical embedded source is retired. Its configuration and service lifecycle remain separate. Do not mix its units and the new manager under the same interface name.
 
 ## Phase 3 — WebSocket compatibility and firewall caveats
 
@@ -24,8 +24,9 @@ used one hardcoded digest. The explicit, narrow
 OMNITUN_WS_ALLOW_LEGACY_ACCEPT=1 environment variable accepts only that
 known digest, and is not recommended for a public-facing listener. It does
 not disable the inner transport's AEAD checks, but it weakens HTTP Upgrade
-validation. Unlike a general-purpose WebSocket server, fragmented data
-messages are not supported and are rejected.
+validation. Binary fragmented messages are assembled up to MAX_FRAME bytes; unexpected
+continuations, nested messages and oversized assemblies are rejected. Text messages
+are not tunnel packets and remain unsupported. This is not a general-purpose WebSocket endpoint.
 
 Forwarding uses staged private iptables chains; a successful staged
 prepare protects the old generation from an in-place chain flush. The

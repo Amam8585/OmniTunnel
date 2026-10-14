@@ -219,7 +219,7 @@ static void *downlink(void *arg) {
 static void sigh(int s) { (void)s; running = 0; }
 
 static int parse_hexkey(const char *hex) {
-    if (strlen(hex) != KEY_LEN * 2) return -1;
+    if (strlen(hex) != KEY_LEN * 2 || strspn(hex, "0123456789abcdefABCDEF") != KEY_LEN * 2) return -1;
     for (int i = 0; i < KEY_LEN; i++) {
         unsigned b;
         if (sscanf(hex + i * 2, "%2x", &b) != 1) return -1;
