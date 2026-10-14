@@ -63,7 +63,10 @@ status() {
     ip -s link show dev "$dev"
     echo "Interface details and MTU:"
     ip -d link show dev "$dev" || true
-    if command -v tc >/dev/null; then tc qdisc show dev "$dev"; fi
+    # tc is diagnostic only; an absent/disappearing qdisc must not abort status.
+    if command -v tc >/dev/null; then
+        tc qdisc show dev "$dev" || echo "qdisc details unavailable (no changes made)"
+    fi
     if [[ -r /proc/sys/net/netfilter/nf_conntrack_max ]]; then
         echo "Conntrack: $(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo n/a)/$(cat /proc/sys/net/netfilter/nf_conntrack_max)"
     else
@@ -85,7 +88,10 @@ case "$ACTION" in
         echo "Experimental only. Lower kernel drop counts can mean longer queues and worse RTT."
         echo "Hypothetical, NOT certified: compare matched-load goodput, P95/P99, and drops."
         echo "GRE/FOU use kernel transport; no fake userspace transport is created."
-        echo "No global sysctl, rp_filter, default route, firewall, qdisc, or other tunnel changed."\n        [[ "$PROFILE" == auto-adaptive ]] && echo "Auto-adaptive is observation-only; no background controller is enabled.";;
+        echo "No global sysctl, rp_filter, default route, firewall, qdisc, or other tunnel changed."
+        if [[ "$PROFILE" == auto-adaptive ]]; then
+            echo "Auto-adaptive is observation-only; no background controller is enabled."
+        fi;;
     compare)
         status
         if [[ -r "$snap" ]]; then
