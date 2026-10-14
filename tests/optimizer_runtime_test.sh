@@ -25,6 +25,15 @@ else
 fi
 SH
 chmod +x "$DIR/stubs/ip"
+# The integration must not query the runner's real network interface via tc.
+cat > "$DIR/stubs/tc" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "$*" == 'qdisc show dev ts-lab' ]] || { echo "unexpected tc args: $*" >&2; exit 1; }
+if [[ "${TEST_TC_FAIL:-0}" == 1 ]]; then exit 2; fi
+printf 'qdisc fq_codel 0: dev ts-lab root\n'
+SH
+chmod +x "$DIR/stubs/tc"
 export TEST_QLEN="$DIR/current_qlen" TEST_WRITES="$DIR/writes"
 export OMNITUN_CONFIG_ROOT="$DIR/config" OMNITUN_OPTIMIZER_STATE_DIR="$DIR/state"
 export PATH="$DIR/stubs:$PATH"
@@ -35,6 +44,15 @@ grep -qF 'Interface details and MTU:' "$DIR/status" || die "broken literal newli
 run analyze lab > "$DIR/analyze"
 run recommend lab low-latency > "$DIR/recommend"
 grep -q 'P95/P99' "$DIR/recommend" || die "no validation/latency caution"
+if grep -qF 'Auto-adaptive is observation-only' "$DIR/recommend"; then
+    die "auto-adaptive warning printed for low-latency profile"
+fi
+run recommend lab auto-adaptive > "$DIR/auto"
+grep -qF 'Auto-adaptive is observation-only' "$DIR/auto" ||
+    die "missing auto-adaptive warning"
+TEST_TC_FAIL=1 run status lab > "$DIR/failed-tc"
+grep -qF 'qdisc details unavailable' "$DIR/failed-tc" ||
+    die "optional tc failure incorrectly kills diagnostics"
 run dry-run lab high-throughput > "$DIR/dry"
 run compare lab > "$DIR/compare"
 [[ "$(cat "$TEST_QLEN")" == 1024 ]] || die "read actions mutated queue"

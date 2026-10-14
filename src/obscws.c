@@ -249,12 +249,19 @@ static int ws_sha1(const unsigned char *input, size_t len, unsigned char out[20]
 }
 static int ws_accept(const char *key64, char out[29]) {
     static const char guid[]="258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-    if (strlen(key64)!=24) return -1;
-    for (unsigned i=0;i<24;i++) {
+    /* RFC 6455 client nonce is 16 raw bytes, encoded as exactly 22 base64
+     * digits followed by '=='. Reject misplaced padding and noncanonical
+     * final sextets instead of accepting an invalid handshake key. */
+    if (strlen(key64)!=24 || key64[22]!='=' || key64[23]!='=') return -1;
+    for (unsigned i=0;i<22;i++) {
         const unsigned char c=(unsigned char)key64[i];
         if (!(c>='A'&&c<='Z') && !(c>='a'&&c<='z') &&
-            !(c>='0'&&c<='9') && c!='+' && c!='/' && c!='=') return -1;
+            !(c>='0'&&c<='9') && c!='+' && c!='/') return -1;
     }
+    static const char alphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const char *last=strchr(alphabet,key64[21]);
+    if (!last || ((size_t)(last-alphabet)&15u)!=0) return -1;
     unsigned char msg[60],hash[20];
     memcpy(msg,key64,24); memcpy(msg+24,guid,36);
     if (ws_sha1(msg,sizeof(msg),hash)!=0) return -1;

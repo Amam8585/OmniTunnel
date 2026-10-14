@@ -157,7 +157,9 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends sshpass netcat-openbsd
-          bash tests/installer_integration_test.sh
+          # Installer builds/snapshots as root; keep the entire isolated fixture
+          # under one UID so injected corruption and cleanup remain testable.
+          sudo bash tests/installer_integration_test.sh
       - name: Direct preservation and shell tests
         run: |
           for t in tests/*.sh; do
