@@ -1596,14 +1596,13 @@ cmd_add_manual() {
     # Server-side params (tun IPs swapped). Encoded so it is a single paste.
     local token; token=$(printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' "$kn" "$t" "$fhost" "$mylip" "$port" "$key" "$pa" "$ta" "$shape" "$nc" "$pmode" | base64 | tr -d '\n')
     echo
-    echo "${C_GREEN}${C_BOLD}Near (Iran) side '$kn' is up.${C_RESET}"
-    echo "${C_BOLD}Now run these TWO lines on the FOREIGN server ($fhost):${C_RESET}"
+    printf '%b\n' "${C_GREEN}${C_BOLD}APADANA | Iran tunnel '$kn' is online.${C_RESET}"
+    printf '%b\n' "${C_BOLD}Foreign server ($fhost): run these 2 commands:${C_RESET}"
     echo
     echo "  ${C_CYAN}curl -fsSLo /tmp/apadana-install.sh $RAW_BASE/install.sh && sudo bash /tmp/apadana-install.sh --prepare && sudo bash /tmp/apadana-install.sh --check && sudo bash /tmp/apadana-install.sh --apply${C_RESET}"
     echo "  ${C_CYAN}apadana server-token $token${C_RESET}"
     echo
-    echo "${C_DIM}No SSH is used between the servers, and nothing changes any server's"
-    echo "own SSH login or port 22. The tunnel uses its own port ($port).${C_RESET}"
+    printf '%b\n' "${C_DIM}SSH unchanged | Tunnel port: $port${C_RESET}"
 }
 # Consume a token on the foreign box to bring up the matching server side.
 cmd_server_token() {
