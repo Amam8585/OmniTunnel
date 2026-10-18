@@ -1596,14 +1596,13 @@ cmd_add_manual() {
     # Server-side params (tun IPs swapped). Encoded so it is a single paste.
     local token; token=$(printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' "$kn" "$t" "$fhost" "$mylip" "$port" "$key" "$pa" "$ta" "$shape" "$nc" "$pmode" | base64 | tr -d '\n')
     echo
-    echo "${C_GREEN}${C_BOLD}Near (Iran) side '$kn' is up.${C_RESET}"
-    echo "${C_BOLD}Now run these TWO lines on the FOREIGN server ($fhost):${C_RESET}"
+    printf '%b\n' "${C_GREEN}${C_BOLD}APADANA | Iran tunnel '$kn' is online.${C_RESET}"
+    printf '%b\n' "${C_BOLD}Foreign server ($fhost): run these 2 commands:${C_RESET}"
     echo
     echo "  ${C_CYAN}curl -fsSLo /tmp/apadana-install.sh $RAW_BASE/install.sh && sudo bash /tmp/apadana-install.sh --prepare && sudo bash /tmp/apadana-install.sh --check && sudo bash /tmp/apadana-install.sh --apply${C_RESET}"
     echo "  ${C_CYAN}apadana server-token $token${C_RESET}"
     echo
-    echo "${C_DIM}No SSH is used between the servers, and nothing changes any server's"
-    echo "own SSH login or port 22. The tunnel uses its own port ($port).${C_RESET}"
+    printf '%b\n' "${C_DIM}SSH unchanged | Tunnel port: $port${C_RESET}"
 }
 # Consume a token on the foreign box to bring up the matching server side.
 cmd_server_token() {
@@ -2094,13 +2093,8 @@ cmd_update() {
 cmd_uninstall() {
     need_root
     echo
-    warn "This removes APADANA-managed instances and their associated assets:"
-    echo "  - every tunnel/instance (including any 'bench-*'), its systemd unit,"
-    echo "    port-forward relays, tun device and iptables chain"
-    echo "  - the core binaries: $TSUITE_BIN and $HYSTERIA_BIN"
-    echo "  - all state in $ROOT_DIR and the files in $ASSET_DIR"
-    echo "  - the 'omnitunnel' command itself"
-    echo "  ${C_DIM}(it does not touch anything OmniTunnel didn't create)${C_RESET}"
+    warn "Uninstall APADANA and its managed tunnels? This deletes managed configuration and may interrupt traffic."
+    echo "  Unrelated services and network settings will be preserved."
     echo
     local a; read -erp "Type 'DELETE' to remove everything: " a || true
     [[ "$a" == "DELETE" ]] || { info "aborted - nothing removed."; return 0; }
@@ -2240,32 +2234,28 @@ banner() {
         return 0
     fi
     printf '%b\n' "$C_BCYN$C_BOLD"
-    cat <<'EOF'
-       _    ____   _    ____    _    _   _    _
-      / \\  |  _ \\ / \\  |  _ \\  / \\  | \ | |  / \\
-     / _ \\ | |_) / _ \\ | | | |/ _ \\ |  \| | / _ \\
-    / ___ \\|  __/ ___ \\| |_| / ___ \\| |\\  |/ ___ \\
-   /_/   \\_\\_| /_/   \\_\\____/_/   \\_\\_| \\_/_/   \\_\\
-EOF
+    printf '    ========================================\n'
+    printf '                  A P A D A N A\n'
+    printf '               DIRECT TUNNEL MANAGER\n'
+    printf '    ========================================\n'
     printf '%b' "$C_RESET"
     printf '  %bAPADANA Direct Manager%b\n\n' "$C_WHITE" "$C_RESET"
     kv "Script Version:" "$VERSION"
-    kv "Core Version:" "$("$TSUITE_BIN" version 2>/dev/null || echo 'not installed')"
-    kv "Source:" "github.com/Amam8585/OmniTunnel"
+    kv "APADANA Core Version:" "$("$TSUITE_BIN" version 2>/dev/null | sed -E 's/^[Oo][Mm][Nn][Ii][Tt][Uu][Nn]/APADANA Core/' || echo 'not installed')"
     rule_amber
     kv "Server:" "${myip:-unknown} · $(arch_tag)"
-    kv "Tunnels:" "$RUN online · $STOP offline" "$([[ $RUN -gt 0 ]] && printf '%s' "$C_BGRN" || printf '%s' "$C_GREY")"
+    if (( RUN > 0 || STOP > 0 )); then
+        kv "Tunnels:" "$RUN online · $STOP offline" "$([[ $RUN -gt 0 ]] && printf '%s' "$C_BGRN" || printf '%s' "$C_GREY")"
+    fi
     kv "Forwards:" "$fwd"
-    kv "Core:" "$([[ -x "$TSUITE_BIN" ]] && echo Ready || echo Missing)" "$([[ -x "$TSUITE_BIN" ]] && printf '%s' "$C_BGRN" || printf '%s' "$C_BRED")"
+    kv "APADANA Core:" "$([[ -x "$TSUITE_BIN" ]] && echo Ready || echo Missing)" "$([[ -x "$TSUITE_BIN" ]] && printf '%s' "$C_BGRN" || printf '%s' "$C_BRED")"
     local off; off="$(forwarding_offenders)"
     if [[ -n "$off" ]]; then
         kv "IP forwarding:" "OFF on ${off% }" "$C_BRED"
         printf '  %b%s%b\n' "$C_BYEL" "forwards silently drop while this is off - fix with: omnitunnel fix-forwarding" "$C_RESET"
     fi
     local ovr; ovr="$(forwarding_conf_overrides)"
-    if [[ -n "$ovr" ]]; then
-        kv "Forwarding:" "Boot override detected (${ovr% })" "$C_BYEL"
-    fi
+    # Boot-override diagnostics remain available in forwarding checks.
     rule_amber
     return 0
 }
@@ -2488,6 +2478,6 @@ case "${1:-menu}" in
                       true;;
     update|upgrade)   need_root; cmd_update;;
     uninstall|purge)  need_root; cmd_uninstall;;
-    version|-v|--version) echo "tunnelctl $VERSION (core: $($TSUITE_BIN version 2>/dev/null || echo n/a))";;
+    version|-v|--version) echo "APADANA Manager $VERSION (APADANA Core: $($TSUITE_BIN version 2>/dev/null | sed -E 's/^[Oo][Mm][Nn][Ii][Tt][Uu][Nn]/APADANA Core/' || echo n/a))";;
     *) echo "usage: $0 [menu|bench|add|list|status <n>|enable <n>|remove <n>|pf-add <n> <proto> <port>|pf-del <n> <port>|pf-map-add <n> <proto> <public-ip> <pubport> <dest-ip> <dstport> <ingress-if>|pf-map-del <n> <proto> <public-ip> <pubport> <ingress-if>|stats <n> [--json]|monitor <n> [--json]|optimizer <action> <n>|diagnostics <n>|fix-forwarding|update|uninstall]";;
 esac
