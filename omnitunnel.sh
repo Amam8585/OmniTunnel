@@ -2074,8 +2074,8 @@ cmd_update() {
         rm -rf "$tmp"; return 1
     fi
     if [[ -n "$(systemctl list-units --type=service --state=running --no-legend 'omnitun-*' 2>/dev/null)" ]]; then
-        warn "Active tunnel detected. Update staged only. Stop managed tunnels during maintenance and run: sudo bash $installer --apply"
-        warn "Installer is temporary; to apply later download the installer again from the same reviewed ref."
+        warn "Active tunnel detected. Update staged only; no service was stopped."
+        warn "During maintenance, stop managed tunnels and run the canonical installer with --apply."
     else
         if ! OMNITUN_REPOSITORY="$repo" OMNITUN_REF="$ref" bash "$installer" --apply; then
             warn "Update staged, but activation failed. Existing installation preserved where possible."
@@ -2131,6 +2131,16 @@ cmd_uninstall() {
     # 5) state, the command symlink, then the install dir (this script lives there)
     rm -rf "$ROOT_DIR"
     rm -f "$BINLINK"
+    if [[ -f "$ASSET_DIR/build-info.json" ]]; then
+        local uninstall_script
+        uninstall_script="$(mktemp)" || return 1
+        if curl --connect-timeout 10 --max-time 60 -fsSL "https://raw.githubusercontent.com/Amam8585/OmniTunnel/main/install.sh" -o "$uninstall_script" && bash -n "$uninstall_script"; then
+            bash "$uninstall_script" --uninstall || warn "Installer cleanup incomplete; inspect remaining files"
+        else
+            warn "Could not obtain canonical uninstaller; shared binaries and assets retained"
+        fi
+        rm -f "$uninstall_script"
+    fi
     ok "APADANA manager cleanup completed. Verify any external components separately."
     # Do not recursively delete an asset directory that may contain user files.
     info "Assets preserved at $ASSET_DIR; installer --uninstall handles program inventory."
