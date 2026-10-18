@@ -2094,13 +2094,8 @@ cmd_update() {
 cmd_uninstall() {
     need_root
     echo
-    warn "This removes APADANA-managed instances and their associated assets:"
-    echo "  - every tunnel/instance (including any 'bench-*'), its systemd unit,"
-    echo "    port-forward relays, tun device and iptables chain"
-    echo "  - the core binaries: $TSUITE_BIN and $HYSTERIA_BIN"
-    echo "  - all state in $ROOT_DIR and the files in $ASSET_DIR"
-    echo "  - the 'omnitunnel' command itself"
-    echo "  ${C_DIM}(it does not touch anything OmniTunnel didn't create)${C_RESET}"
+    warn "Uninstall APADANA and its managed tunnels? This deletes managed configuration and may interrupt traffic."
+    echo "  Unrelated services and network settings will be preserved."
     echo
     local a; read -erp "Type 'DELETE' to remove everything: " a || true
     [[ "$a" == "DELETE" ]] || { info "aborted - nothing removed."; return 0; }
@@ -2240,21 +2235,19 @@ banner() {
         return 0
     fi
     printf '%b\n' "$C_BCYN$C_BOLD"
-    cat <<'EOF'
-       _    ____   _    ____    _    _   _    _
-      / \\  |  _ \\ / \\  |  _ \\  / \\  | \ | |  / \\
-     / _ \\ | |_) / _ \\ | | | |/ _ \\ |  \| | / _ \\
-    / ___ \\|  __/ ___ \\| |_| / ___ \\| |\\  |/ ___ \\
-   /_/   \\_\\_| /_/   \\_\\____/_/   \\_\\_| \\_/_/   \\_\\
-EOF
+    printf '    ========================================\n'
+    printf '                  A P A D A N A\n'
+    printf '               DIRECT TUNNEL MANAGER\n'
+    printf '    ========================================\n'
     printf '%b' "$C_RESET"
     printf '  %bAPADANA Direct Manager%b\n\n' "$C_WHITE" "$C_RESET"
     kv "Script Version:" "$VERSION"
     kv "APADANA Core Version:" "$("$TSUITE_BIN" version 2>/dev/null | sed -E 's/^[Oo][Mm][Nn][Ii][Tt][Uu][Nn]/APADANA Core/' || echo 'not installed')"
-    kv "Source:" "github.com/Amam8585/OmniTunnel"
     rule_amber
     kv "Server:" "${myip:-unknown} · $(arch_tag)"
-    kv "Tunnels:" "$RUN online · $STOP offline" "$([[ $RUN -gt 0 ]] && printf '%s' "$C_BGRN" || printf '%s' "$C_GREY")"
+    if (( RUN > 0 || STOP > 0 )); then
+        kv "Tunnels:" "$RUN online · $STOP offline" "$([[ $RUN -gt 0 ]] && printf '%s' "$C_BGRN" || printf '%s' "$C_GREY")"
+    fi
     kv "Forwards:" "$fwd"
     kv "APADANA Core:" "$([[ -x "$TSUITE_BIN" ]] && echo Ready || echo Missing)" "$([[ -x "$TSUITE_BIN" ]] && printf '%s' "$C_BGRN" || printf '%s' "$C_BRED")"
     local off; off="$(forwarding_offenders)"
@@ -2263,9 +2256,7 @@ EOF
         printf '  %b%s%b\n' "$C_BYEL" "forwards silently drop while this is off - fix with: omnitunnel fix-forwarding" "$C_RESET"
     fi
     local ovr; ovr="$(forwarding_conf_overrides)"
-    if [[ -n "$ovr" ]]; then
-        kv "Forwarding:" "Boot override detected (${ovr% })" "$C_BYEL"
-    fi
+    # Keep boot-override diagnostics available via the dedicated forwarding checks.
     rule_amber
     return 0
 }
