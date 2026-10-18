@@ -2250,13 +2250,13 @@ EOF
     printf '%b' "$C_RESET"
     printf '  %bAPADANA Direct Manager%b\n\n' "$C_WHITE" "$C_RESET"
     kv "Script Version:" "$VERSION"
-    kv "Core Version:" "$("$TSUITE_BIN" version 2>/dev/null || echo 'not installed')"
+    kv "APADANA Core Version:" "$("$TSUITE_BIN" version 2>/dev/null | sed -E 's/^[Oo][Mm][Nn][Ii][Tt][Uu][Nn]/APADANA Core/' || echo 'not installed')"
     kv "Source:" "github.com/Amam8585/OmniTunnel"
     rule_amber
     kv "Server:" "${myip:-unknown} · $(arch_tag)"
     kv "Tunnels:" "$RUN online · $STOP offline" "$([[ $RUN -gt 0 ]] && printf '%s' "$C_BGRN" || printf '%s' "$C_GREY")"
     kv "Forwards:" "$fwd"
-    kv "Core:" "$([[ -x "$TSUITE_BIN" ]] && echo Ready || echo Missing)" "$([[ -x "$TSUITE_BIN" ]] && printf '%s' "$C_BGRN" || printf '%s' "$C_BRED")"
+    kv "APADANA Core:" "$([[ -x "$TSUITE_BIN" ]] && echo Ready || echo Missing)" "$([[ -x "$TSUITE_BIN" ]] && printf '%s' "$C_BGRN" || printf '%s' "$C_BRED")"
     local off; off="$(forwarding_offenders)"
     if [[ -n "$off" ]]; then
         kv "IP forwarding:" "OFF on ${off% }" "$C_BRED"
@@ -2488,6 +2488,6 @@ case "${1:-menu}" in
                       true;;
     update|upgrade)   need_root; cmd_update;;
     uninstall|purge)  need_root; cmd_uninstall;;
-    version|-v|--version) echo "tunnelctl $VERSION (core: $($TSUITE_BIN version 2>/dev/null || echo n/a))";;
+    version|-v|--version) echo "APADANA Manager $VERSION (APADANA Core: $($TSUITE_BIN version 2>/dev/null | sed -E 's/^[Oo][Mm][Nn][Ii][Tt][Uu][Nn]/APADANA Core/' || echo n/a))";;
     *) echo "usage: $0 [menu|bench|add|list|status <n>|enable <n>|remove <n>|pf-add <n> <proto> <port>|pf-del <n> <port>|pf-map-add <n> <proto> <public-ip> <pubport> <dest-ip> <dstport> <ingress-if>|pf-map-del <n> <proto> <public-ip> <pubport> <ingress-if>|stats <n> [--json]|monitor <n> [--json]|optimizer <action> <n>|diagnostics <n>|fix-forwarding|update|uninstall]";;
 esac
