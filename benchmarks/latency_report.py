@@ -16,7 +16,9 @@ import sys
 
 # `time<1 ms` is an upper bound, not an exact RTT observation.
 RX = re.compile(r"\btime=\s*(\d+(?:\.\d+)?)\s*ms\b", re.IGNORECASE)
-CENSORED_RX = re.compile(r"\btime<\s*\d+(?:\.\d+)?\s*ms\b", re.IGNORECASE)
+CENSORED_RX = re.compile(r"\btime\s*<\s*\d+(?:\.\d+)?\s*ms\b", re.IGNORECASE)
+SEQ_RX = re.compile(r"\bicmp_seq=(\d+)\b", re.IGNORECASE)
+SUMMARY_RX = re.compile(r"\b\d+\s+packets\s+transmitted\b", re.IGNORECASE)
 
 def quantile(values, proportion):
     if not math.isfinite(proportion) or not 0 <= proportion <= 1:
@@ -34,7 +36,20 @@ def summarize(text, sent):
         raise ValueError("invalid requested packet count")
     if CENSORED_RX.search(text):
         raise ValueError("censored RTT values (time<...) cannot be used as exact measurements")
-    samples = [float(x) for x in RX.findall(text)]
+    if SUMMARY_RX.search(text) and not RX.search(text):
+        raise ValueError("incomplete ping measurements: packet summary without RTT observations")
+    samples = []
+    seen_sequences = set()
+    for line in text.splitlines():
+        match = RX.search(line)
+        if not match:
+            continue
+        seq = SEQ_RX.search(line)
+        if seq:
+            if seq.group(1) in seen_sequences:
+                continue
+            seen_sequences.add(seq.group(1))
+        samples.append(float(match.group(1)))
     if any(not math.isfinite(n) or n < 0 for n in samples):
         raise ValueError("invalid RTT sample")
     if len(samples) > sent:
