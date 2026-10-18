@@ -2050,28 +2050,40 @@ cmd_bench_clean() {
 # re-pushing the files the same way you first installed it.
 cmd_update() {
     need_root
-    command -v curl >/dev/null 2>&1 || { warn "curl is required to check releases"; return 1; }
-    command -v python3 >/dev/null 2>&1 || { warn "python3 is required to validate release metadata"; return 1; }
-    info "Installed manager: v$VERSION"
-    if [[ -x "$TSUITE_BIN" ]]; then
-        info "Installed core: $("$TSUITE_BIN" version 2>/dev/null | head -n 1 || echo unknown)"
+    command -v curl >/dev/null 2>&1 || { warn "curl is required"; return 1; }
+    command -v bash >/dev/null 2>&1 || return 1
+    local repo="${OMNITUN_REPOSITORY:-Amam8585/OmniTunnel}"
+    local ref="${OMNITUN_REF:-main}"
+    [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || { warn "Invalid repository"; return 1; }
+    [[ "$ref" =~ ^[A-Za-z0-9_./-]+$ ]] || { warn "Invalid ref"; return 1; }
+    local tmp
+    tmp="$(mktemp -d)" || return 1
+    local installer="$tmp/install.sh"
+    if ! curl --retry 2 --connect-timeout 10 --max-time 90 -fsSL \
+        "https://raw.githubusercontent.com/$repo/$ref/install.sh" -o "$installer"; then
+        warn "Could not download installer from $repo ($ref)"
+        rm -rf "$tmp"; return 1
     fi
-    local api="https://api.github.com/repos/Amam8585/OmniTunnel/releases/latest"
-    local json tag sha tmp
-    json="$(curl --connect-timeout 8 --max-time 20 -fsSL -H 'Accept: application/vnd.github+json' "$api")" || {
-        warn "No verified GitHub release could be retrieved. Experimental main is not a stable update."
-        return 1
-    }
-    tag="$(printf '%s' "$json" | python3 -c 'import json,sys; r=json.load(sys.stdin); print(r.get("tag_name","") if not r.get("draft") and not r.get("prerelease") else "")' 2>/dev/null)" || return 1
-    [[ "$tag" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([.-][a-zA-Z0-9.]+)?$ ]] || {
-        warn "Latest release has no acceptable version tag; refusing automatic update."
-        return 1
-    }
-    info "Latest published stable release: $tag"
-    info "Review its release notes: https://github.com/Amam8585/OmniTunnel/releases/tag/$tag"
-    warn "No binaries or running services have been changed."
-    warn "To stage an update, pin a reviewed commit and verified archive SHA256 via the existing installer --prepare."
-    return 0
+    if ! bash -n "$installer"; then
+        warn "Downloaded installer has invalid shell syntax"
+        rm -rf "$tmp"; return 1
+    fi
+    info "Preparing and validating APADANA from $repo ($ref). Running services will not be restarted."
+    if ! OMNITUN_REPOSITORY="$repo" OMNITUN_REF="$ref" bash "$installer" --prepare; then
+        warn "Update preparation failed; installed version is unchanged."
+        rm -rf "$tmp"; return 1
+    fi
+    if [[ -n "$(systemctl list-units --type=service --state=running --no-legend 'omnitun-*' 2>/dev/null)" ]]; then
+        warn "Active tunnel detected. Update staged only; no service was stopped."
+        warn "During maintenance, stop managed tunnels and run the canonical installer with --apply."
+    else
+        if ! OMNITUN_REPOSITORY="$repo" OMNITUN_REF="$ref" bash "$installer" --apply; then
+            warn "Update staged, but activation failed. Existing installation preserved where possible."
+            rm -rf "$tmp"; return 1
+        fi
+        ok "APADANA update applied. No tunnel was restarted."
+    fi
+    rm -rf "$tmp"
 }
 
 # ----------------------------------------------------------- full uninstall ---
@@ -2119,6 +2131,16 @@ cmd_uninstall() {
     # 5) state, the command symlink, then the install dir (this script lives there)
     rm -rf "$ROOT_DIR"
     rm -f "$BINLINK"
+    if [[ -f "$ASSET_DIR/build-info.json" ]]; then
+        local uninstall_script
+        uninstall_script="$(mktemp)" || return 1
+        if curl --connect-timeout 10 --max-time 60 -fsSL "https://raw.githubusercontent.com/Amam8585/OmniTunnel/main/install.sh" -o "$uninstall_script" && bash -n "$uninstall_script"; then
+            bash "$uninstall_script" --uninstall || warn "Installer cleanup incomplete; inspect remaining files"
+        else
+            warn "Could not obtain canonical uninstaller; shared binaries and assets retained"
+        fi
+        rm -f "$uninstall_script"
+    fi
     ok "APADANA manager cleanup completed. Verify any external components separately."
     # Do not recursively delete an asset directory that may contain user files.
     info "Assets preserved at $ASSET_DIR; installer --uninstall handles program inventory."
